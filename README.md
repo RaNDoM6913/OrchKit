@@ -25,6 +25,8 @@ Local deterministic E2E evidence: two dependent fixture tasks completed as two i
 
 **Real Scheduled ChatGPT E2E also passed:** the reusable standalone dispatcher ran two separate Scheduled ChatGPT workers (`scheduled-variant-b`) through RDC. `LIVE-1` and dependent `LIVE-2` each produced their own run/snapshot, passed independent checks, and were published as commits `f92c918...` and `5830e6b...` to a local bare remote. Final local/remote HEAD matched, the protected sentinel was unchanged, `orch next` returned `NO_WORK`, `orch reconcile` returned `CLEAN`, and the dispatcher was disabled.
 
+**Autonomous chaining also passed:** in `variant-b-autochain-v1`, `CHAIN-1` completed and re-armed the same native task from inside its Scheduled ChatGPT run. A later fresh Scheduled ChatGPT run automatically claimed dependent `CHAIN-2` with no manual dispatch between them. Both published successfully; final local/remote HEAD matched at `4e571b8...`, the sentinel remained unchanged, the queue ended `NO_WORK`/`CLEAN`, and the native task ended disabled.
+
 ## Why Variant B
 
 ORCH-001 proved standalone Scheduled ChatGPT → RDC → Mac, but the available automation surface did not prove an observable chat ID or same-chat context continuation. The owner explicitly approved Variant B: a new real ChatGPT conversation per task/repair, with durable handoff through this coordinator.

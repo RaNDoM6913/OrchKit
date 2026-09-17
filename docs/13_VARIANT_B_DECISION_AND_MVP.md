@@ -38,6 +38,12 @@ A separate two-task `variant-b-live-v1` fixture validated the actual path, not a
 
 The launcher implementation uses one reusable standalone Scheduled Task object. When the ledger reports `READY`, that task is re-armed for a later run. The next model run intentionally receives no previous-chat dependency and claims fresh bounded state from SQLite/RDC. When the ledger reports `NO_WORK`, it stays disabled.
 
+### Fully autonomous self-rearm acceptance — PASS
+
+A second `variant-b-autochain-v1` fixture removed the remaining manual-dispatch ambiguity. `CHAIN-1` ran as Scheduled ChatGPT (`CHAIN-1-A1-27bc5fa5e6`), passed verification/publish, observed `READY`, and re-armed the same native task before its run ended. Without any manual dispatch between blocks, the later fresh Scheduled ChatGPT run claimed `CHAIN-2` (`CHAIN-2-A1-bea04e4317`), passed verification/publish, then observed `NO_WORK`. Final local and bare-remote HEAD both equal `4e571b8fae2bdfcd220c6bb3ec2de31bd34eb519`; protected sentinel hash remained `3969cf7dd07a8778bc8f1a462b8414bd72fd6fd66a6d29ad0ec7d59573f657fe`; the native task ended disabled.
+
+This is the required proof that Variant B can advance an approved dependency chain across fresh real ChatGPT runs without the owner copying prompts or writing `Продолжай` between ordinary blocks. Native scheduling latency is variable, but correctness comes from the durable claim/lease ledger rather than wall-clock timing.
+
 ## Remaining boundaries
 
 - Scheduled task runtime does not expose a reliable ChatGPT chat URL/ID to the worker. Variant B does not depend on it; local `run_id` is the authoritative workflow identity.
