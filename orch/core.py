@@ -431,6 +431,62 @@ class Orchestrator:
         return {"status": "VERIFYING", "residual_risk": "cooperative_direct_rdc_not_os_fenced",
                 "capability_revoked": revoked}
 
+    def _block_verification(self, run_id: str, reason: str, *, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        now = utc_now()
+        feedback = {"kind": "verification_safety_block", "error": reason}
+        if evidence is not None:
+            feedback["evidence"] = evidence
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT task_id,state FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not current or current["state"] != "VERIFYING":
+                conn.execute("ROLLBACK")
+                raise ValueError("run_not_verifying")
+            conn.execute("UPDATE runs SET state='BLOCKED',verify_status='BLOCKED',feedback_json=?,completed_at=?,error=? WHERE run_id=?",
+                         (canonical_json(feedback), now, reason[:1000], run_id))
+            conn.execute("UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?", (now, current["task_id"]))
+            self._event(conn, "VERIFY_SAFETY_BLOCK", task_id=current["task_id"], run_id=run_id, payload=feedback)
+            conn.execute("COMMIT")
+        self._revoke_capability(run_id)
+        return {"status": "BLOCKED", "reason": reason, "feedback": feedback}
+
+    def _workspace_scope_evidence(self, payload: Dict[str, Any], declared_paths: List[str]) -> Dict[str, Any]:
+        workspace = Path(payload["workspace"]).resolve()
+        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+        prefix = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+                  "-c", "diff.external=", "-C", str(workspace)]
+        probe = subprocess.run(prefix + ["rev-parse", "--is-inside-work-tree"], env=env,
+                               capture_output=True, text=True, timeout=10, check=False)
+        declared = sorted(set(normalize_relative_path(path) for path in declared_paths))
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            return {"status": "NON_GIT_UNAVAILABLE", "declared_paths": declared,
+                    "limitation": "independent_scope_census_requires_git_workspace"}
+        def paths(*args: str) -> List[str]:
+            result = subprocess.run(prefix + list(args), env=env, capture_output=True, text=False, timeout=15, check=False)
+            if result.returncode != 0:
+                raise RuntimeError("git_scope_probe_failed:" + " ".join(args))
+            return [normalize_relative_path(os.fsdecode(item)) for item in result.stdout.split(b"\0") if item]
+        tracked = paths("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z")
+        staged = paths("diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z")
+        untracked = paths("ls-files", "--others", "--exclude-standard", "-z")
+        observed_all = sorted(set(tracked + staged + untracked))
+        protected = set(normalize_relative_path(path) for path in payload.get("protected_paths", {}))
+        observed = sorted(path for path in observed_all if path not in protected)
+        outside_allowlist = sorted(path for path in observed if not path_allowed(path, payload.get("allowed_paths", [])))
+        omitted_from_receipt = sorted(set(observed) - set(declared))
+        declared_but_unobserved = sorted(set(declared) - set(observed))
+        return {
+            "status": "PASS" if not outside_allowlist and not omitted_from_receipt and not declared_but_unobserved else "BLOCKED",
+            "declared_paths": declared,
+            "observed_paths": observed,
+            "protected_preexisting_paths": sorted(protected.intersection(observed_all)),
+            "outside_allowlist": outside_allowlist,
+            "omitted_from_receipt": omitted_from_receipt,
+            "declared_but_unobserved": declared_but_unobserved,
+            "ignored_files_observed": False,
+        }
+
     def _snapshot(self, payload: Dict[str, Any], changed_paths: List[str]) -> Tuple[str, Dict[str, Any]]:
         workspace = Path(payload["workspace"]).resolve()
         files: Dict[str, Any] = {}
@@ -493,6 +549,16 @@ class Orchestrator:
             payload = self._task_payload(task)
             receipt = json.loads(run["receipt_json"])
         workspace = Path(payload["workspace"]).resolve()
+        scope_evidence = self._workspace_scope_evidence(payload, receipt["changed_paths"])
+        scope_log = self.logs / f"{run_id}-scope.json"
+        scope_log.write_text(json.dumps(scope_evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        scope_evidence["log_path"] = str(scope_log)
+        if scope_evidence["status"] == "BLOCKED":
+            if scope_evidence["outside_allowlist"]:
+                reason = "workspace_scope_violation:" + scope_evidence["outside_allowlist"][0]
+            else:
+                reason = "receipt_scope_mismatch"
+            return self._block_verification(run_id, reason, evidence=scope_evidence)
         try:
             snapshot_id, manifest = self._snapshot(payload, receipt["changed_paths"])
         except ValueError as exc:
@@ -502,21 +568,7 @@ class Orchestrator:
                 "missing_path", "not_regular_file:",
             )
             if reason.startswith(safety_prefixes):
-                now = utc_now()
-                feedback = {"kind": "verification_safety_block", "error": reason}
-                with self.connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    current = conn.execute("SELECT task_id,state FROM runs WHERE run_id=?", (run_id,)).fetchone()
-                    if not current or current["state"] != "VERIFYING":
-                        conn.execute("ROLLBACK")
-                        raise ValueError("run_not_verifying")
-                    conn.execute("UPDATE runs SET state='BLOCKED',verify_status='BLOCKED',feedback_json=?,completed_at=?,error=? WHERE run_id=?",
-                                 (canonical_json(feedback), now, reason[:1000], run_id))
-                    conn.execute("UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?", (now, current["task_id"]))
-                    self._event(conn, "VERIFY_SAFETY_BLOCK", task_id=current["task_id"], run_id=run_id, payload=feedback)
-                    conn.execute("COMMIT")
-                self._revoke_capability(run_id)
-                return {"status": "BLOCKED", "reason": reason, "feedback": feedback}
+                return self._block_verification(run_id, reason, evidence=scope_evidence)
             raise
         checks = [self._run_check(workspace, run_id, item) for item in payload.get("checks", [])]
         passed = all(item["exit_code"] == 0 and not item["timed_out"] for item in checks)
@@ -531,7 +583,7 @@ class Orchestrator:
                              (snapshot_id, canonical_json(feedback), run_id))
                 conn.execute("UPDATE tasks SET status='NEEDS_FIX',updated_at=? WHERE task_id=?", (now, run["task_id"]))
                 self._event(conn, "VERIFY_FAIL", task_id=run["task_id"], run_id=run_id,
-                            payload={"snapshot_id": snapshot_id, "checks": checks})
+                            payload={"snapshot_id": snapshot_id, "checks": checks, "scope_evidence": scope_evidence})
                 conn.execute("COMMIT")
                 return {"status": "NEEDS_FIX", "snapshot_id": snapshot_id, "checks": checks}
             decision = decide_review(payload, manifest, attempt=int(run["attempt"]))
@@ -545,9 +597,10 @@ class Orchestrator:
             self._event(conn, "VERIFY_PASS", task_id=run["task_id"], run_id=run_id,
                         payload={"snapshot_id": snapshot_id,
                                  "checks": [{"id": c["id"], "exit_code": c["exit_code"]} for c in checks],
-                                 "review_decision": decision})
+                                 "review_decision": decision, "scope_evidence": scope_evidence})
             conn.execute("COMMIT")
-        return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks, "review_decision": decision}
+        return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks,
+                "review_decision": decision, "scope_evidence": scope_evidence}
 
     def review_decision(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:

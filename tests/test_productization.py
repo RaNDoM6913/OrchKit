@@ -220,6 +220,50 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(finished['status'],'COMPLETE')
         self.assertEqual(finished['commit'],subprocess.run(['git','-C',str(self.repo),'rev-parse','HEAD'],check=True,capture_output=True,text=True).stdout.strip())
 
+    def test_verifier_blocks_unreported_git_change_outside_allowlist(self):
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='SCOPE-1',goal='bounded write',allowed_paths=['result.json'])
+        orch=Orchestrator(self.home); plan_path=self.home/'scope-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture')
+        (self.repo/'result.json').write_text('{"ok":true}\n'); (self.repo/'rogue.txt').write_text('rogue\n')
+        receipt=self.home/'scope-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-1','changed_paths':['result.json']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
+        result=orch.verify(claim['run_id'])
+        self.assertEqual(result['status'],'BLOCKED')
+        self.assertEqual(result['reason'],'workspace_scope_violation:rogue.txt')
+        self.assertIn('rogue.txt',result['feedback']['evidence']['outside_allowlist'])
+
+    def test_verifier_blocks_receipt_path_with_no_observed_git_change(self):
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='SCOPE-2',goal='must really change',allowed_paths=['README.md'])
+        orch=Orchestrator(self.home); plan_path=self.home/'phantom-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture')
+        receipt=self.home/'phantom-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-2','changed_paths':['README.md']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
+        result=orch.verify(claim['run_id'])
+        self.assertEqual(result['status'],'BLOCKED')
+        self.assertEqual(result['reason'],'receipt_scope_mismatch')
+        self.assertEqual(result['feedback']['evidence']['declared_but_unobserved'],['README.md'])
+
+    def test_verifier_subtracts_unchanged_protected_preexisting_dirty_path(self):
+        owner=self.repo/'owner-note.txt'; owner.write_text('owner dirty\n',encoding='utf-8')
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='SCOPE-3',goal='safe write',allowed_paths=['result.json'])
+        orch=Orchestrator(self.home); plan_path=self.home/'protected-scope-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture'); (self.repo/'result.json').write_text('{"safe":true}\n')
+        receipt=self.home/'protected-scope-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-3','changed_paths':['result.json']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
+        result=orch.verify(claim['run_id'])
+        self.assertEqual(result['status'],'VERIFIED')
+        self.assertEqual(result['scope_evidence']['observed_paths'],['result.json'])
+        self.assertEqual(result['scope_evidence']['protected_preexisting_paths'],['owner-note.txt'])
+
     def test_dispatcher_requires_publication_reconciliation_before_retry(self):
         with mock.patch.dict(os.environ, {'ORCH_EXECUTABLE':'/tmp/orch'}, clear=False):
             rendered=render_dispatcher(self.home)

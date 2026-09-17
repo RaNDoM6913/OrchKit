@@ -12,7 +12,7 @@ Implemented and locally verified on 2026-09-17:
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.
 - Cooperative quiescence marker with the direct-RDC residual risk explicitly recorded.
-- Independent registered checks, protected-file hashes, content snapshots and stale-snapshot detection.
+- Independent Git scope census, registered checks, protected-file hashes, content snapshots and stale-snapshot detection. The verifier blocks unreported/out-of-allowlist repository changes before checks/publication.
 - Snapshot-bound review import; failed verification/review becomes `NEEDS_FIX` and is picked up by a **new** ChatGPT run.
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
@@ -157,4 +157,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current 39-test suite covers orchestration/recovery/review, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current 42-test suite covers orchestration/recovery/review, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

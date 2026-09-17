@@ -140,9 +140,12 @@ class OrchestratorTests(unittest.TestCase):
         workspace=Path(prepared['workspace'])
         self.assertTrue((workspace/'checks/check.py').is_file())
         self.assertTrue((workspace/'verification_evidence/support.json').is_file())
+        self.assertTrue((workspace/'verification_evidence/scope.json').is_file())
         prompt=json.loads(Path(prepared['prompt']).read_text())
         self.assertIn('checks/check.py',prompt['support_files'])
         self.assertEqual(prompt['verification_evidence'][0]['exit_code'],0)
+        self.assertEqual(prompt['scope_evidence']['status'],'NON_GIT_UNAVAILABLE')
+        self.assertEqual(prompt['scope_evidence']['evidence_file'],'verification_evidence/scope.json')
 
     def test_dependency_cycle_is_rejected_at_plan_load(self):
         one=self.task('T1',deps=['T2']); two=self.task('T2',deps=['T1'])

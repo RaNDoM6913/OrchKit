@@ -105,6 +105,12 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
             support_files[rel]={'sha256':sha256_file(src),'purpose':'approved_check_support'}
     verification=[]
     evidence_dir=work/'verification_evidence'; evidence_dir.mkdir()
+    scope_evidence=None
+    scope_log=orch.logs/f"{run_id}-scope.json"
+    if scope_log.is_file():
+        scope_data=json.loads(scope_log.read_text(encoding='utf-8'))
+        scope_target=evidence_dir/'scope.json'; shutil.copy2(scope_log,scope_target)
+        scope_evidence={**scope_data,'evidence_file':str(scope_target.relative_to(work)),'sha256':sha256_file(scope_target)}
     for check in payload.get('checks',[]):
         safe_id=str(check.get('id','check')).replace('/','_')
         log=orch.logs/f"{run_id}-{safe_id}.json"
@@ -125,7 +131,7 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
             'review_decision':decision,
             'files':sorted(manifest.get('files',{})),'deleted_files':deleted_files,
             'file_manifest':manifest.get('files',{}),'support_files':support_files,'checks':payload.get('checks',[]),
-            'verification_evidence':verification,
+            'verification_evidence':verification,'scope_evidence':scope_evidence,
             'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.',
                             'Verifier checks already ran against the source workspace; inspect supplied evidence and frozen support files.',
                             'Only rerun an approved check when necessary; never expand beyond the exported workspace.',

@@ -14,6 +14,8 @@ Hardening added in this slice:
 - Run capability files are revoked at quiesce/abort instead of lingering after write authority ends.
 - Protected-path/snapshot safety violations transition the run/task to `BLOCKED`; they no longer leave a writer stuck in `VERIFYING`.
 - Snapshots and exact Git publication now support verified tracked-file deletions.
+- Git workspaces receive an independent diff census before snapshot/checks; unreported or out-of-allowlist tracked/untracked changes block the run, while unchanged protected pre-existing dirty files are subtracted explicitly.
+- Scope evidence is persisted and included in frozen Codex review exports.
 
 ## Durable state and recovery
 
@@ -35,13 +37,13 @@ Publication now records `INTENT → STAGED → COMMITTED → PUSHED → REMOTE_V
 
 ## Verification
 
-- Deterministic suite: **39/39 PASS**.
+- Deterministic suite: **42/42 PASS**.
 - `python3 -m py_compile orch/*.py`: PASS.
 - `git diff --check`: PASS.
 - Repo-local `orch state check`: `READY`; SQLite `quick_check=ok`, zero FK violations, zero active runs, zero pending publications, zero orphan capabilities.
 - Repo-local `orch reconcile`: `CLEAN`.
 - Secret-free local state backup created successfully; stale capability files from historical fixtures were detected and pruned only after confirming no active runs.
-- Offline wheel build: `agent_workflow_orchestrator-0.3.0-py3-none-any.whl`, SHA-256 `67e482a41c4c4cb7f6076f795af6273746dc8b2209b186813b1905162f18d74c`.
+- Offline wheel build: `agent_workflow_orchestrator-0.3.0-py3-none-any.whl`, SHA-256 `b0574dd710e6d92866f1720e0a310d1e46fddf325bb204b2ae5aebc6dfd05fbf`.
 - Wheel installed into a clean temporary Python venv without runtime dependencies; installed `orch 0.3.0` initialized fresh state and reported schema v2 `READY`.
 
 ## Remaining boundaries
