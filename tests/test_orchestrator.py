@@ -71,16 +71,20 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(c2['context']['feedback']['kind'],'verification_failure')
         self.assertEqual(c2['context']['previous_snapshot_id'],result['snapshot_id'])
 
-    def test_protected_change_blocks_verification(self):
+    def test_protected_change_blocks_verification_without_stuck_writer(self):
         sentinel=self.ws/'owner.txt'; sentinel.write_text('keep\n')
         digest=hashlib.sha256(sentinel.read_bytes()).hexdigest()
         self.load([self.task('T1',protected={'owner.txt':digest})])
         c=self.orch.claim('w'); (self.ws/'T1.json').write_text('{"value":1}\n'); sentinel.write_text('changed\n')
         receipt=self.root/'r.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
-        lease=self.orch.lease_from_capability(c['run_id'],Path(c['capability_file']))
-        self.orch.submit(c['run_id'],lease,receipt); self.orch.quiesce(c['run_id'],lease)
-        with self.assertRaisesRegex(ValueError,'protected_path_changed'):
-            self.orch.verify(c['run_id'])
+        cap=Path(c['capability_file']); lease=self.orch.lease_from_capability(c['run_id'],cap)
+        self.orch.submit(c['run_id'],lease,receipt); quiesced=self.orch.quiesce(c['run_id'],lease)
+        self.assertTrue(quiesced['capability_revoked']); self.assertFalse(cap.exists())
+        blocked=self.orch.verify(c['run_id'])
+        self.assertEqual(blocked['status'],'BLOCKED')
+        self.assertIn('protected_path_changed',blocked['reason'])
+        self.assertEqual(self.orch.reconcile()['status'],'CLEAN')
+        self.assertEqual(self.orch.next_work()['status'],'NO_WORK')
 
     def test_review_is_snapshot_bound_and_feedback_reappears(self):
         self.load([self.task('T1',review=True)])
@@ -139,6 +143,38 @@ class OrchestratorTests(unittest.TestCase):
         prompt=json.loads(Path(prepared['prompt']).read_text())
         self.assertIn('checks/check.py',prompt['support_files'])
         self.assertEqual(prompt['verification_evidence'][0]['exit_code'],0)
+
+    def test_dependency_cycle_is_rejected_at_plan_load(self):
+        one=self.task('T1',deps=['T2']); two=self.task('T2',deps=['T1'])
+        with self.assertRaisesRegex(ValueError,'dependency_cycle'):
+            self.load([one,two])
+
+    def test_task_id_conflict_across_plan_revisions_is_rejected(self):
+        self.load([self.task('T1')],revision='p1')
+        path=self.root/'p2.json'
+        path.write_text(json.dumps({'schema_version':1,'plan_revision':'p2','tasks':[self.task('T1')]})+'\n')
+        with self.assertRaisesRegex(ValueError,'task_id_conflict:T1'):
+            self.orch.load_plan(path)
+
+    def test_capability_is_revoked_on_quiesce_and_abort(self):
+        self.load([self.task('T1'),self.task('T2')])
+        c1=self.orch.claim('w1'); cap1=Path(c1['capability_file']); lease1=self.orch.lease_from_capability(c1['run_id'],cap1)
+        (self.ws/'T1.json').write_text('{"value":1}\n')
+        receipt=self.root/'cap-r.json'; receipt.write_text(json.dumps({'run_id':c1['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
+        self.orch.submit(c1['run_id'],lease1,receipt); self.orch.quiesce(c1['run_id'],lease1)
+        self.assertFalse(cap1.exists())
+        self.orch.verify(c1['run_id']); self.orch.complete(c1['run_id'])
+        c2=self.orch.claim('w2'); cap2=Path(c2['capability_file'])
+        self.assertTrue(cap2.exists()); self.orch.abort(c2['run_id'],'stop',retry=False)
+        self.assertFalse(cap2.exists())
+
+    def test_invalid_check_and_protected_hash_are_rejected_at_plan_load(self):
+        bad_check=self.task('T1',checks=[{'id':'bad','argv':[],'cwd':'.'}])
+        with self.assertRaisesRegex(ValueError,'invalid_check_argv'):
+            self.load([bad_check],revision='bad-check')
+        bad_hash=self.task('T2',protected={'owner.txt':'not-a-sha'})
+        with self.assertRaisesRegex(ValueError,'invalid_protected_hash'):
+            self.load([bad_hash],revision='bad-hash')
 
     def test_plan_revision_digest_conflict(self):
         self.load([self.task('T1')],revision='same')

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -91,6 +92,63 @@ def path_allowed(relative: str, allowlist: Iterable[str]) -> bool:
     return False
 
 
+def validate_task_definition(item: Dict[str, Any]) -> None:
+    workspace = Path(item.get("workspace", ""))
+    if not workspace.is_absolute():
+        raise ValueError("workspace_must_be_absolute")
+    allowed = item.get("allowed_paths", [])
+    if not isinstance(allowed, list) or not allowed:
+        raise ValueError("allowed_paths_required")
+    for relative in allowed:
+        if not isinstance(relative, str) or not relative:
+            raise ValueError("invalid_allowed_path")
+        normalize_relative_path(relative.rstrip("/"))
+    protected = item.get("protected_paths", {})
+    if not isinstance(protected, dict):
+        raise ValueError("invalid_protected_paths")
+    for relative, digest in protected.items():
+        normalize_relative_path(relative)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("invalid_protected_hash")
+    checks = item.get("checks", [])
+    if not isinstance(checks, list):
+        raise ValueError("invalid_checks")
+    for check in checks:
+        if not isinstance(check, dict):
+            raise ValueError("invalid_check")
+        argv = check.get("argv")
+        if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg for arg in argv):
+            raise ValueError("invalid_check_argv")
+        cwd = check.get("cwd", ".")
+        if not isinstance(cwd, str) or not cwd:
+            raise ValueError("invalid_check_cwd")
+        if cwd != ".":
+            normalize_relative_path(cwd)
+        timeout = check.get("timeout_sec", 30)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120:
+            raise ValueError("invalid_check_timeout")
+    attempts = item.get("max_attempts", 2)
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
+        raise ValueError("invalid_max_attempts")
+
+
+def validate_dependency_graph(tasks: List[Dict[str, Any]]) -> None:
+    graph = {item["id"]: list(item.get("dependencies", [])) for item in tasks}
+    state: Dict[str, int] = {}
+    def visit(task_id: str) -> None:
+        current = state.get(task_id, 0)
+        if current == 1:
+            raise ValueError("dependency_cycle")
+        if current == 2:
+            return
+        state[task_id] = 1
+        for dep in graph[task_id]:
+            visit(dep)
+        state[task_id] = 2
+    for task_id in graph:
+        visit(task_id)
+
+
 class Orchestrator:
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -108,6 +166,20 @@ class Orchestrator:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    def _capability_path(self, run_id: str) -> Path:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
+            raise ValueError("invalid_run_id")
+        return self.runtime / "claims" / f"{run_id}.json"
+
+    def _revoke_capability(self, run_id: str) -> bool:
+        path = self._capability_path(run_id)
+        if not path.exists():
+            return False
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("invalid_capability_artifact")
+        path.unlink()
+        return True
 
     def _initialize(self) -> None:
         schema = """
@@ -165,11 +237,8 @@ class Orchestrator:
             deps = item.get("dependencies", [])
             if not isinstance(deps, list) or any(dep not in known or dep == item["id"] for dep in deps):
                 raise ValueError("invalid_dependency")
-            workspace = Path(item.get("workspace", ""))
-            if not workspace.is_absolute():
-                raise ValueError("workspace_must_be_absolute")
-            if not isinstance(item.get("allowed_paths", []), list):
-                raise ValueError("invalid_allowed_paths")
+            validate_task_definition(item)
+        validate_dependency_graph(tasks)
         digest = sha256_file(plan_path)
         now = utc_now()
         with self.connect() as conn:
@@ -179,6 +248,11 @@ class Orchestrator:
             if existing and existing["source_digest"] != digest:
                 conn.execute("ROLLBACK")
                 raise ValueError("plan_revision_digest_conflict")
+            for item in tasks:
+                task_existing = conn.execute("SELECT plan_revision FROM tasks WHERE task_id=?", (item["id"],)).fetchone()
+                if task_existing and task_existing["plan_revision"] != data["plan_revision"]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError(f"task_id_conflict:{item['id']}")
             conn.execute("INSERT OR IGNORE INTO plans(plan_revision,source_digest,loaded_at) VALUES(?,?,?)",
                          (data["plan_revision"], digest, now))
             for ordinal, item in enumerate(tasks):
@@ -247,7 +321,7 @@ class Orchestrator:
             conn.execute("COMMIT")
         claims = self.runtime / "claims"
         claims.mkdir(exist_ok=True)
-        cap = claims / f"{run_id}.json"
+        cap = self._capability_path(run_id)
         cap.write_text(json.dumps({"run_id": run_id, "lease_token": lease}, separators=(",", ":")) + "\n", encoding="utf-8")
         os.chmod(cap, 0o600)
         return {"status": "CLAIMED", "run_id": run_id, "task_id": row["task_id"],
@@ -342,7 +416,9 @@ class Orchestrator:
             self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
                         payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
             conn.execute("COMMIT")
-        return {"status": "VERIFYING", "residual_risk": "cooperative_direct_rdc_not_os_fenced"}
+        revoked = self._revoke_capability(run_id)
+        return {"status": "VERIFYING", "residual_risk": "cooperative_direct_rdc_not_os_fenced",
+                "capability_revoked": revoked}
 
     def _snapshot(self, payload: Dict[str, Any], changed_paths: List[str]) -> Tuple[str, Dict[str, Any]]:
         workspace = Path(payload["workspace"]).resolve()
@@ -403,7 +479,31 @@ class Orchestrator:
             payload = self._task_payload(task)
             receipt = json.loads(run["receipt_json"])
         workspace = Path(payload["workspace"]).resolve()
-        snapshot_id, manifest = self._snapshot(payload, receipt["changed_paths"])
+        try:
+            snapshot_id, manifest = self._snapshot(payload, receipt["changed_paths"])
+        except ValueError as exc:
+            reason = str(exc)
+            safety_prefixes = (
+                "protected_path_changed:", "path_escape", "symlink_not_allowed",
+                "missing_path", "not_regular_file:",
+            )
+            if reason.startswith(safety_prefixes):
+                now = utc_now()
+                feedback = {"kind": "verification_safety_block", "error": reason}
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    current = conn.execute("SELECT task_id,state FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                    if not current or current["state"] != "VERIFYING":
+                        conn.execute("ROLLBACK")
+                        raise ValueError("run_not_verifying")
+                    conn.execute("UPDATE runs SET state='BLOCKED',verify_status='BLOCKED',feedback_json=?,completed_at=?,error=? WHERE run_id=?",
+                                 (canonical_json(feedback), now, reason[:1000], run_id))
+                    conn.execute("UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?", (now, current["task_id"]))
+                    self._event(conn, "VERIFY_SAFETY_BLOCK", task_id=current["task_id"], run_id=run_id, payload=feedback)
+                    conn.execute("COMMIT")
+                self._revoke_capability(run_id)
+                return {"status": "BLOCKED", "reason": reason, "feedback": feedback}
+            raise
         checks = [self._run_check(workspace, run_id, item) for item in payload.get("checks", [])]
         passed = all(item["exit_code"] == 0 and not item["timed_out"] for item in checks)
         now = utc_now()
@@ -652,6 +752,7 @@ class Orchestrator:
             conn.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (state,now,run["task_id"]))
             self._event(conn, "RUN_ABORTED", task_id=run["task_id"], run_id=run_id, payload={"reason":reason[:500],"retry":retry})
             conn.execute("COMMIT")
+        self._revoke_capability(run_id)
         return {"status":"ABORTED", "run_id":run_id, "task_status":state}
 
     def next_work(self) -> Dict[str, Any]:
