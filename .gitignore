@@ -9,3 +9,7 @@ __pycache__/
 /review-plan.json
 /review-plan-v2.json
 /autochain-plan.json
+/build/
+/dist/
+/*.egg-info/
+/dispatcher-prompt.txt

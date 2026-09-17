@@ -1,7 +1,7 @@
 # ORCH working rules
 
 - This project is independent from `<protected-project>`. Never modify that project unless <separately-authorized-integration> receives a separate explicit approval.
-- Primary worker is a real ChatGPT scheduled conversation. Codex is review-only. No paid model API, external AI provider, purchased credits, or subscription upgrade fallback.
+- Primary worker is a real ChatGPT scheduled conversation. Codex is an optional review-only adapter selected by policy; ORCH must work with review mode off. No paid model API, external AI provider, purchased credits, or subscription upgrade fallback.
 - Variant B is authoritative: each task/repair attempt runs in a new ChatGPT conversation. Durable context and feedback come from the local ledger, not prior chat history.
 - One active writer run. Never expire a lease by time alone. `RESULT_SUBMITTED` is not completion.
 - Use task `allowed_paths`; protect recorded sentinel hashes; verifier checks actual bytes and registered commands.

@@ -64,6 +64,11 @@ def subscription_preflight(root: Path) -> Dict[str, Any]:
 
 
 def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
+    decision = orch.review_decision(run_id)
+    if not decision.get('required'):
+        raise ValueError('review_not_required')
+    if decision.get('reviewer') != 'codex':
+        raise ValueError('reviewer_not_codex')
     with orch.connect() as conn:
         run=conn.execute('SELECT * FROM runs WHERE run_id=?',(run_id,)).fetchone()
         if not run or run['state']!='REVIEWING': raise ValueError('run_not_reviewing')
@@ -114,6 +119,7 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
                           'uncertainty':{'type':'array','items':{'type':'string'}}}}
     schema_path=export/'review_schema.json'; schema_path.write_text(json.dumps(schema,indent=2)+'\n',encoding='utf-8')
     prompt={'role':'reviewer_only','run_id':run_id,'snapshot_id':run['snapshot_id'],'goal':payload.get('goal'),'non_goals':payload.get('non_goals',[]),
+            'review_decision':decision,
             'files':sorted(manifest.get('files',{})),'support_files':support_files,'checks':payload.get('checks',[]),
             'verification_evidence':verification,
             'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.',

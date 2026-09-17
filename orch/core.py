@@ -11,6 +11,8 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .review_policy import decide_review, normalize_review_policy
+
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
 READY_TASK_STATES = {"PLANNED", "READY", "NEEDS_FIX"}
 
@@ -59,13 +61,32 @@ def safe_workspace_path(workspace: Path, relative: str, *, must_exist: bool = Fa
     return raw
 
 
+def normalize_relative_path(relative: str) -> str:
+    if not isinstance(relative, str) or not relative or "\x00" in relative or relative.startswith("/"):
+        raise ValueError("invalid_relative_path")
+    value = relative
+    while value.startswith("./"):
+        value = value[2:]
+    parts = Path(value).parts
+    if not value or any(part == ".." for part in parts):
+        raise ValueError("path_escape")
+    return Path(value).as_posix()
+
+
 def path_allowed(relative: str, allowlist: Iterable[str]) -> bool:
-    normalized = Path(relative).as_posix().lstrip("./")
+    try:
+        normalized = normalize_relative_path(relative)
+    except ValueError:
+        return False
     for entry in allowlist:
-        item = Path(entry.rstrip("/")).as_posix().lstrip("./")
+        directory = entry.endswith("/")
+        try:
+            item = normalize_relative_path(entry.rstrip("/"))
+        except ValueError:
+            continue
         if normalized == item:
             return True
-        if entry.endswith("/") and normalized.startswith(item + "/"):
+        if directory and normalized.startswith(item + "/"):
             return True
     return False
 
@@ -78,6 +99,7 @@ class Orchestrator:
         self.db_path = self.runtime / "orch.sqlite3"
         self.logs = self.runtime / "logs"
         self.logs.mkdir(exist_ok=True)
+        (self.runtime / "worker_receipts").mkdir(exist_ok=True)
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
@@ -165,6 +187,7 @@ class Orchestrator:
                 payload.setdefault("checks", [])
                 payload.setdefault("protected_paths", {})
                 payload.setdefault("required_review", False)
+                payload["review"] = normalize_review_policy(payload)
                 payload.setdefault("owner_acceptance", False)
                 payload.setdefault("publication", {"kind": "none"})
                 conn.execute("INSERT OR IGNORE INTO tasks(task_id,plan_revision,ordinal,status,payload_json,updated_at) VALUES(?,?,?,?,?,?)",
@@ -255,7 +278,7 @@ class Orchestrator:
                     "goal": payload.get("goal"), "non_goals": payload.get("non_goals", []),
                     "workspace": payload["workspace"], "allowed_paths": payload.get("allowed_paths", []),
                     "protected_paths": payload.get("protected_paths", {}), "checks": payload.get("checks", []),
-                    "required_review": bool(payload.get("required_review")), "owner_acceptance": bool(payload.get("owner_acceptance")),
+                    "review": normalize_review_policy(payload), "owner_acceptance": bool(payload.get("owner_acceptance")),
                     "publication": payload.get("publication", {"kind": "none"}), "feedback": feedback,
                     "previous_snapshot_id": previous["snapshot_id"] if previous else None}
             if len(canonical_json(pack).encode("utf-8")) > 32768:
@@ -397,7 +420,8 @@ class Orchestrator:
                             payload={"snapshot_id": snapshot_id, "checks": checks})
                 conn.execute("COMMIT")
                 return {"status": "NEEDS_FIX", "snapshot_id": snapshot_id, "checks": checks}
-            if payload.get("required_review"):
+            decision = decide_review(payload, manifest, attempt=int(run["attempt"]))
+            if decision["required"]:
                 next_state, task_state = "REVIEWING", "WAITING_REVIEW"
             else:
                 next_state, task_state = "VERIFIED", "READY_TO_PUBLISH"
@@ -406,9 +430,23 @@ class Orchestrator:
             conn.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (task_state, now, run["task_id"]))
             self._event(conn, "VERIFY_PASS", task_id=run["task_id"], run_id=run_id,
                         payload={"snapshot_id": snapshot_id,
-                                 "checks": [{"id": c["id"], "exit_code": c["exit_code"]} for c in checks]})
+                                 "checks": [{"id": c["id"], "exit_code": c["exit_code"]} for c in checks],
+                                 "review_decision": decision})
             conn.execute("COMMIT")
-        return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks}
+        return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks, "review_decision": decision}
+
+    def review_decision(self, run_id: str) -> Dict[str, Any]:
+        with self.connect() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not run or not run["snapshot_id"]:
+                raise ValueError("snapshot_missing")
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+            snap = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?", (run["snapshot_id"],)).fetchone()
+            if not task or not snap:
+                raise ValueError("review_basis_missing")
+            payload = self._task_payload(task)
+            manifest = json.loads(snap["manifest_json"])
+            return decide_review(payload, manifest, attempt=int(run["attempt"]))
 
     def import_review(self, run_id: str, report_path: Path) -> Dict[str, Any]:
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -517,17 +555,20 @@ class Orchestrator:
                 if not approval or approval["snapshot_id"] != run["snapshot_id"]:
                     raise ValueError("owner_approval_missing_or_stale")
         pub = payload.get("publication", {})
-        if pub.get("kind") != "git":
+        if pub.get("kind") not in {"git", "git_local"}:
             raise ValueError("git_publication_not_configured")
         workspace = Path(payload["workspace"]).resolve()
         changed = sorted(manifest.get("files", {}).keys())
         if not changed:
             raise ValueError("nothing_to_publish")
+        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        env.update({"GIT_PAGER": "cat", "PAGER": "cat"})
         def git(*args: str) -> subprocess.CompletedProcess:
-            env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
-            env.update({"GIT_PAGER": "cat", "PAGER": "cat"})
             return subprocess.run(["git", "-C", str(workspace), *args], env=env,
                                   capture_output=True, text=True, timeout=30, check=False)
+        def git_bytes(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", str(workspace), *args], env=env,
+                                  capture_output=True, text=False, timeout=30, check=False)
         branch = git("branch", "--show-current")
         if branch.returncode or branch.stdout.strip() != pub.get("branch", "main"):
             raise ValueError("publication_branch_mismatch")
@@ -535,40 +576,45 @@ class Orchestrator:
         head = git("rev-parse", "HEAD")
         if expected_base and head.stdout.strip() != expected_base:
             raise ValueError("publication_base_changed")
-        existing_staged = git("diff", "--cached", "--name-only")
-        if existing_staged.returncode or existing_staged.stdout.strip():
+        existing_staged = git_bytes("diff", "--cached", "--name-only", "-z")
+        if existing_staged.returncode or existing_staged.stdout:
             raise ValueError("preexisting_staging_not_empty")
         add = git("add", "--", *changed)
         if add.returncode:
             raise RuntimeError("git_add_failed:" + add.stderr[-1000:])
-        staged = sorted(line for line in git("diff", "--cached", "--name-only").stdout.splitlines() if line)
+        staged_result = git_bytes("diff", "--cached", "--name-only", "-z")
+        staged = sorted(os.fsdecode(item) for item in staged_result.stdout.split(b"\0") if item) if staged_result.returncode == 0 else []
         if staged != changed:
             raise ValueError("staged_scope_mismatch")
         for relative, recorded in manifest["files"].items():
-            staged_blob = git("show", f":{relative}")
-            if staged_blob.returncode or sha256_bytes(staged_blob.stdout.encode("utf-8")) != recorded["sha256"]:
+            staged_blob = git_bytes("show", f":{relative}")
+            if staged_blob.returncode or sha256_bytes(staged_blob.stdout) != recorded["sha256"]:
                 raise ValueError(f"staged_bytes_mismatch:{relative};staging_requires_reconciliation")
         message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
         commit = git("commit", "-m", message, "--", *changed)
         if commit.returncode:
             raise RuntimeError("git_commit_failed:" + commit.stderr[-1000:])
         commit_id = git("rev-parse", "HEAD").stdout.strip()
+        remote_commit = None
         remote = pub.get("remote", "origin")
         ref = pub.get("ref", "main")
-        push = git("push", remote, f"HEAD:{ref}")
-        if push.returncode:
-            raise RuntimeError("git_push_failed:" + push.stderr[-1000:])
-        remote_ref = git("ls-remote", remote, f"refs/heads/{ref}")
-        remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
-        if remote_commit != commit_id:
-            raise ValueError("remote_verification_failed")
+        if pub.get("kind") == "git":
+            push = git("push", remote, f"HEAD:{ref}")
+            if push.returncode:
+                raise RuntimeError("git_push_failed:" + push.stderr[-1000:])
+            remote_ref = git("ls-remote", remote, f"refs/heads/{ref}")
+            remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
+            if remote_commit != commit_id:
+                raise ValueError("remote_verification_failed")
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("UPDATE runs SET state='COMPLETE',completed_at=? WHERE run_id=?", (now, run_id))
             conn.execute("UPDATE tasks SET status='DONE',updated_at=? WHERE task_id=?", (now, run["task_id"]))
             self._event(conn, "PUBLISHED", task_id=run["task_id"], run_id=run_id,
-                        payload={"commit": commit_id, "remote": remote, "ref": ref})
+                        payload={"commit": commit_id, "kind": pub.get("kind"),
+                                 "remote": remote if pub.get("kind") == "git" else None,
+                                 "ref": ref if pub.get("kind") == "git" else None})
             conn.execute("COMMIT")
         return {"status": "COMPLETE", "commit": commit_id, "remote_commit": remote_commit}
 
