@@ -146,6 +146,25 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
         self.assertEqual(orch.publish(claim["run_id"])["status"], "COMPLETE")
 
+    def test_git_local_publication_supports_tracked_deletion(self):
+        legacy=self.repo/'legacy.txt'; legacy.write_text('remove me\n',encoding='utf-8')
+        subprocess.run(['git','-C',str(self.repo),'add','legacy.txt'],check=True)
+        subprocess.run(['git','-C',str(self.repo),'commit','-m','add legacy'],check=True,capture_output=True)
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='DEL-1',goal='remove legacy',allowed_paths=['legacy.txt'])
+        orch=Orchestrator(self.home); plan_path=self.home/'delete-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture'); legacy.unlink()
+        receipt=self.home/'delete-receipt.json'
+        receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'DEL-1','changed_paths':['legacy.txt']}),encoding='utf-8')
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
+        verified=orch.verify(claim['run_id']); self.assertEqual(verified['status'],'VERIFIED')
+        published=orch.publish(claim['run_id']); self.assertEqual(published['status'],'COMPLETE')
+        self.assertFalse(legacy.exists())
+        probe=subprocess.run(['git','-C',str(self.repo),'show','HEAD:legacy.txt'],capture_output=True)
+        self.assertNotEqual(probe.returncode,0)
+
     def test_doctor_without_rdc_marker_is_attention_not_hard_block(self):
         result = run_doctor(self.home, check_codex=False)
         self.assertIn(result["status"], {"ATTENTION", "READY"})

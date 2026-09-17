@@ -176,6 +176,20 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'invalid_protected_hash'):
             self.load([bad_hash],revision='bad-hash')
 
+    def test_review_export_records_deleted_files_without_recreating_them(self):
+        task=self.task('T1',review=True); self.load([task])
+        target=self.ws/'T1.json'; target.write_text('{"old":true}\n',encoding='utf-8')
+        claim=self.orch.claim('w'); target.unlink()
+        receipt=self.root/'delete-review-receipt.json'
+        receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
+        lease=self.orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        self.orch.submit(claim['run_id'],lease,receipt); self.orch.quiesce(claim['run_id'],lease)
+        verified=self.orch.verify(claim['run_id']); self.assertEqual(verified['status'],'REVIEWING')
+        prepared=prepare_review(self.orch,claim['run_id']); prompt=json.loads(Path(prepared['prompt']).read_text())
+        self.assertEqual(prompt['deleted_files'],['T1.json'])
+        self.assertTrue(prompt['file_manifest']['T1.json']['deleted'])
+        self.assertFalse((Path(prepared['workspace'])/'T1.json').exists())
+
     def test_plan_revision_digest_conflict(self):
         self.load([self.task('T1')],revision='same')
         path=self.root/'other.json'; path.write_text(json.dumps({'schema_version':1,'plan_revision':'same','tasks':[self.task('T2')]})+'\n')

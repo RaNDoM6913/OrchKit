@@ -81,8 +81,11 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
     if export.exists(): shutil.rmtree(export)
     work=export/'workspace'; work.mkdir(parents=True)
     workspace=Path(payload['workspace']).resolve()
-    copied=set()
-    for rel in sorted(manifest.get('files',{})):
+    copied=set(); deleted_files=[]
+    for rel, meta in sorted(manifest.get('files',{}).items()):
+        if meta.get('deleted'):
+            deleted_files.append(rel)
+            continue
         src=safe_workspace_path(workspace,rel,must_exist=True)
         dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied.add(rel)
     support_files={}
@@ -120,7 +123,8 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
     schema_path=export/'review_schema.json'; schema_path.write_text(json.dumps(schema,indent=2)+'\n',encoding='utf-8')
     prompt={'role':'reviewer_only','run_id':run_id,'snapshot_id':run['snapshot_id'],'goal':payload.get('goal'),'non_goals':payload.get('non_goals',[]),
             'review_decision':decision,
-            'files':sorted(manifest.get('files',{})),'support_files':support_files,'checks':payload.get('checks',[]),
+            'files':sorted(manifest.get('files',{})),'deleted_files':deleted_files,
+            'file_manifest':manifest.get('files',{}),'support_files':support_files,'checks':payload.get('checks',[]),
             'verification_evidence':verification,
             'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.',
                             'Verifier checks already ran against the source workspace; inspect supplied evidence and frozen support files.',

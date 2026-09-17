@@ -424,10 +424,13 @@ class Orchestrator:
         workspace = Path(payload["workspace"]).resolve()
         files: Dict[str, Any] = {}
         for relative in sorted(set(changed_paths)):
-            path = safe_workspace_path(workspace, relative, must_exist=True)
+            path = safe_workspace_path(workspace, relative, must_exist=False)
+            if not path.exists():
+                files[relative] = {"deleted": True, "sha256": None, "bytes": 0, "mode": None}
+                continue
             if not path.is_file():
                 raise ValueError(f"not_regular_file:{relative}")
-            files[relative] = {"sha256": sha256_file(path), "bytes": path.stat().st_size,
+            files[relative] = {"deleted": False, "sha256": sha256_file(path), "bytes": path.stat().st_size,
                                "mode": oct(path.stat().st_mode & 0o777)}
         protected_results: Dict[str, Any] = {}
         for relative, expected_hash in sorted(payload.get("protected_paths", {}).items()):
@@ -586,8 +589,12 @@ class Orchestrator:
         manifest = json.loads(snap["manifest_json"])
         workspace = Path(payload["workspace"]).resolve()
         for relative, recorded in manifest.get("files", {}).items():
-            path = safe_workspace_path(workspace, relative, must_exist=True)
-            if sha256_file(path) != recorded["sha256"]:
+            path = safe_workspace_path(workspace, relative, must_exist=False)
+            if recorded.get("deleted"):
+                if path.exists():
+                    raise ValueError(f"snapshot_stale:{relative}")
+                continue
+            if not path.is_file() or sha256_file(path) != recorded["sha256"]:
                 raise ValueError(f"snapshot_stale:{relative}")
         for relative, recorded in manifest.get("protected", {}).items():
             path = safe_workspace_path(workspace, relative, must_exist=True)
@@ -688,6 +695,10 @@ class Orchestrator:
             raise ValueError("staged_scope_mismatch")
         for relative, recorded in manifest["files"].items():
             staged_blob = git_bytes("show", f":{relative}")
+            if recorded.get("deleted"):
+                if staged_blob.returncode == 0:
+                    raise ValueError(f"staged_deletion_mismatch:{relative};staging_requires_reconciliation")
+                continue
             if staged_blob.returncode or sha256_bytes(staged_blob.stdout) != recorded["sha256"]:
                 raise ValueError(f"staged_bytes_mismatch:{relative};staging_requires_reconciliation")
         message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
