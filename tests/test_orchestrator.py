@@ -1,0 +1,104 @@
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+from orch.core import Orchestrator
+
+
+class OrchestratorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        self.root=Path(self.tmp.name)/'orch'; self.root.mkdir()
+        self.ws=Path(self.tmp.name)/'ws'; self.ws.mkdir()
+        self.orch=Orchestrator(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load(self,tasks,revision='p1'):
+        path=self.root/'plan.json'
+        path.write_text(json.dumps({'schema_version':1,'plan_revision':revision,'tasks':tasks}),encoding='utf-8')
+        return self.orch.load_plan(path)
+
+    def task(self,tid='T1',deps=None,checks=None,review=False,protected=None,max_attempts=2):
+        return {'id':tid,'goal':'test','workspace':str(self.ws),'dependencies':deps or [],'allowed_paths':[f'{tid}.json'],
+                'protected_paths':protected or {},'checks':checks or [],'required_review':review,'owner_acceptance':False,
+                'publication':{'kind':'none'},'max_attempts':max_attempts}
+
+    def write_result(self,claim,tid='T1',value=1):
+        (self.ws/f'{tid}.json').write_text(json.dumps({'value':value})+'\n',encoding='utf-8')
+        receipt=self.root/f'{tid}-receipt.json'
+        receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':tid,'changed_paths':[f'{tid}.json']})+'\n',encoding='utf-8')
+        cap=Path(claim['capability_file'])
+        lease=self.orch.lease_from_capability(claim['run_id'],cap)
+        self.orch.submit(claim['run_id'],lease,receipt)
+        self.orch.quiesce(claim['run_id'],lease)
+        return self.orch.verify(claim['run_id'])
+
+    def test_dependency_sequence_and_no_work(self):
+        self.load([self.task('T1'),self.task('T2',deps=['T1'])])
+        c1=self.orch.claim('w1'); self.assertEqual(c1['task_id'],'T1')
+        self.write_result(c1,'T1'); self.orch.complete(c1['run_id'])
+        c2=self.orch.claim('w2'); self.assertEqual(c2['task_id'],'T2')
+        self.write_result(c2,'T2'); self.orch.complete(c2['run_id'])
+        self.assertEqual(self.orch.claim('w3')['status'],'NO_WORK')
+
+    def test_single_writer_busy(self):
+        self.load([self.task('T1'),self.task('T2')])
+        first=self.orch.claim('w1')
+        second=self.orch.claim('w2')
+        self.assertEqual(first['status'],'CLAIMED'); self.assertEqual(second['status'],'BUSY')
+        self.assertEqual(second['active']['run_id'],first['run_id'])
+
+    def test_scope_escape_rejected(self):
+        self.load([self.task('T1')]); c=self.orch.claim('w')
+        receipt=self.root/'bad.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')
+        lease=self.orch.lease_from_capability(c['run_id'],Path(c['capability_file']))
+        with self.assertRaisesRegex(ValueError,'path_not_allowed'):
+            self.orch.submit(c['run_id'],lease,receipt)
+
+    def test_failed_check_feedback_moves_to_new_chat_attempt(self):
+        check={'id':'fail','argv':[sys.executable,'-c','import sys; sys.exit(7)'],'cwd':'.','timeout_sec':5}
+        self.load([self.task('T1',checks=[check])])
+        c1=self.orch.claim('w1'); result=self.write_result(c1,'T1')
+        self.assertEqual(result['status'],'NEEDS_FIX')
+        c2=self.orch.claim('w2')
+        self.assertEqual(c2['attempt'],2)
+        self.assertEqual(c2['context']['feedback']['kind'],'verification_failure')
+        self.assertEqual(c2['context']['previous_snapshot_id'],result['snapshot_id'])
+
+    def test_protected_change_blocks_verification(self):
+        sentinel=self.ws/'owner.txt'; sentinel.write_text('keep\n')
+        digest=hashlib.sha256(sentinel.read_bytes()).hexdigest()
+        self.load([self.task('T1',protected={'owner.txt':digest})])
+        c=self.orch.claim('w'); (self.ws/'T1.json').write_text('{"value":1}\n'); sentinel.write_text('changed\n')
+        receipt=self.root/'r.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
+        lease=self.orch.lease_from_capability(c['run_id'],Path(c['capability_file']))
+        self.orch.submit(c['run_id'],lease,receipt); self.orch.quiesce(c['run_id'],lease)
+        with self.assertRaisesRegex(ValueError,'protected_path_changed'):
+            self.orch.verify(c['run_id'])
+
+    def test_review_is_snapshot_bound_and_feedback_reappears(self):
+        self.load([self.task('T1',review=True)])
+        c1=self.orch.claim('w1'); verified=self.write_result(c1,'T1')
+        self.assertEqual(verified['status'],'REVIEWING')
+        wrong=self.root/'wrong.json'; wrong.write_text(json.dumps({'run_id':c1['run_id'],'snapshot_id':'sha256:wrong','verdict':'PASS','findings':[],'uncertainty':[]})+'\n')
+        with self.assertRaisesRegex(ValueError,'stale_review'):
+            self.orch.import_review(c1['run_id'],wrong)
+        report=self.root/'review.json'; report.write_text(json.dumps({'run_id':c1['run_id'],'snapshot_id':verified['snapshot_id'],'verdict':'NEEDS_FIX','findings':[{'severity':'important','path':'T1.json','evidence':'fixture','impact':'repair'}],'uncertainty':[]})+'\n')
+        self.orch.import_review(c1['run_id'],report)
+        c2=self.orch.claim('w2')
+        self.assertEqual(c2['context']['feedback']['kind'],'review')
+        self.assertEqual(c2['context']['feedback']['findings'][0]['path'],'T1.json')
+
+    def test_plan_revision_digest_conflict(self):
+        self.load([self.task('T1')],revision='same')
+        path=self.root/'other.json'; path.write_text(json.dumps({'schema_version':1,'plan_revision':'same','tasks':[self.task('T2')]})+'\n')
+        with self.assertRaisesRegex(ValueError,'plan_revision_digest_conflict'):
+            self.orch.load_plan(path)
+
+if __name__=='__main__':
+    unittest.main()

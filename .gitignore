@@ -1,0 +1,8 @@
+/.runtime/
+/spikes/
+/fixtures/
+__pycache__/
+*.pyc
+.DS_Store
+/demo-plan.json
+/live-plan.json
