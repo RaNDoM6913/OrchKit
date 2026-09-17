@@ -15,6 +15,7 @@ from .git_policy import evaluate_project_git_policy
 from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
+from .state import backup_state, check_state, prune_capabilities
 
 
 def root_from_args(args: argparse.Namespace) -> Path:
@@ -88,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
     git_policy = git_sub.add_parser("policy"); git_policy.add_argument("project_id")
 
     sub.add_parser("init")
+    state = sub.add_parser("state", help="inspect and maintain durable ORCH state")
+    state_sub = state.add_subparsers(dest="state_command", required=True)
+    state_sub.add_parser("check")
+    state_backup = state_sub.add_parser("backup"); state_backup.add_argument("--output")
+    state_sub.add_parser("prune-capabilities")
     load = sub.add_parser("load-plan"); load.add_argument("plan")
     claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True)
     context = sub.add_parser("context"); context.add_argument("--run-id", required=True)
@@ -171,6 +177,16 @@ def main(argv=None) -> int:
                 raise ValueError("unknown_git_command")
         elif args.command == "init":
             result = {"status": "OK", "root": str(root), "db": str(orch.db_path)}
+        elif args.command == "state":
+            if args.state_command == "check":
+                result = check_state(orch)
+            elif args.state_command == "backup":
+                output = Path(args.output).expanduser().resolve() if args.output else None
+                result = backup_state(orch, output)
+            elif args.state_command == "prune-capabilities":
+                result = prune_capabilities(orch)
+            else:
+                raise ValueError("unknown_state_command")
         elif args.command == "load-plan":
             result = orch.load_plan(Path(args.plan).expanduser().resolve())
         elif args.command == "claim":

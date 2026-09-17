@@ -13,3 +13,4 @@ __pycache__/
 /dist/
 /*.egg-info/
 /dispatcher-prompt.txt
+/backups/

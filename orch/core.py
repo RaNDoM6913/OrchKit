@@ -216,6 +216,11 @@ class Orchestrator:
         """
         with self.connect() as conn:
             conn.executescript(schema)
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1):
+                raise ValueError(f"unsupported_state_schema:{version}")
+            if version == 0:
+                conn.execute("PRAGMA user_version=1")
 
     def _event(self, conn: sqlite3.Connection, kind: str, *, task_id: str = None,
                run_id: str = None, payload: Dict[str, Any] = None) -> None:
