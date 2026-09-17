@@ -21,9 +21,10 @@ Work:
 10. If verify returns NEEDS_FIX, leave the failed attempt frozen and continue to Dispatch. The next new ChatGPT receives bounded feedback from ORCH.
 11. If verify returns REVIEWING, run review-decision. Only if reviewer=codex, run codex-review --execute. If review is unavailable/blocked/unknown-billing, stop; never substitute another AI or paid API. If review returns NEEDS_FIX, continue to Dispatch.
 12. If VERIFIED: obey owner-approval and publication policy. For allowed git or git_local publication use publish; for publication kind=none use complete. Never force push/reset/clean/stash.
+13. If publish returns ERROR or its outcome is uncertain, DO NOT blindly call publish again. Run publish-reconcile --run-id <run_id> first. If it returns SAFE_TO_RETRY, call publish once. If it returns STAGED_PENDING_COMMIT or COMMIT_PROVEN_REMOTE_PENDING with resume_available=true, run publish-reconcile --run-id <run_id> --resume. If it returns BLOCKED or any unrecognized state, stop and do not dispatch another writer.
 
 Dispatch:
-13. Only when the current run is no longer active, run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} next
-14. If READY, re-arm/reschedule THIS SAME standalone Scheduled Task for a later one-time run with this exact prompt unchanged. The next execution is intentionally a fresh ChatGPT conversation and must claim new durable context from ORCH.
-15. If NO_WORK, leave the task disabled. If BUSY/PAUSED/ERROR/WAITING_OWNER, do not re-arm.
-16. End with factual task/run/check/review/publication/next-state results. Never invent a chat ID or URL.
+14. Only when the current run is no longer active, run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} next
+15. If READY, re-arm/reschedule THIS SAME standalone Scheduled Task for a later one-time run with this exact prompt unchanged. The next execution is intentionally a fresh ChatGPT conversation and must claim new durable context from ORCH.
+16. If NO_WORK, leave the task disabled. If BUSY/PAUSED/ERROR/WAITING_OWNER, do not re-arm.
+17. End with factual task/run/check/review/publication/next-state results. Never invent a chat ID or URL.

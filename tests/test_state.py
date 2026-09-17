@@ -22,7 +22,7 @@ class StateMaintenanceTests(unittest.TestCase):
     def test_fresh_state_has_schema_version_and_integrity(self):
         result = check_state(self.orch)
         self.assertEqual(result["status"], "READY")
-        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["quick_check"], ["ok"])
         self.assertEqual(result["foreign_key_violations"], [])
 
@@ -57,7 +57,7 @@ class StateMaintenanceTests(unittest.TestCase):
         conn = sqlite3.connect(str(extracted))
         try:
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
         finally:
             conn.close()
 

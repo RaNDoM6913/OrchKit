@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.2 productization
+# Agent Workflow Orchestrator — v0.3 reliability hardening
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -7,8 +7,8 @@ A local, subscription-only coordinator for development performed by real ChatGPT
 Implemented and locally verified on 2026-09-17:
 
 - SQLite durable plan/task/run/event ledger with immutable plan-revision digests.
-- DAG dependency checks and atomic single-writer claims.
-- Capability-file based run authority (`0600`) so lease secrets are not put in command arguments.
+- DAG dependency checks, cycle rejection, task-id conflict detection, and atomic single-writer claims.
+- Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capabilities are revoked at quiesce/abort.
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.
 - Cooperative quiescence marker with the direct-RDC residual risk explicitly recorded.
@@ -16,8 +16,8 @@ Implemented and locally verified on 2026-09-17:
 - Snapshot-bound review import; failed verification/review becomes `NEEDS_FIX` and is picked up by a **new** ChatGPT run.
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
-- Exact Git publication: verified bytes → exact stage → one commit → ordinary push → `ls-remote` verification. Pre-existing staging blocks publication.
-- Recovery/status commands do not auto-expire active writers; explicit `pause`, `resume`, and `abort --retry` are available.
+- Exact Git publication: verified bytes/deletions → exact stage → one commit → ordinary push → `ls-remote` verification. A schema-v2 publication journal records INTENT/STAGED/COMMITTED/PUSHED/REMOTE_VERIFIED so uncertain outcomes are reconciled before retry.
+- Recovery/status commands do not auto-expire active writers; explicit `pause`, `resume`, and `abort --retry` are available. `state check`, secret-free local backups, stale-capability pruning, and publication reconciliation are implemented.
 - Owner acceptance is stored separately and bound to the exact `run_id + snapshot_id`.
 - Packaged Scheduled ChatGPT dispatcher template at `orch/templates/dispatcher_prompt.txt`; `orch dispatcher render` creates the user-specific prompt. `dispatcher_prompt.txt` is the repo-local development render.
 
@@ -35,7 +35,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.2 separates installed ORCH state from the source tree. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.3 keeps the v0.2 install model and adds fail-closed recovery/state hardening. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -43,7 +43,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The produced `agent_workflow_orchestrator-0.2.0-py3-none-any.whl` was installed into a clean temporary venv and verified to expose the `orch` console command, initialize a fresh ORCH home, register a new Git project, protect pre-existing dirty bytes, and render the packaged dispatcher prompt.
+The produced `agent_workflow_orchestrator-0.3.0-py3-none-any.whl` was installed into a clean temporary venv and verified to expose the `orch` console command, initialize a fresh ORCH home, register a new Git project, protect pre-existing dirty bytes, and render the packaged dispatcher prompt.
 
 First-run flow for another user:
 
@@ -95,6 +95,8 @@ cd <orchkit-root>
 ./bin/orch next
 ./bin/orch status
 ./bin/orch reconcile
+./bin/orch state check
+./bin/orch state backup
 ```
 
 A scheduled ChatGPT worker claims exactly one attempt:
@@ -121,6 +123,18 @@ For a normal verified task use `publish` when publication kind is `git`, otherwi
 
 `codex-review --execute` refuses to run when the official account preflight is not a ChatGPT-authenticated, non-exhausted subscription path or purchased-credit availability is detected.
 
+### Publication crash recovery
+
+`publish` writes a durable publication intent before the first Git side effect. If a commit/push result becomes uncertain, do not blindly repeat it:
+
+```sh
+orch publish-reconcile --run-id RUN
+# only when the observed state reports resume_available=true:
+orch publish-reconcile --run-id RUN --resume
+```
+
+Reconciliation can prove a staged snapshot, adopt a commit that happened before the journal update, verify an already-pushed remote commit, or return `SAFE_TO_RETRY` only when no Git side effect is observed. Unexpected staging or remote advancement blocks automatic continuation.
+
 ## Scheduled dispatcher
 
 The dispatcher template packaged with ORCH is the durable bootstrap. `orch dispatcher render` substitutes the user's ORCH home and executable into a reusable standalone Scheduled Task prompt. One task uses it to claim one task, do the work via RDC, verify/review/publish, call `orch next`, and — only when `READY` — re-arm itself for one later run with the same prompt. ORCH-001 established that a later standalone run does not inherit the previous model context, so each block receives a clean ChatGPT execution context while the local ledger supplies the durable handoff. When the queue reaches `NO_WORK`, the task is left disabled.
@@ -143,4 +157,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current 24-test suite keeps the original 11 orchestration/recovery/review tests and adds productization coverage for setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, generated plans, local-only publication, binary staged-byte verification, dotfile/path-scope safety, and doctor behavior.
+The current 39-test suite covers orchestration/recovery/review, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

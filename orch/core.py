@@ -213,14 +213,20 @@ class Orchestrator:
           seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, kind TEXT NOT NULL,
           task_id TEXT, run_id TEXT, payload_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS publications (
+          run_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+          expected_base TEXT, staged_paths_json TEXT, commit_id TEXT, remote_commit TEXT,
+          error TEXT, updated_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES runs(run_id)
+        );
         """
         with self.connect() as conn:
             conn.executescript(schema)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise ValueError(f"unsupported_state_schema:{version}")
-            if version == 0:
-                conn.execute("PRAGMA user_version=1")
+            if version < 2:
+                conn.execute("PRAGMA user_version=2")
 
     def _event(self, conn: sqlite3.Connection, kind: str, *, task_id: str = None,
                run_id: str = None, payload: Dict[str, Any] = None) -> None:
@@ -654,6 +660,92 @@ class Orchestrator:
             conn.execute("COMMIT")
             return {"status": "APPROVED", "run_id": run_id, "snapshot_id": run["snapshot_id"]}
 
+    def _publication_update(self, run_id: str, *, status: str, operation_id: Optional[str] = None,
+                            kind: Optional[str] = None, expected_base: Optional[str] = None,
+                            staged_paths: Optional[List[str]] = None, commit_id: Optional[str] = None,
+                            remote_commit: Optional[str] = None, error: Optional[str] = None) -> None:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT * FROM publications WHERE run_id=?", (run_id,)).fetchone()
+            now = utc_now()
+            if existing:
+                conn.execute(
+                    "UPDATE publications SET status=?,staged_paths_json=COALESCE(?,staged_paths_json),"
+                    "commit_id=COALESCE(?,commit_id),remote_commit=COALESCE(?,remote_commit),error=?,updated_at=? WHERE run_id=?",
+                    (status, canonical_json(staged_paths) if staged_paths is not None else None,
+                     commit_id, remote_commit, error, now, run_id),
+                )
+            else:
+                if not operation_id or not kind:
+                    raise ValueError("publication_intent_metadata_required")
+                conn.execute(
+                    "INSERT INTO publications(run_id,operation_id,kind,status,expected_base,staged_paths_json,commit_id,remote_commit,error,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, operation_id, kind, status, expected_base,
+                     canonical_json(staged_paths) if staged_paths is not None else None,
+                     commit_id, remote_commit, error, now),
+                )
+
+    def _publication_git(self, workspace: Path, *, binary: bool = False):
+        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        env.update({"GIT_PAGER": "cat", "PAGER": "cat"})
+        def run(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", str(workspace), *args], env=env,
+                                  capture_output=True, text=not binary, timeout=30, check=False)
+        return run
+
+    def _staged_matches_snapshot(self, workspace: Path, manifest: Dict[str, Any]) -> bool:
+        gitb = self._publication_git(workspace, binary=True)
+        changed = sorted(manifest.get("files", {}))
+        staged_result = gitb("diff", "--cached", "--name-only", "-z")
+        staged = sorted(os.fsdecode(item) for item in staged_result.stdout.split(b"\0") if item) if staged_result.returncode == 0 else []
+        if staged != changed:
+            return False
+        for relative, recorded in manifest.get("files", {}).items():
+            blob = gitb("show", f":{relative}")
+            if recorded.get("deleted"):
+                if blob.returncode == 0:
+                    return False
+            elif blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
+                return False
+        return True
+
+    def _commit_matches_snapshot(self, workspace: Path, commit_id: str, expected_base: Optional[str],
+                                 manifest: Dict[str, Any]) -> bool:
+        gitt = self._publication_git(workspace, binary=False)
+        gitb = self._publication_git(workspace, binary=True)
+        changed = sorted(manifest.get("files", {}))
+        paths = gitb("diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit_id)
+        actual_paths = sorted(os.fsdecode(item) for item in paths.stdout.split(b"\0") if item) if paths.returncode == 0 else []
+        if actual_paths != changed:
+            return False
+        if expected_base:
+            parent = gitt("rev-parse", f"{commit_id}^")
+            if parent.returncode or parent.stdout.strip() != expected_base:
+                return False
+        for relative, recorded in manifest.get("files", {}).items():
+            blob = gitb("show", f"{commit_id}:{relative}")
+            if recorded.get("deleted"):
+                if blob.returncode == 0:
+                    return False
+            elif blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
+                return False
+        return True
+
+    def _finalize_publication(self, run_id: str, task_id: str, *, commit_id: str,
+                              remote_commit: Optional[str], kind: str, remote: Optional[str], ref: Optional[str]) -> Dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE publications SET status='COMPLETE',commit_id=?,remote_commit=?,error=NULL,updated_at=? WHERE run_id=?",
+                         (commit_id, remote_commit, now, run_id))
+            conn.execute("UPDATE runs SET state='COMPLETE',completed_at=? WHERE run_id=?", (now, run_id))
+            conn.execute("UPDATE tasks SET status='DONE',updated_at=? WHERE task_id=?", (now, task_id))
+            self._event(conn, "PUBLISHED", task_id=task_id, run_id=run_id,
+                        payload={"commit": commit_id, "kind": kind, "remote": remote, "ref": ref,
+                                 "remote_commit": remote_commit})
+            conn.execute("COMMIT")
+        return {"status": "COMPLETE", "commit": commit_id, "remote_commit": remote_commit}
+
     def publish(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:
             run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -662,6 +754,14 @@ class Orchestrator:
             task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
             payload = self._task_payload(task)
             manifest = self._assert_snapshot_current(conn, run, payload)
+            existing = conn.execute("SELECT status FROM publications WHERE run_id=?", (run_id,)).fetchone()
+            if existing and existing["status"] not in {"ABANDONED"}:
+                if existing["status"] == "COMPLETE":
+                    row = conn.execute("SELECT commit_id,remote_commit FROM publications WHERE run_id=?", (run_id,)).fetchone()
+                    return {"status": "COMPLETE", "commit": row["commit_id"], "remote_commit": row["remote_commit"]}
+                raise ValueError(f"publication_reconciliation_required:{existing['status']}")
+            if existing and existing["status"] == "ABANDONED":
+                conn.execute("DELETE FROM publications WHERE run_id=?", (run_id,))
             if payload.get("owner_acceptance"):
                 approval = conn.execute("SELECT snapshot_id FROM approvals WHERE run_id=?", (run_id,)).fetchone()
                 if not approval or approval["snapshot_id"] != run["snapshot_id"]:
@@ -673,66 +773,139 @@ class Orchestrator:
         changed = sorted(manifest.get("files", {}).keys())
         if not changed:
             raise ValueError("nothing_to_publish")
-        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
-        env.update({"GIT_PAGER": "cat", "PAGER": "cat"})
-        def git(*args: str) -> subprocess.CompletedProcess:
-            return subprocess.run(["git", "-C", str(workspace), *args], env=env,
-                                  capture_output=True, text=True, timeout=30, check=False)
-        def git_bytes(*args: str) -> subprocess.CompletedProcess:
-            return subprocess.run(["git", "-C", str(workspace), *args], env=env,
-                                  capture_output=True, text=False, timeout=30, check=False)
-        branch = git("branch", "--show-current")
+        gitt = self._publication_git(workspace, binary=False)
+        gitb = self._publication_git(workspace, binary=True)
+        branch = gitt("branch", "--show-current")
         if branch.returncode or branch.stdout.strip() != pub.get("branch", "main"):
             raise ValueError("publication_branch_mismatch")
         expected_base = pub.get("expected_base")
-        head = git("rev-parse", "HEAD")
+        head = gitt("rev-parse", "HEAD")
         if expected_base and head.stdout.strip() != expected_base:
             raise ValueError("publication_base_changed")
-        existing_staged = git_bytes("diff", "--cached", "--name-only", "-z")
+        existing_staged = gitb("diff", "--cached", "--name-only", "-z")
         if existing_staged.returncode or existing_staged.stdout:
             raise ValueError("preexisting_staging_not_empty")
-        add = git("add", "--", *changed)
-        if add.returncode:
-            raise RuntimeError("git_add_failed:" + add.stderr[-1000:])
-        staged_result = git_bytes("diff", "--cached", "--name-only", "-z")
-        staged = sorted(os.fsdecode(item) for item in staged_result.stdout.split(b"\0") if item) if staged_result.returncode == 0 else []
-        if staged != changed:
-            raise ValueError("staged_scope_mismatch")
-        for relative, recorded in manifest["files"].items():
-            staged_blob = git_bytes("show", f":{relative}")
-            if recorded.get("deleted"):
-                if staged_blob.returncode == 0:
-                    raise ValueError(f"staged_deletion_mismatch:{relative};staging_requires_reconciliation")
-                continue
-            if staged_blob.returncode or sha256_bytes(staged_blob.stdout) != recorded["sha256"]:
-                raise ValueError(f"staged_bytes_mismatch:{relative};staging_requires_reconciliation")
-        message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
-        commit = git("commit", "-m", message, "--", *changed)
-        if commit.returncode:
-            raise RuntimeError("git_commit_failed:" + commit.stderr[-1000:])
-        commit_id = git("rev-parse", "HEAD").stdout.strip()
-        remote_commit = None
-        remote = pub.get("remote", "origin")
-        ref = pub.get("ref", "main")
-        if pub.get("kind") == "git":
-            push = git("push", remote, f"HEAD:{ref}")
-            if push.returncode:
-                raise RuntimeError("git_push_failed:" + push.stderr[-1000:])
-            remote_ref = git("ls-remote", remote, f"refs/heads/{ref}")
-            remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
-            if remote_commit != commit_id:
-                raise ValueError("remote_verification_failed")
-        now = utc_now()
+        operation_id = uuid.uuid4().hex
+        self._publication_update(run_id, status="INTENT", operation_id=operation_id, kind=pub["kind"], expected_base=expected_base)
+        phase = "INTENT"
+        try:
+            add = gitt("add", "--", *changed)
+            if add.returncode:
+                raise RuntimeError("git_add_failed:" + add.stderr[-1000:])
+            if not self._staged_matches_snapshot(workspace, manifest):
+                raise ValueError("staged_snapshot_mismatch;staging_requires_reconciliation")
+            phase = "STAGED"
+            self._publication_update(run_id, status=phase, staged_paths=changed)
+            message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
+            commit = gitt("commit", "-m", message, "--", *changed)
+            if commit.returncode:
+                raise RuntimeError("git_commit_failed:" + commit.stderr[-1000:])
+            commit_id = gitt("rev-parse", "HEAD").stdout.strip()
+            if not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
+                raise ValueError("committed_snapshot_mismatch")
+            phase = "COMMITTED"
+            self._publication_update(run_id, status=phase, commit_id=commit_id)
+            remote_commit = None
+            remote = pub.get("remote", "origin")
+            ref = pub.get("ref", "main")
+            if pub.get("kind") == "git":
+                push = gitt("push", remote, f"HEAD:{ref}")
+                if push.returncode:
+                    raise RuntimeError("git_push_failed:" + push.stderr[-1000:])
+                phase = "PUSHED"
+                self._publication_update(run_id, status=phase, commit_id=commit_id)
+                remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+                remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
+                if remote_commit != commit_id:
+                    raise ValueError("remote_verification_failed")
+                phase = "REMOTE_VERIFIED"
+                self._publication_update(run_id, status=phase, commit_id=commit_id, remote_commit=remote_commit)
+            return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
+                                              remote_commit=remote_commit, kind=pub["kind"],
+                                              remote=remote if pub.get("kind") == "git" else None,
+                                              ref=ref if pub.get("kind") == "git" else None)
+        except Exception as exc:
+            self._publication_update(run_id, status=phase, error=f"{type(exc).__name__}:{str(exc)[:900]}")
+            raise
+
+    def reconcile_publication(self, run_id: str, *, resume: bool = False) -> Dict[str, Any]:
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("UPDATE runs SET state='COMPLETE',completed_at=? WHERE run_id=?", (now, run_id))
-            conn.execute("UPDATE tasks SET status='DONE',updated_at=? WHERE task_id=?", (now, run["task_id"]))
-            self._event(conn, "PUBLISHED", task_id=run["task_id"], run_id=run_id,
-                        payload={"commit": commit_id, "kind": pub.get("kind"),
-                                 "remote": remote if pub.get("kind") == "git" else None,
-                                 "ref": ref if pub.get("kind") == "git" else None})
-            conn.execute("COMMIT")
-        return {"status": "COMPLETE", "commit": commit_id, "remote_commit": remote_commit}
+            journal = conn.execute("SELECT * FROM publications WHERE run_id=?", (run_id,)).fetchone()
+            run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not journal:
+                return {"status": "NO_PUBLICATION", "run_id": run_id}
+            if not run:
+                raise ValueError("unknown_run")
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+            payload = self._task_payload(task)
+            snap = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?", (run["snapshot_id"],)).fetchone()
+            if not snap:
+                raise ValueError("snapshot_missing")
+            manifest = json.loads(snap["manifest_json"])
+            if journal["status"] == "COMPLETE":
+                return {"status": "COMPLETE", "commit": journal["commit_id"], "remote_commit": journal["remote_commit"]}
+        pub = payload.get("publication", {})
+        workspace = Path(payload["workspace"]).resolve()
+        gitt = self._publication_git(workspace, binary=False)
+        gitb = self._publication_git(workspace, binary=True)
+        expected_base = journal["expected_base"] or pub.get("expected_base")
+        head_result = gitt("rev-parse", "HEAD")
+        head = head_result.stdout.strip() if head_result.returncode == 0 else None
+        staged = self._staged_matches_snapshot(workspace, manifest)
+        status = journal["status"]
+        commit_id = journal["commit_id"]
+        if not commit_id and head and head != expected_base and self._commit_matches_snapshot(workspace, head, expected_base, manifest):
+            commit_id = head
+            status = "COMMITTED"
+            self._publication_update(run_id, status=status, commit_id=commit_id, error=None)
+        if not commit_id and head == expected_base:
+            if not staged:
+                staged_raw = gitb("diff", "--cached", "--name-only", "-z")
+                if staged_raw.returncode == 0 and not staged_raw.stdout and status == "INTENT":
+                    self._publication_update(run_id, status="ABANDONED", error=None)
+                    return {"status": "SAFE_TO_RETRY", "run_id": run_id, "reason": "no_git_side_effect_observed"}
+                return {"status": "BLOCKED", "run_id": run_id, "reason": "unexpected_staging_state"}
+            if not resume:
+                return {"status": "STAGED_PENDING_COMMIT", "run_id": run_id, "resume_available": True}
+            message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
+            commit = gitt("commit", "-m", message, "--", *sorted(manifest.get("files", {})))
+            if commit.returncode:
+                self._publication_update(run_id, status="STAGED", error="git_commit_failed:" + commit.stderr[-900:])
+                return {"status": "BLOCKED", "run_id": run_id, "reason": "git_commit_failed"}
+            commit_id = gitt("rev-parse", "HEAD").stdout.strip()
+            if not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
+                self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error="committed_snapshot_mismatch")
+                return {"status": "BLOCKED", "run_id": run_id, "reason": "committed_snapshot_mismatch"}
+            self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error=None)
+        if not commit_id or not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "commit_not_proven"}
+        if pub.get("kind") == "git_local":
+            return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
+                                              remote_commit=None, kind="git_local", remote=None, ref=None)
+        remote = pub.get("remote", "origin"); ref = pub.get("ref", "main")
+        remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+        remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
+        if remote_commit == commit_id:
+            self._publication_update(run_id, status="REMOTE_VERIFIED", commit_id=commit_id, remote_commit=remote_commit, error=None)
+            return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
+                                              remote_commit=remote_commit, kind="git", remote=remote, ref=ref)
+        if not resume:
+            return {"status": "COMMIT_PROVEN_REMOTE_PENDING", "run_id": run_id,
+                    "commit": commit_id, "remote_commit": remote_commit, "resume_available": True}
+        if remote_commit not in {None, expected_base}:
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "remote_advanced", "remote_commit": remote_commit}
+        push = gitt("push", remote, f"{commit_id}:refs/heads/{ref}")
+        if push.returncode:
+            self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error="git_push_failed:" + push.stderr[-900:])
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "git_push_failed"}
+        self._publication_update(run_id, status="PUSHED", commit_id=commit_id, error=None)
+        remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+        remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
+        if remote_commit != commit_id:
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "remote_verification_failed", "remote_commit": remote_commit}
+        self._publication_update(run_id, status="REMOTE_VERIFIED", commit_id=commit_id, remote_commit=remote_commit, error=None)
+        return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
+                                          remote_commit=remote_commit, kind="git", remote=remote, ref=ref)
 
     def status(self) -> Dict[str, Any]:
         with self.connect() as conn:
@@ -794,5 +967,10 @@ class Orchestrator:
         with self.connect() as conn:
             active = [dict(row) for row in conn.execute("SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at",
                                                        tuple(ACTIVE_RUN_STATES))]
-        return {"status": "ATTENTION" if active else "CLEAN", "active_runs": active,
-                "rule": "No automatic lease expiry; inspect active runs before any new writer."}
+            pending_publications = [dict(row) for row in conn.execute(
+                "SELECT run_id,status,commit_id,remote_commit,error,updated_at FROM publications "
+                "WHERE status NOT IN ('COMPLETE','ABANDONED') ORDER BY updated_at"
+            )]
+        return {"status": "ATTENTION" if active or pending_publications else "CLEAN",
+                "active_runs": active, "pending_publications": pending_publications,
+                "rule": "No automatic lease expiry or blind publication retry; reconcile observed state before a new writer."}

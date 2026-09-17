@@ -1,12 +1,15 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from orch.config import configure_home
 from orch.doctor import run_doctor
+from orch.dispatcher import render_dispatcher
 from orch.git_policy import evaluate_project_git_policy
 from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
@@ -164,6 +167,66 @@ class ProductizationTests(unittest.TestCase):
         self.assertFalse(legacy.exists())
         probe=subprocess.run(['git','-C',str(self.repo),'show','HEAD:legacy.txt'],capture_output=True)
         self.assertNotEqual(probe.returncode,0)
+
+    def test_publication_intent_without_side_effect_is_safe_to_retry(self):
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='REC-1',goal='write result',allowed_paths=['result.json'])
+        orch=Orchestrator(self.home); plan_path=self.home/'rec-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture'); (self.repo/'result.json').write_text('{"ok":1}\n')
+        receipt=self.home/'rec-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-1','changed_paths':['result.json']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
+        pub=claim['context']['publication']
+        orch._publication_update(claim['run_id'],status='INTENT',operation_id='fixture-intent',kind='git_local',expected_base=pub['expected_base'])
+        self.assertEqual(orch.reconcile()['status'],'ATTENTION')
+        reconciled=orch.reconcile_publication(claim['run_id'])
+        self.assertEqual(reconciled['status'],'SAFE_TO_RETRY')
+        published=orch.publish(claim['run_id'])
+        self.assertEqual(published['status'],'COMPLETE')
+        self.assertEqual(orch.reconcile()['status'],'CLEAN')
+
+    def test_publication_reconcile_resumes_exact_staged_snapshot(self):
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='REC-2',goal='write staged',allowed_paths=['stage.json'])
+        orch=Orchestrator(self.home); plan_path=self.home/'stage-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture'); (self.repo/'stage.json').write_text('{"ok":2}\n')
+        receipt=self.home/'stage-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-2','changed_paths':['stage.json']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
+        subprocess.run(['git','-C',str(self.repo),'add','--','stage.json'],check=True)
+        pub=claim['context']['publication']
+        orch._publication_update(claim['run_id'],status='STAGED',operation_id='fixture-staged',kind='git_local',expected_base=pub['expected_base'],staged_paths=['stage.json'])
+        pending=orch.reconcile_publication(claim['run_id'])
+        self.assertEqual(pending['status'],'STAGED_PENDING_COMMIT')
+        finished=orch.reconcile_publication(claim['run_id'],resume=True)
+        self.assertEqual(finished['status'],'COMPLETE')
+
+    def test_publication_reconcile_adopts_commit_after_journal_gap(self):
+        config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
+        plan=build_single_task_plan(config,task_id='REC-3',goal='write committed',allowed_paths=['commit.json'])
+        orch=Orchestrator(self.home); plan_path=self.home/'commit-plan.json'
+        plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
+        claim=orch.claim('fixture'); (self.repo/'commit.json').write_text('{"ok":3}\n')
+        receipt=self.home/'commit-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-3','changed_paths':['commit.json']}))
+        lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
+        orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
+        subprocess.run(['git','-C',str(self.repo),'add','--','commit.json'],check=True)
+        subprocess.run(['git','-C',str(self.repo),'commit','-m','fixture uncertain commit','--','commit.json'],check=True,capture_output=True)
+        pub=claim['context']['publication']
+        orch._publication_update(claim['run_id'],status='STAGED',operation_id='fixture-gap',kind='git_local',expected_base=pub['expected_base'],staged_paths=['commit.json'])
+        finished=orch.reconcile_publication(claim['run_id'])
+        self.assertEqual(finished['status'],'COMPLETE')
+        self.assertEqual(finished['commit'],subprocess.run(['git','-C',str(self.repo),'rev-parse','HEAD'],check=True,capture_output=True,text=True).stdout.strip())
+
+    def test_dispatcher_requires_publication_reconciliation_before_retry(self):
+        with mock.patch.dict(os.environ, {'ORCH_EXECUTABLE':'/tmp/orch'}, clear=False):
+            rendered=render_dispatcher(self.home)
+        text=Path(rendered['path']).read_text(encoding='utf-8')
+        self.assertIn('publish-reconcile --run-id <run_id>',text)
+        self.assertIn('DO NOT blindly call publish again',text)
+        self.assertIn('COMMIT_PROVEN_REMOTE_PENDING',text)
 
     def test_doctor_without_rdc_marker_is_attention_not_hard_block(self):
         result = run_doctor(self.home, check_codex=False)

@@ -106,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     complete = sub.add_parser("complete"); complete.add_argument("--run-id", required=True)
     approve = sub.add_parser("approve"); approve.add_argument("--run-id", required=True); approve.add_argument("--note", default="owner approved")
     publish = sub.add_parser("publish"); publish.add_argument("--run-id", required=True)
+    publish_reconcile = sub.add_parser("publish-reconcile")
+    publish_reconcile.add_argument("--run-id", required=True)
+    publish_reconcile.add_argument("--resume", action="store_true")
     sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
     pause = sub.add_parser("pause"); pause.add_argument("--reason", required=True)
     sub.add_parser("resume")
@@ -214,6 +217,8 @@ def main(argv=None) -> int:
             result = orch.approve(args.run_id, args.note)
         elif args.command == "publish":
             result = orch.publish(args.run_id)
+        elif args.command == "publish-reconcile":
+            result = orch.reconcile_publication(args.run_id, resume=args.resume)
         elif args.command == "status":
             result = orch.status()
         elif args.command == "reconcile":

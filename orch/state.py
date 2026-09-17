@@ -11,7 +11,7 @@ import zipfile
 
 from .core import ACTIVE_RUN_STATES, Orchestrator, utc_now
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 
 def _sha256(path: Path) -> str:
@@ -50,10 +50,14 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
             "SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at",
             tuple(ACTIVE_RUN_STATES),
         )]
+        pending_publications = [dict(row) for row in conn.execute(
+            "SELECT run_id,status,commit_id,remote_commit,error,updated_at FROM publications "
+            "WHERE status NOT IN ('COMPLETE','ABANDONED') ORDER BY updated_at"
+        )]
     quick_values = [row[0] for row in quick]
     caps = capability_health(orch)
     blocked = quick_values != ["ok"] or bool(foreign)
-    attention = bool(active) or caps["status"] != "READY"
+    attention = bool(active) or caps["status"] != "READY" or bool(pending_publications)
     return {
         "status": "BLOCKED" if blocked else "ATTENTION" if attention else "READY",
         "schema_version": user_version,
@@ -62,6 +66,7 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
         "foreign_key_violations": [list(row) for row in foreign],
         "journal_mode": journal_mode,
         "active_runs": active,
+        "pending_publications": pending_publications,
         "capabilities": caps,
     }
 
@@ -104,7 +109,7 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
         raise ValueError("active_runs_present")
     backups = orch.root / "backups"
     backups.mkdir(parents=True, exist_ok=True)
-    target = output.expanduser().resolve() if output else backups / f"orch-state-{utc_now().replace(':','').replace('+00:00','Z')}.zip"
+    target = output.expanduser().resolve() if output else backups / f"orch-state-{utc_now().replace(':','').replace('+0000','Z')}.zip"
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="orch-backup-", dir=str(orch.runtime)) as tmp:
         db_copy = Path(tmp) / "orch.sqlite3"
