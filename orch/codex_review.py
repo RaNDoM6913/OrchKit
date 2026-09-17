@@ -9,7 +9,7 @@ import subprocess
 import time
 from typing import Any, Dict
 
-from .core import Orchestrator, canonical_json, safe_workspace_path, utc_now
+from .core import Orchestrator, canonical_json, safe_workspace_path, sha256_file, utc_now
 
 CODEX_BIN = Path('/Applications/ChatGPT.app/Contents/Resources/codex')
 
@@ -76,8 +76,37 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
     if export.exists(): shutil.rmtree(export)
     work=export/'workspace'; work.mkdir(parents=True)
     workspace=Path(payload['workspace']).resolve()
+    copied=set()
     for rel in sorted(manifest.get('files',{})):
-        src=safe_workspace_path(workspace,rel,must_exist=True); dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        src=safe_workspace_path(workspace,rel,must_exist=True)
+        dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied.add(rel)
+    support_files={}
+    for check in payload.get('checks',[]):
+        for arg in check.get('argv',[])[1:]:
+            if not isinstance(arg,str) or not arg or arg.startswith('-') or Path(arg).is_absolute():
+                continue
+            try:
+                src=safe_workspace_path(workspace,arg,must_exist=True)
+            except (ValueError,OSError):
+                continue
+            if not src.is_file():
+                continue
+            rel=Path(arg).as_posix()
+            if rel not in copied:
+                dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied.add(rel)
+            support_files[rel]={'sha256':sha256_file(src),'purpose':'approved_check_support'}
+    verification=[]
+    evidence_dir=work/'verification_evidence'; evidence_dir.mkdir()
+    for check in payload.get('checks',[]):
+        safe_id=str(check.get('id','check')).replace('/','_')
+        log=orch.logs/f"{run_id}-{safe_id}.json"
+        if not log.is_file():
+            continue
+        data=json.loads(log.read_text(encoding='utf-8'))
+        target=evidence_dir/f"{safe_id}.json"; shutil.copy2(log,target)
+        verification.append({'id':data.get('id'),'exit_code':data.get('exit_code'),'timed_out':data.get('timed_out'),
+                             'stdout':data.get('stdout','')[-2000:],'stderr':data.get('stderr','')[-2000:],
+                             'evidence_file':str(target.relative_to(work)),'sha256':sha256_file(target)})
     schema={'type':'object','additionalProperties':False,'required':['run_id','snapshot_id','verdict','findings','uncertainty'],
             'properties':{'run_id':{'type':'string'},'snapshot_id':{'type':'string'},'verdict':{'type':'string','enum':['PASS','NEEDS_FIX','BLOCKED']},
                           'findings':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['severity','path','evidence','impact'],
@@ -85,7 +114,12 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
                           'uncertainty':{'type':'array','items':{'type':'string'}}}}
     schema_path=export/'review_schema.json'; schema_path.write_text(json.dumps(schema,indent=2)+'\n',encoding='utf-8')
     prompt={'role':'reviewer_only','run_id':run_id,'snapshot_id':run['snapshot_id'],'goal':payload.get('goal'),'non_goals':payload.get('non_goals',[]),
-            'files':sorted(manifest.get('files',{})),'checks':payload.get('checks',[]),'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.','Report only concrete findings.','PASS only when the stated goal/checklist is met.']}
+            'files':sorted(manifest.get('files',{})),'support_files':support_files,'checks':payload.get('checks',[]),
+            'verification_evidence':verification,
+            'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.',
+                            'Verifier checks already ran against the source workspace; inspect supplied evidence and frozen support files.',
+                            'Only rerun an approved check when necessary; never expand beyond the exported workspace.',
+                            'Report only concrete findings.','PASS only when the stated goal/checklist is met.']}
     prompt_path=export/'review_prompt.json'; prompt_path.write_text(json.dumps(prompt,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     return {'export':str(export),'workspace':str(work),'schema':str(schema_path),'prompt':str(prompt_path),'snapshot_id':run['snapshot_id']}
 

@@ -17,10 +17,13 @@ Implemented and locally verified on 2026-09-17:
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
 - Exact Git publication: verified bytes → exact stage → one commit → ordinary push → `ls-remote` verification. Pre-existing staging blocks publication.
-- Recovery/status commands do not auto-expire active writers.
+- Recovery/status commands do not auto-expire active writers; explicit `pause`, `resume`, and `abort --retry` are available.
+- Owner acceptance is stored separately and bound to the exact `run_id + snapshot_id`.
 - Static Scheduled ChatGPT dispatcher prompt at `dispatcher_prompt.txt`.
 
-Local E2E evidence: two dependent fixture tasks completed as two independent runs; both checks passed, two commits were pushed to a local bare remote, local/remote HEAD matched, protected sentinel stayed unchanged, and the queue ended at `NO_WORK`/`CLEAN`.
+Local deterministic E2E evidence: two dependent fixture tasks completed as two independent runs; both checks passed, two commits were pushed to a local bare remote, local/remote HEAD matched, protected sentinel stayed unchanged, and the queue ended at `NO_WORK`/`CLEAN`.
+
+**Real Scheduled ChatGPT E2E also passed:** the reusable standalone dispatcher ran two separate Scheduled ChatGPT workers (`scheduled-variant-b`) through RDC. `LIVE-1` and dependent `LIVE-2` each produced their own run/snapshot, passed independent checks, and were published as commits `f92c918...` and `5830e6b...` to a local bare remote. Final local/remote HEAD matched, the protected sentinel was unchanged, `orch next` returned `NO_WORK`, `orch reconcile` returned `CLEAN`, and the dispatcher was disabled.
 
 ## Why Variant B
 
@@ -65,9 +68,13 @@ For a normal verified task use `publish` when publication kind is `git`, otherwi
 
 ## Scheduled dispatcher
 
-`dispatcher_prompt.txt` is the durable bootstrap. A standalone Scheduled Task uses it to claim one task, do the work via RDC, verify/publish, call `orch next`, and — only when `READY` — create exactly one new one-time standalone Scheduled Task using the same prompt. Thus each block receives a clean ChatGPT conversation automatically.
+`dispatcher_prompt.txt` is the durable bootstrap. One reusable standalone Scheduled Task uses it to claim one task, do the work via RDC, verify/publish, call `orch next`, and — only when `READY` — re-arm itself for one later run with the same prompt. ORCH-001 established that a later standalone run does not inherit the previous model context, so each block receives a clean ChatGPT execution context while the local ledger supplies the durable handoff. When the queue reaches `NO_WORK`, the task is left disabled.
 
 The launcher is intentionally platform-native. The local Python program does **not** hold or repurpose OpenAI OAuth tokens and does not call a model API.
+
+## Real Codex review evidence
+
+The subscription reviewer path is not only mocked. With account preflight showing ChatGPT auth, purchased credits disabled/balance 0 and the included limit available, a real Codex review was executed against a frozen disposable fixture. The first review correctly blocked because the export omitted its approved check support. ChatGPT repaired `orch/codex_review.py`; a fresh second snapshot received a real Codex `PASS` with exit code 0. The final adapter also places verifier evidence inside the exported workspace and has deterministic test coverage. No external AI or paid API fallback was used.
 
 ## Security boundary
 
@@ -81,4 +88,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The unit suite covers DAG ordering, single writer, scope escape, protected-file tamper, failed verifier → new-attempt feedback, stale review rejection and plan-revision digest conflicts.
+The final 11-test suite covers DAG ordering, single writer, scope escape, protected-file tamper, failed verifier → new-attempt feedback, stale review rejection, snapshot-bound owner approval, pause/resume, abort/retry, plan-revision digest conflicts, and frozen review export of approved check support plus verifier evidence.

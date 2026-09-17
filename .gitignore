@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 /demo-plan.json
 /live-plan.json
+/review-plan.json
+/review-plan-v2.json

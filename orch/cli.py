@@ -57,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status")
     sub.add_parser("reconcile")
     sub.add_parser("next")
+    pause = sub.add_parser("pause"); pause.add_argument("--reason", required=True)
+    sub.add_parser("resume")
+    abort = sub.add_parser("abort"); abort.add_argument("--run-id", required=True); abort.add_argument("--reason", required=True); abort.add_argument("--retry", action="store_true")
     sub.add_parser("codex-preflight")
     codex_review = sub.add_parser("codex-review")
     codex_review.add_argument("--run-id", required=True)
@@ -103,6 +106,12 @@ def main(argv=None) -> int:
             result = orch.reconcile()
         elif args.command == "next":
             result = orch.next_work()
+        elif args.command == "pause":
+            result = orch.pause(args.reason)
+        elif args.command == "resume":
+            result = orch.resume()
+        elif args.command == "abort":
+            result = orch.abort(args.run_id, args.reason, args.retry)
         elif args.command == "codex-preflight":
             result = subscription_preflight(root)
         elif args.command == "codex-review":

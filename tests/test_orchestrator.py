@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from orch.core import Orchestrator
+from orch.codex_review import prepare_review
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -93,6 +94,51 @@ class OrchestratorTests(unittest.TestCase):
         c2=self.orch.claim('w2')
         self.assertEqual(c2['context']['feedback']['kind'],'review')
         self.assertEqual(c2['context']['feedback']['findings'][0]['path'],'T1.json')
+
+    def test_owner_approval_is_snapshot_bound(self):
+        task=self.task('T1'); task['owner_acceptance']=True
+        self.load([task])
+        c=self.orch.claim('w'); self.write_result(c,'T1')
+        self.assertEqual(self.orch.complete(c['run_id'])['status'],'WAITING_OWNER')
+        approved=self.orch.approve(c['run_id'],'fixture approval')
+        self.assertEqual(approved['status'],'APPROVED')
+        self.assertEqual(self.orch.complete(c['run_id'])['status'],'COMPLETE')
+
+    def test_pause_blocks_dispatch_until_resume(self):
+        self.load([self.task('T1')])
+        paused=self.orch.pause('fixture maintenance')
+        self.assertEqual(paused['status'],'PAUSED')
+        self.assertEqual(self.orch.claim('w')['status'],'PAUSED')
+        self.assertEqual(self.orch.next_work()['status'],'PAUSED')
+        self.assertEqual(self.orch.resume()['status'],'RESUMED')
+        self.assertEqual(self.orch.claim('w')['status'],'CLAIMED')
+
+    def test_abort_retry_releases_writer_and_creates_new_attempt(self):
+        self.load([self.task('T1')])
+        first=self.orch.claim('w1')
+        aborted=self.orch.abort(first['run_id'],'synthetic crash recovery',retry=True)
+        self.assertEqual(aborted['task_status'],'NEEDS_FIX')
+        second=self.orch.claim('w2')
+        self.assertEqual(second['status'],'CLAIMED')
+        self.assertEqual(second['attempt'],2)
+        self.assertNotEqual(second['run_id'],first['run_id'])
+
+    def test_review_export_contains_check_support_and_verifier_evidence(self):
+        checks_dir=self.ws/'checks'; checks_dir.mkdir()
+        check_file=checks_dir/'check.py'
+        check_file.write_text("print('support-ok')\n",encoding='utf-8')
+        check={'id':'support','argv':[sys.executable,'checks/check.py'],'cwd':'.','timeout_sec':5}
+        self.load([self.task('T1',checks=[check],review=True)])
+        claim=self.orch.claim('w')
+        verified=self.write_result(claim,'T1')
+        self.assertEqual(verified['status'],'REVIEWING')
+        prepared=prepare_review(self.orch,claim['run_id'])
+        workspace=Path(prepared['workspace'])
+        self.assertTrue((workspace/'checks/check.py').is_file())
+        self.assertTrue((workspace/'verification_evidence/support.json').is_file())
+        prompt=json.loads(Path(prepared['prompt']).read_text())
+        self.assertIn('checks/check.py',prompt['support_files'])
+        self.assertEqual(prompt['verification_evidence'][0]['exit_code'],0)
 
     def test_plan_revision_digest_conflict(self):
         self.load([self.task('T1')],revision='same')

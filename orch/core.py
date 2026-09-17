@@ -108,6 +108,9 @@ class Orchestrator:
           snapshot_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, manifest_json TEXT NOT NULL,
           created_at TEXT NOT NULL, FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS approvals (
           run_id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, approved_at TEXT NOT NULL, note TEXT,
           FOREIGN KEY(run_id) REFERENCES runs(run_id)
@@ -184,6 +187,10 @@ class Orchestrator:
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
+            if paused:
+                conn.execute("COMMIT")
+                return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
             active = conn.execute("SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at LIMIT 1",
                                   tuple(ACTIVE_RUN_STATES)).fetchone()
             if active:
@@ -570,12 +577,42 @@ class Orchestrator:
             tasks = [dict(row) for row in conn.execute("SELECT task_id,plan_revision,ordinal,status,updated_at FROM tasks ORDER BY ordinal,task_id")]
             runs = [dict(row) for row in conn.execute("SELECT run_id,task_id,attempt,worker_id,state,started_at,heartbeat_at,snapshot_id,verify_status,review_status,completed_at,error FROM runs ORDER BY started_at")]
             events = [dict(row) for row in conn.execute("SELECT seq,ts,kind,task_id,run_id,payload_json FROM events ORDER BY seq DESC LIMIT 30")]
+            paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
         for event in events:
             event["payload"] = json.loads(event.pop("payload_json"))
-        return {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "tasks": tasks, "runs": runs, "recent_events": events}
+        return {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "paused": json.loads(paused["value_json"]) if paused else None, "tasks": tasks, "runs": runs, "recent_events": events}
+
+    def pause(self, reason: str) -> Dict[str, Any]:
+        details={"reason": reason[:500], "paused_at": utc_now()}
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings(key,value_json,updated_at) VALUES('paused',?,?)", (canonical_json(details), utc_now()))
+            self._event(conn, "PAUSED", payload=details)
+        return {"status":"PAUSED", "details":details}
+
+    def resume(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key='paused'")
+            self._event(conn, "RESUMED")
+        return {"status":"RESUMED"}
+
+    def abort(self, run_id: str, reason: str, retry: bool=False) -> Dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run=conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not run or run["state"] not in ACTIVE_RUN_STATES:
+                conn.execute("ROLLBACK"); raise ValueError("run_not_active")
+            now=utc_now(); state="NEEDS_FIX" if retry else "BLOCKED"
+            conn.execute("UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?", (reason[:1000],now,run_id))
+            conn.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (state,now,run["task_id"]))
+            self._event(conn, "RUN_ABORTED", task_id=run["task_id"], run_id=run_id, payload={"reason":reason[:500],"retry":retry})
+            conn.execute("COMMIT")
+        return {"status":"ABORTED", "run_id":run_id, "task_status":state}
 
     def next_work(self) -> Dict[str, Any]:
         with self.connect() as conn:
+            paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
+            if paused:
+                return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
             active = conn.execute("SELECT run_id,task_id,state FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at LIMIT 1", tuple(ACTIVE_RUN_STATES)).fetchone()
             if active:
                 return {"status": "BUSY", "active": dict(active)}
