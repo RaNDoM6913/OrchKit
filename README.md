@@ -11,6 +11,7 @@ Implemented and locally verified through 2026-09-18:
 - Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capabilities are revoked at quiesce/abort.
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.
+- Verifier checks use admission-bound execution authority: argv[0] is resolved and hashed once, relevant support/config files are hash/presence-bound, and verification refuses drift before executing a check.
 - Cooperative quiescence marker with the direct-RDC residual risk explicitly recorded.
 - Independent Git scope census, registered checks, protected-file hashes, content snapshots and stale-snapshot detection. The verifier blocks unreported/out-of-allowlist repository changes, and Git publication repeats the scope census before side effects and before the compare-and-swap ref update so foreign post-verification worktree changes fail closed.
 - Snapshot-bound review import; failed verification/review becomes `NEEDS_FIX` and is picked up by a **new** ChatGPT run.
@@ -206,4 +207,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current **147-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **150-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

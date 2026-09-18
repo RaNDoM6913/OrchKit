@@ -291,6 +291,71 @@ class OrchestratorTests(unittest.TestCase):
         repeated = self.orch.cancel_task("CANCEL-1", "idempotent")
         self.assertTrue(repeated["already_cancelled"])
 
+    def test_check_executable_is_bound_and_executed_by_absolute_path(self):
+        runner = self.ws / "runner.sh"
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        check = {
+            "id": "runner", "argv": ["./runner.sh"],
+            "cwd": ".", "timeout_sec": 5,
+        }
+        self.load([self.task("AUTH-EXEC", checks=[check])], revision="auth-exec")
+        claim = self.orch.claim("worker")
+        context_check = claim["context"]["checks"][0]
+        self.assertEqual(context_check["executable_path"], str(runner.resolve()))
+        self.assertEqual(len(context_check["executable_sha256"]), 64)
+        result = self.write_result(claim, "AUTH-EXEC")
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(
+            result["checks"][0]["executed_argv"][0], str(runner.resolve())
+        )
+        self.assertEqual(result["check_authority"]["status"], "PASS")
+
+    def test_check_executable_mutation_blocks_before_execution(self):
+        sentinel = self.ws / "executed.txt"
+        runner = self.ws / "mutable-runner.sh"
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        check = {
+            "id": "mutable", "argv": ["./mutable-runner.sh"],
+            "cwd": ".", "timeout_sec": 5,
+        }
+        self.load([self.task("AUTH-MUT", checks=[check])], revision="auth-mut")
+        claim = self.orch.claim("worker")
+        runner.write_text(
+            "#!/bin/sh\necho executed > " + str(sentinel) + "\nexit 0\n",
+            encoding="utf-8",
+        )
+        runner.chmod(0o755)
+        result = self.write_result(claim, "AUTH-MUT")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn(
+            "check_authority_changed:mutable:executable_hash_changed",
+            result["reason"],
+        )
+        self.assertFalse(sentinel.exists())
+
+    def test_check_support_file_mutation_blocks_before_execution(self):
+        support = self.ws / "check_support.py"
+        support.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        check = {
+            "id": "support", "argv": [sys.executable, "check_support.py"],
+            "cwd": ".", "timeout_sec": 5,
+        }
+        self.load([self.task("AUTH-SUPPORT", checks=[check])], revision="auth-support")
+        claim = self.orch.claim("worker")
+        bound = claim["context"]["checks"][0]["authority_files"]
+        self.assertEqual(bound[0]["path"], "check_support.py")
+        original = bound[0]["sha256"]
+        self.assertEqual(len(original), 64)
+        support.write_text("raise SystemExit(7)\n", encoding="utf-8")
+        result = self.write_result(claim, "AUTH-SUPPORT")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn(
+            "check_authority_changed:support:authority_file:check_support.py:HASH_CHANGED",
+            result["reason"],
+        )
+
     def test_scope_escape_rejected(self):
         self.load([self.task('T1')]); c=self.orch.claim('w')
         receipt=self.root/'bad.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')

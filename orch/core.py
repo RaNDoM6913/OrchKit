@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -142,6 +143,147 @@ def task_writer_key(item: Dict[str, Any]) -> str:
     return derived
 
 
+def _check_cwd(workspace: Path, check: Dict[str, Any]) -> Path:
+    cwd_rel = check.get("cwd", ".")
+    cwd = (
+        workspace.resolve()
+        if cwd_rel == "."
+        else safe_workspace_path(workspace, cwd_rel, must_exist=True).resolve()
+    )
+    if not cwd.is_dir():
+        raise ValueError("invalid_check_cwd")
+    return cwd
+
+
+def _resolve_check_executable(
+    workspace: Path, check: Dict[str, Any]
+) -> Path:
+    argv = check["argv"]
+    argv0 = argv[0]
+    cwd = _check_cwd(workspace, check)
+    raw = Path(argv0)
+    if raw.is_absolute():
+        candidate = raw
+    elif "/" in argv0:
+        candidate = (cwd / raw).resolve()
+        if not _inside(workspace.resolve(), candidate):
+            raise ValueError("check_executable_path_escape")
+    else:
+        found = shutil.which(argv0, path=os.environ.get("PATH"))
+        if not found:
+            raise ValueError(f"check_executable_not_found:{argv0}")
+        candidate = Path(found)
+    resolved = candidate.expanduser().resolve()
+    if (
+        not resolved.is_file()
+        or resolved.is_symlink()
+        or not os.access(str(resolved), os.X_OK)
+    ):
+        raise ValueError(f"check_executable_unsafe:{argv0}")
+    return resolved
+
+
+def _authority_record(
+    workspace: Path, relative: str, *, expected: str
+) -> Dict[str, Any]:
+    normalized = normalize_relative_path(relative)
+    path = safe_workspace_path(workspace, normalized, must_exist=False)
+    if path.is_symlink():
+        raise ValueError(f"check_authority_symlink_not_allowed:{normalized}")
+    if expected == "file":
+        if not path.is_file():
+            raise ValueError(f"check_authority_file_missing:{normalized}")
+        return {
+            "path": normalized,
+            "expected": "file",
+            "sha256": sha256_file(path),
+        }
+    if expected != "absent":
+        raise ValueError("invalid_check_authority_expectation")
+    if path.exists():
+        raise ValueError(f"check_authority_expected_absent:{normalized}")
+    return {"path": normalized, "expected": "absent", "sha256": None}
+
+
+def bind_check_authority(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    workspace = Path(item["workspace"]).resolve()
+    bound: List[Dict[str, Any]] = []
+    for raw_check in item.get("checks", []):
+        check = dict(raw_check)
+        check.pop("executable_path", None)
+        check.pop("executable_sha256", None)
+        check.pop("authority_files", None)
+        executable = _resolve_check_executable(workspace, check)
+        check["executable_path"] = str(executable)
+        check["executable_sha256"] = sha256_file(executable)
+
+        cwd = _check_cwd(workspace, check)
+        required = set(check.get("authority_paths", []))
+        absent = set(check.get("authority_absent_paths", []))
+
+        for arg in check["argv"][1:]:
+            if not arg or arg.startswith("-") or Path(arg).is_absolute():
+                continue
+            raw_candidate = cwd / arg
+            if raw_candidate.is_symlink():
+                raise ValueError(
+                    f"check_authority_symlink_not_allowed:{arg}"
+                )
+            try:
+                candidate = raw_candidate.resolve()
+            except OSError:
+                continue
+            if _inside(workspace, candidate) and candidate.is_file():
+                required.add(candidate.relative_to(workspace).as_posix())
+
+        command_name = Path(check["argv"][0]).name
+        if (
+            command_name in {"npm", "yarn", "pnpm"}
+            and "run" in check["argv"][1:3]
+        ):
+            required.add("package.json")
+            for relative in (
+                ".npmrc", ".yarnrc", ".yarnrc.yml",
+                ".pnpmfile.cjs", "pnpm-workspace.yaml",
+            ):
+                path = workspace / relative
+                if path.exists() or path.is_symlink():
+                    required.add(relative)
+                else:
+                    absent.add(relative)
+
+        overlap = required.intersection(absent)
+        if overlap:
+            raise ValueError(
+                "check_authority_conflicting_expectation:" + sorted(overlap)[0]
+            )
+        authority = [
+            _authority_record(workspace, relative, expected="file")
+            for relative in sorted(required)
+        ]
+        authority.extend(
+            _authority_record(workspace, relative, expected="absent")
+            for relative in sorted(absent)
+        )
+        check["authority_files"] = authority
+        bound.append(check)
+    return bound
+
+
+def prepare_task_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(item)
+    payload.setdefault("max_attempts", 2)
+    payload.setdefault("checks", [])
+    payload.setdefault("protected_paths", {})
+    payload.setdefault("required_review", False)
+    payload["review"] = normalize_review_policy(payload)
+    payload.setdefault("owner_acceptance", False)
+    payload.setdefault("publication", {"kind": "none"})
+    payload["writer_key"] = task_writer_key(payload)
+    payload["checks"] = bind_check_authority(payload)
+    return payload
+
+
 def validate_task_definition(item: Dict[str, Any]) -> None:
     workspace = Path(item.get("workspace", ""))
     if not workspace.is_absolute():
@@ -183,6 +325,14 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         timeout = check.get("timeout_sec", 30)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120:
             raise ValueError("invalid_check_timeout")
+        for field in ("authority_paths", "authority_absent_paths"):
+            values = check.get(field, [])
+            if not isinstance(values, list):
+                raise ValueError(f"invalid_{field}")
+            for relative in values:
+                if not isinstance(relative, str) or not relative:
+                    raise ValueError(f"invalid_{field}")
+                normalize_relative_path(relative)
     attempts = item.get("max_attempts", 2)
     if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
         raise ValueError("invalid_max_attempts")
@@ -389,6 +539,9 @@ class Orchestrator:
                 raise ValueError("invalid_dependency")
             validate_task_definition(item)
         validate_dependency_graph(tasks)
+        prepared_payloads = {
+            item["id"]: prepare_task_payload(item) for item in tasks
+        }
         digest = sha256_file(plan_path)
         now = utc_now()
         queued_count = 0
@@ -426,15 +579,7 @@ class Orchestrator:
             for ordinal, item in enumerate(tasks):
                 if item["id"] in existing_task_ids:
                     continue
-                payload = dict(item)
-                payload.setdefault("max_attempts", 2)
-                payload.setdefault("checks", [])
-                payload.setdefault("protected_paths", {})
-                payload.setdefault("required_review", False)
-                payload["review"] = normalize_review_policy(payload)
-                payload.setdefault("owner_acceptance", False)
-                payload.setdefault("publication", {"kind": "none"})
-                payload["writer_key"] = task_writer_key(payload)
+                payload = prepared_payloads[item["id"]]
                 next_queue += 1
                 conn.execute(
                     "INSERT INTO tasks(task_id,plan_revision,ordinal,project_id,writer_key,queue_seq,status,payload_json,updated_at) "
@@ -892,6 +1037,97 @@ class Orchestrator:
         snapshot_id = "sha256:" + sha256_bytes(canonical_json(manifest).encode("utf-8"))
         return snapshot_id, manifest
 
+    def _check_authority_evidence(
+        self, workspace: Path, checks: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        items: List[Dict[str, Any]] = []
+        first_error: Optional[str] = None
+        for check in checks:
+            check_id = str(check.get("id", "unnamed"))
+            errors: List[str] = []
+            executable_value = check.get("executable_path")
+            expected_executable_hash = check.get("executable_sha256")
+            actual_executable_hash = None
+            executable_path = (
+                Path(executable_value)
+                if isinstance(executable_value, str)
+                else None
+            )
+            if (
+                executable_path is None
+                or not executable_path.is_absolute()
+                or executable_path.is_symlink()
+                or not executable_path.is_file()
+            ):
+                errors.append("executable_missing_or_unsafe")
+            elif (
+                not isinstance(expected_executable_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_executable_hash) is None
+            ):
+                errors.append("executable_hash_missing")
+            else:
+                actual_executable_hash = sha256_file(executable_path)
+                if actual_executable_hash != expected_executable_hash:
+                    errors.append("executable_hash_changed")
+
+            authority_items: List[Dict[str, Any]] = []
+            for record in check.get("authority_files", []):
+                relative = record.get("path")
+                expected = record.get("expected")
+                expected_hash = record.get("sha256")
+                state = "PASS"
+                actual_hash = None
+                try:
+                    path = safe_workspace_path(
+                        workspace, relative, must_exist=False
+                    )
+                except (TypeError, ValueError):
+                    state = "INVALID_PATH"
+                    path = None
+                if path is not None:
+                    if path.is_symlink():
+                        state = "UNSAFE_SYMLINK"
+                    elif expected == "file":
+                        if not path.is_file():
+                            state = "MISSING"
+                        else:
+                            actual_hash = sha256_file(path)
+                            if actual_hash != expected_hash:
+                                state = "HASH_CHANGED"
+                    elif expected == "absent":
+                        if path.exists():
+                            state = "UNEXPECTED_PRESENT"
+                    else:
+                        state = "INVALID_EXPECTATION"
+                authority_items.append({
+                    "path": relative,
+                    "expected": expected,
+                    "expected_sha256": expected_hash,
+                    "actual_sha256": actual_hash,
+                    "status": state,
+                })
+                if state != "PASS":
+                    errors.append(f"authority_file:{relative}:{state}")
+
+            if errors and first_error is None:
+                first_error = f"check_authority_changed:{check_id}:{errors[0]}"
+            items.append({
+                "id": check_id,
+                "status": "BLOCKED" if errors else "PASS",
+                "executable_path": (
+                    str(executable_path) if executable_path is not None else None
+                ),
+                "expected_executable_sha256": expected_executable_hash,
+                "actual_executable_sha256": actual_executable_hash,
+                "authority_files": authority_items,
+                "errors": errors,
+            })
+        return {
+            "status": "BLOCKED" if first_error else "PASS",
+            "reason": first_error,
+            "checks": items,
+        }
+
     def _run_check(self, workspace: Path, run_id: str, check: Dict[str, Any]) -> Dict[str, Any]:
         argv = check.get("argv")
         if not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv):
@@ -901,16 +1137,22 @@ class Orchestrator:
         if not cwd.is_dir():
             raise ValueError("invalid_check_cwd")
         timeout = min(max(int(check.get("timeout_sec", 30)), 1), 120)
+        executable = check.get("executable_path")
+        if not isinstance(executable, str) or not Path(executable).is_absolute():
+            raise ValueError("check_executable_not_bound")
+        executed_argv = [executable, *argv[1:]]
         env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
         started = time.monotonic()
         try:
-            proc = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True,
+            proc = subprocess.run(executed_argv, cwd=str(cwd), env=env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
-            result = {"id": check.get("id", "unnamed"), "argv": argv, "exit_code": proc.returncode,
+            result = {"id": check.get("id", "unnamed"), "argv": argv,
+                      "executed_argv": executed_argv, "exit_code": proc.returncode,
                       "duration_ms": int((time.monotonic() - started) * 1000),
                       "stdout": proc.stdout[-8000:], "stderr": proc.stderr[-8000:], "timed_out": False}
         except subprocess.TimeoutExpired as exc:
-            result = {"id": check.get("id", "unnamed"), "argv": argv, "exit_code": None,
+            result = {"id": check.get("id", "unnamed"), "argv": argv,
+                      "executed_argv": executed_argv, "exit_code": None,
                       "duration_ms": int((time.monotonic() - started) * 1000),
                       "stdout": (exc.stdout or "")[-8000:] if isinstance(exc.stdout, str) else "",
                       "stderr": (exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "",
@@ -952,6 +1194,22 @@ class Orchestrator:
                 return self._block_verification(
                     run_id, "workspace_base_changed", evidence=scope_evidence
                 )
+        authority_evidence = self._check_authority_evidence(
+            workspace, payload.get("checks", [])
+        )
+        authority_log = self.logs / f"{run_id}-check-authority.json"
+        authority_log.write_text(
+            json.dumps(authority_evidence, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        authority_evidence["log_path"] = str(authority_log)
+        if authority_evidence["status"] == "BLOCKED":
+            scope_evidence["check_authority"] = authority_evidence
+            return self._block_verification(
+                run_id,
+                authority_evidence["reason"],
+                evidence=scope_evidence,
+            )
         try:
             snapshot_id, manifest = self._snapshot(
                 payload, receipt["changed_paths"], git_head=scope_evidence.get("git_head")
@@ -995,7 +1253,8 @@ class Orchestrator:
                                  "review_decision": decision, "scope_evidence": scope_evidence})
             conn.execute("COMMIT")
         return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks,
-                "review_decision": decision, "scope_evidence": scope_evidence}
+                "review_decision": decision, "scope_evidence": scope_evidence,
+                "check_authority": authority_evidence}
 
     def review_decision(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:
