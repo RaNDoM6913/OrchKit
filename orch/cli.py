@@ -16,7 +16,8 @@ from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
 from .state import (backup_state, check_state, migration_history, prune_capabilities,
-                    prune_retention, recovery_inspect, restore_backup_archive,
+                    prune_retention, recovery_inspect, reconcile_home_replacement,
+                    replace_home_from_backup, restore_backup_archive,
                     retention_status, verify_backup_archive)
 
 
@@ -132,6 +133,14 @@ def build_parser() -> argparse.ArgumentParser:
     state_restore_backup = state_sub.add_parser("restore-backup")
     state_restore_backup.add_argument("path")
     state_restore_backup.add_argument("--destination", required=True)
+    state_replace_backup = state_sub.add_parser("replace-backup")
+    state_replace_backup.add_argument("path")
+    state_replace_backup.add_argument("--destination", required=True)
+    state_replace_reconcile = state_sub.add_parser("replace-reconcile")
+    state_replace_reconcile.add_argument("--destination", required=True)
+    replace_action = state_replace_reconcile.add_mutually_exclusive_group()
+    replace_action.add_argument("--resume", action="store_true")
+    replace_action.add_argument("--finalize", action="store_true")
     state_sub.add_parser("prune-capabilities")
     retention = state_sub.add_parser("retention")
     retention.add_argument("--max-evidence-mb", type=int, default=256)
@@ -306,6 +315,17 @@ def main(argv=None) -> int:
                 result = restore_backup_archive(
                     Path(args.path).expanduser(),
                     Path(args.destination).expanduser(),
+                )
+            elif args.state_command == "replace-backup":
+                result = replace_home_from_backup(
+                    Path(args.path).expanduser(),
+                    Path(args.destination).expanduser(),
+                )
+            elif args.state_command == "replace-reconcile":
+                result = reconcile_home_replacement(
+                    Path(args.destination).expanduser(),
+                    resume=args.resume,
+                    finalize=args.finalize,
                 )
             elif args.state_command == "prune-capabilities":
                 result = prune_capabilities(orch)
