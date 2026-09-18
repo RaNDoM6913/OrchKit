@@ -97,6 +97,8 @@ A project pause affects only new dispatch. Existing active runs keep their expli
 
 `orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
 
+The registry also enforces one project identity per exact resolved workspace root: the same root cannot be registered again under a different name. Distinct linked Git worktrees remain separate project roots but share the same Git writer isolation.
+
 Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
 
 ## Optional Review Policy Engine

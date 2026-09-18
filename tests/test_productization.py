@@ -71,6 +71,49 @@ class ProductizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reviewer_required"):
             ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="required", reviewer="none")
 
+    def test_project_registry_rejects_exact_root_alias(self):
+        registry = ProjectRegistry(self.home)
+        first = registry.add(
+            self.repo, name="primary", profile="standard", review_mode="off"
+        )["project"]
+        with self.assertRaisesRegex(
+            ValueError,
+            "project_root_already_registered:" + first["project_id"],
+        ):
+            registry.add(
+                self.repo, name="alias", profile="standard", review_mode="off"
+            )
+        self.assertEqual(len(registry.list()), 1)
+
+    def test_project_registry_replace_same_identity_still_allowed(self):
+        registry = ProjectRegistry(self.home)
+        first = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        replaced = registry.add(
+            self.repo, profile="safe", review_mode="off", replace=True
+        )["project"]
+        self.assertEqual(replaced["project_id"], first["project_id"])
+        self.assertEqual(replaced["profile"], "safe")
+        self.assertEqual(len(registry.list()), 1)
+
+    def test_project_registry_allows_distinct_linked_worktree_root(self):
+        linked = self.base / "linked-worktree"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "linked", str(linked)],
+            check=True,
+        )
+        registry = ProjectRegistry(self.home)
+        primary = registry.add(
+            self.repo, name="primary", profile="standard", review_mode="off"
+        )["project"]
+        secondary = registry.add(
+            linked, name="linked", profile="standard", review_mode="off"
+        )["project"]
+        self.assertNotEqual(primary["root"], secondary["root"])
+        self.assertEqual(primary["writer_key"], secondary["writer_key"])
+        self.assertEqual(len(registry.list()), 2)
+
     def test_project_registration_protects_existing_dirty_bytes(self):
         dirty = self.repo / "owner-note.txt"
         dirty.write_text("owner work\n", encoding="utf-8")

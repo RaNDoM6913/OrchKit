@@ -216,6 +216,21 @@ class ProjectRegistry:
         target = self._path(project_id)
         if target.exists() and not replace:
             raise ValueError("project_already_registered")
+        for candidate in sorted(self.projects_dir.glob("*.json")):
+            if candidate == target:
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"project_registry_unsafe:{candidate.stem}")
+            try:
+                existing_config = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"project_registry_unreadable:{candidate.stem}") from exc
+            existing_root = existing_config.get("root")
+            if not isinstance(existing_root, str) or not existing_root:
+                raise ValueError(f"project_registry_invalid:{candidate.stem}")
+            if Path(existing_root).expanduser().resolve() == root:
+                owner = existing_config.get("project_id") or candidate.stem
+                raise ValueError(f"project_root_already_registered:{owner}")
         defaults = json.loads(json.dumps(PROFILE_DEFAULTS[profile]))
         if review_mode is not None:
             if review_mode not in MODES:
