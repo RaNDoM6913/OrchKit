@@ -95,7 +95,7 @@ orch queue resume-project PROJECT_ID
 
 A project pause affects only new dispatch. Existing active runs keep their explicit recovery semantics, and resumed tasks keep their original durable FIFO position.
 
-`orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
+`orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. CLI registration creates the authoritative SQLite ledger up front; deregistration refuses to manufacture an empty ledger if that state file is missing or unsafe. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
 
 The registry also enforces one project identity per exact resolved workspace root: the same root cannot be registered again under a different name. Distinct linked Git worktrees remain separate project roots but share the same Git writer isolation.
 

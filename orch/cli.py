@@ -188,10 +188,7 @@ def main(argv=None) -> int:
         args.command in {
             "setup", "doctor", "rdc", "dispatcher", "git", "codex-preflight",
         }
-        or (
-            args.command == "project"
-            and args.project_command != "remove"
-        )
+        or args.command == "project"
         or (
             args.command == "state"
             and args.state_command in {
@@ -232,11 +229,16 @@ def main(argv=None) -> int:
         elif args.command == "project":
             registry = ProjectRegistry(root)
             if args.project_command == "add":
+                ledger = Orchestrator(root)
                 result = registry.add(
                     Path(args.path), name=args.name, profile=args.profile,
                     review_mode=args.review_mode, reviewer=args.reviewer,
                     allow_commit=args.commit, allow_push=args.push, replace=args.replace,
                 )
+                result["ledger"] = {
+                    "status": "READY",
+                    "db": str(ledger.db_path),
+                }
             elif args.project_command == "list":
                 result = {"status": "OK", "projects": registry.list()}
             elif args.project_command == "show":
@@ -254,17 +256,34 @@ def main(argv=None) -> int:
                 result["plan"] = plan
             elif args.project_command == "remove":
                 registry.get(args.project_id)
-                guard = orch.project_removal_guard(args.project_id)
-                if guard["status"] != "SAFE":
-                    result = guard
-                else:
-                    removed = registry.remove(args.project_id)
-                    recorded = orch.record_project_removed(args.project_id)
+                db_path = root / ".runtime" / "orch.sqlite3"
+                if (
+                    db_path.is_symlink()
+                    or not db_path.is_file()
+                ):
                     result = {
-                        **removed,
-                        "queue_guard": guard,
-                        "ledger": recorded,
+                        "status": "BLOCKED",
+                        "project_id": args.project_id,
+                        "reason": "project_state_ledger_missing_or_unsafe",
+                        "db": str(db_path),
+                        "safe_next_steps": [
+                            "Restore or reconcile the authoritative ORCH state before deregistration.",
+                            "Do not initialize an empty replacement ledger to bypass this guard.",
+                        ],
                     }
+                else:
+                    project_orch = Orchestrator(root)
+                    guard = project_orch.project_removal_guard(args.project_id)
+                    if guard["status"] != "SAFE":
+                        result = guard
+                    else:
+                        removed = registry.remove(args.project_id)
+                        recorded = project_orch.record_project_removed(args.project_id)
+                        result = {
+                            **removed,
+                            "queue_guard": guard,
+                            "ledger": recorded,
+                        }
             else:
                 raise ValueError("unknown_project_command")
         elif args.command == "queue":

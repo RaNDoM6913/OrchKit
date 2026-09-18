@@ -18,8 +18,8 @@ from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
 from orch.project import ProjectRegistry
 from orch.review_policy import decide_review, normalize_review_policy
-from orch.state import (backup_state, reconcile_home_replacement,
-                        replace_home_from_backup)
+from orch.state import (backup_state, check_state,
+                        reconcile_home_replacement, replace_home_from_backup)
 
 
 class ProductizationTests(unittest.TestCase):
@@ -100,6 +100,73 @@ class ProductizationTests(unittest.TestCase):
         )
         self.assertFalse(phantom.exists())
         reconcile_home_replacement(live, finalize=True)
+
+    def test_project_add_initializes_authoritative_ledger(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--profile", "standard",
+                "--review-mode", "off",
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "REGISTERED")
+        db = self.home / ".runtime" / "orch.sqlite3"
+        self.assertTrue(db.is_file())
+        self.assertEqual(Path(result["ledger"]["db"]).resolve(), db.resolve())
+        self.assertEqual(check_state(Orchestrator(self.home))["status"], "READY")
+
+    def test_project_remove_blocks_missing_ledger_without_creating_one(self):
+        registry = ProjectRegistry(self.home)
+        config = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        db = self.home / ".runtime" / "orch.sqlite3"
+        self.assertFalse(db.exists())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "remove", config["project_id"],
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(
+            result["reason"], "project_state_ledger_missing_or_unsafe"
+        )
+        self.assertFalse(db.exists())
+        self.assertEqual(
+            registry.get(config["project_id"])["project_id"],
+            config["project_id"],
+        )
+
+    def test_project_remove_after_cli_registration_uses_empty_ledger_safely(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--profile", "standard",
+                "--review-mode", "off",
+            ])
+        registered = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        project_id = registered["project"]["project_id"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "remove", project_id,
+            ])
+        removed = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(removed["status"], "REMOVED")
+        self.assertEqual(removed["queue_guard"]["status"], "SAFE")
+        with self.assertRaisesRegex(ValueError, "unknown_project"):
+            ProjectRegistry(self.home).get(project_id)
 
     def test_setup_persists_default_profile(self):
         configured = configure_home(self.home, profile="standard")
