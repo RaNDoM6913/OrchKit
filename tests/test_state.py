@@ -284,6 +284,20 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(checked["status"], "BLOCKED")
         self.assertIn("forbidden_secret_member", checked["errors"])
 
+    def test_backup_verifier_rejects_unknown_files_member(self):
+        source_path = Path(backup_state(self.orch)["path"])
+        extra = self.root / "unknown-member.zip"
+        extra.write_bytes(source_path.read_bytes())
+        with zipfile.ZipFile(extra, "a") as archive:
+            archive.writestr("files/manual-owner-note.json", "{}")
+        checked = verify_backup_archive(extra)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("backup_member_not_restorable", checked["errors"])
+        self.assertEqual(
+            checked["nonrestorable_members"],
+            ["files/manual-owner-note.json"],
+        )
+
     def test_backup_verifier_rejects_invalid_zip(self):
         invalid = self.root / "invalid-backup.zip"
         invalid.write_bytes(b"not-a-zip")

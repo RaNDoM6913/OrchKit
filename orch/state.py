@@ -634,6 +634,7 @@ def verify_backup_archive(
             total = 0
             unsafe: List[str] = []
             forbidden: List[str] = []
+            nonrestorable: List[str] = []
             for info in infos:
                 name = info.filename
                 total += int(info.file_size)
@@ -648,11 +649,8 @@ def verify_backup_archive(
                 ):
                     unsafe.append(name)
                     continue
-                if not (
-                    name in {"state/orch.sqlite3", "state/manifest.json"}
-                    or name.startswith("files/")
-                ):
-                    unsafe.append(name)
+                if not _restorable_backup_member(name):
+                    nonrestorable.append(name)
                 if name.startswith("files/.runtime/claims/") or name == "files/.runtime/claims":
                     forbidden.append(name)
                 file_type = (info.external_attr >> 16) & 0o170000
@@ -664,6 +662,9 @@ def verify_backup_archive(
             if forbidden:
                 base["errors"].append("forbidden_secret_member")
                 base["forbidden_members"] = sorted(set(forbidden))
+            if nonrestorable:
+                base["errors"].append("backup_member_not_restorable")
+                base["nonrestorable_members"] = sorted(set(nonrestorable))
             if total > max_uncompressed_bytes:
                 base["errors"].append("backup_uncompressed_limit_exceeded")
             base["member_count"] = len(infos)
