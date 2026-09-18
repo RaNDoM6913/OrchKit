@@ -608,7 +608,7 @@ class Orchestrator:
                                capture_output=True, text=True, timeout=10, check=False)
         declared = sorted(set(normalize_relative_path(path) for path in declared_paths))
         if probe.returncode != 0 or probe.stdout.strip() != "true":
-            return {"status": "NON_GIT_UNAVAILABLE", "declared_paths": declared,
+            return {"status": "NON_GIT_UNAVAILABLE", "declared_paths": declared, "git_head": None,
                     "limitation": "independent_scope_census_requires_git_workspace"}
         def paths(*args: str) -> List[str]:
             result = subprocess.run(prefix + list(args), env=env, capture_output=True, text=False, timeout=15, check=False)
@@ -624,9 +624,15 @@ class Orchestrator:
         outside_allowlist = sorted(path for path in observed if not path_allowed(path, payload.get("allowed_paths", [])))
         omitted_from_receipt = sorted(set(observed) - set(declared))
         declared_but_unobserved = sorted(set(declared) - set(observed))
+        head_probe = subprocess.run(
+            prefix + ["rev-parse", "HEAD"], env=env, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+        git_head = head_probe.stdout.strip() if head_probe.returncode == 0 else None
         return {
             "status": "PASS" if not outside_allowlist and not omitted_from_receipt and not declared_but_unobserved else "BLOCKED",
             "declared_paths": declared,
+            "git_head": git_head,
             "observed_paths": observed,
             "protected_preexisting_paths": sorted(protected.intersection(observed_all)),
             "outside_allowlist": outside_allowlist,
@@ -635,7 +641,8 @@ class Orchestrator:
             "ignored_files_observed": False,
         }
 
-    def _snapshot(self, payload: Dict[str, Any], changed_paths: List[str]) -> Tuple[str, Dict[str, Any]]:
+    def _snapshot(self, payload: Dict[str, Any], changed_paths: List[str],
+                  git_head: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         workspace = Path(payload["workspace"]).resolve()
         files: Dict[str, Any] = {}
         for relative in sorted(set(changed_paths)):
@@ -656,7 +663,7 @@ class Orchestrator:
             if actual != expected_hash:
                 raise ValueError(f"protected_path_changed:{relative}")
         manifest = {"schema_version": 1, "workspace": str(workspace), "files": files,
-                    "protected": protected_results, "created_at": utc_now()}
+                    "protected": protected_results, "git_head": git_head, "created_at": utc_now()}
         snapshot_id = "sha256:" + sha256_bytes(canonical_json(manifest).encode("utf-8"))
         return snapshot_id, manifest
 
@@ -707,8 +714,23 @@ class Orchestrator:
             else:
                 reason = "receipt_scope_mismatch"
             return self._block_verification(run_id, reason, evidence=scope_evidence)
+        publication = payload.get("publication", {})
+        if publication.get("kind") in {"git", "git_local"}:
+            observed_base = scope_evidence.get("git_head")
+            if not observed_base:
+                return self._block_verification(
+                    run_id, "workspace_git_unavailable", evidence=scope_evidence
+                )
+            expected_base = publication.get("expected_base")
+            if expected_base and observed_base != expected_base:
+                scope_evidence["expected_base"] = expected_base
+                return self._block_verification(
+                    run_id, "workspace_base_changed", evidence=scope_evidence
+                )
         try:
-            snapshot_id, manifest = self._snapshot(payload, receipt["changed_paths"])
+            snapshot_id, manifest = self._snapshot(
+                payload, receipt["changed_paths"], git_head=scope_evidence.get("git_head")
+            )
         except ValueError as exc:
             reason = str(exc)
             safety_prefixes = (
@@ -932,6 +954,36 @@ class Orchestrator:
                 return False
         return True
 
+    def _prepare_snapshot_commit(self, workspace: Path, *, expected_base: str,
+                                 manifest: Dict[str, Any], message: str) -> str:
+        gitt = self._publication_git(workspace, binary=False)
+        tree = gitt("write-tree")
+        if tree.returncode or not tree.stdout.strip():
+            raise RuntimeError("git_write_tree_failed:" + tree.stderr[-1000:])
+        commit = gitt("commit-tree", tree.stdout.strip(), "-p", expected_base, "-m", message)
+        if commit.returncode or not commit.stdout.strip():
+            raise RuntimeError("git_commit_tree_failed:" + commit.stderr[-1000:])
+        commit_id = commit.stdout.strip()
+        if not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
+            raise ValueError("prepared_snapshot_mismatch")
+        return commit_id
+
+    def _cas_update_branch(self, workspace: Path, *, branch: str,
+                           commit_id: str, expected_base: str) -> None:
+        gitt = self._publication_git(workspace, binary=False)
+        symbolic = gitt("symbolic-ref", "-q", "HEAD")
+        expected_ref = f"refs/heads/{branch}"
+        if symbolic.returncode or symbolic.stdout.strip() != expected_ref:
+            raise ValueError("publication_branch_ref_mismatch")
+        update = gitt("update-ref", expected_ref, commit_id, expected_base)
+        if update.returncode:
+            head = gitt("rev-parse", "HEAD")
+            actual = head.stdout.strip() if head.returncode == 0 else None
+            raise ValueError(
+                "publication_base_changed_during_commit:"
+                + (actual or "unknown")
+            )
+
     def _finalize_publication(self, run_id: str, task_id: str, *, commit_id: str,
                               remote_commit: Optional[str], kind: str, remote: Optional[str], ref: Optional[str]) -> Dict[str, Any]:
         now = utc_now()
@@ -979,9 +1031,11 @@ class Orchestrator:
         branch = gitt("branch", "--show-current")
         if branch.returncode or branch.stdout.strip() != pub.get("branch", "main"):
             raise ValueError("publication_branch_mismatch")
-        expected_base = pub.get("expected_base")
+        expected_base = pub.get("expected_base") or manifest.get("git_head")
+        if not expected_base:
+            raise ValueError("publication_expected_base_missing")
         head = gitt("rev-parse", "HEAD")
-        if expected_base and head.stdout.strip() != expected_base:
+        if head.returncode or head.stdout.strip() != expected_base:
             raise ValueError("publication_base_changed")
         existing_staged = gitb("diff", "--cached", "--name-only", "-z")
         if existing_staged.returncode or existing_staged.stdout:
@@ -998,12 +1052,15 @@ class Orchestrator:
             phase = "STAGED"
             self._publication_update(run_id, status=phase, staged_paths=changed)
             message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
-            commit = gitt("commit", "-m", message, "--", *changed)
-            if commit.returncode:
-                raise RuntimeError("git_commit_failed:" + commit.stderr[-1000:])
-            commit_id = gitt("rev-parse", "HEAD").stdout.strip()
-            if not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
-                raise ValueError("committed_snapshot_mismatch")
+            commit_id = self._prepare_snapshot_commit(
+                workspace, expected_base=expected_base, manifest=manifest, message=message
+            )
+            phase = "PREPARED"
+            self._publication_update(run_id, status=phase, commit_id=commit_id)
+            self._cas_update_branch(
+                workspace, branch=branch.stdout.strip(),
+                commit_id=commit_id, expected_base=expected_base,
+            )
             phase = "COMMITTED"
             self._publication_update(run_id, status=phase, commit_id=commit_id)
             remote_commit = None
@@ -1049,17 +1106,23 @@ class Orchestrator:
         workspace = Path(payload["workspace"]).resolve()
         gitt = self._publication_git(workspace, binary=False)
         gitb = self._publication_git(workspace, binary=True)
-        expected_base = journal["expected_base"] or pub.get("expected_base")
+        expected_base = journal["expected_base"] or pub.get("expected_base") or manifest.get("git_head")
+        if not expected_base:
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "publication_expected_base_missing"}
         head_result = gitt("rev-parse", "HEAD")
         head = head_result.stdout.strip() if head_result.returncode == 0 else None
         staged = self._staged_matches_snapshot(workspace, manifest)
         status = journal["status"]
         commit_id = journal["commit_id"]
-        if not commit_id and head and head != expected_base and self._commit_matches_snapshot(workspace, head, expected_base, manifest):
+        if commit_id and not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "commit_not_proven"}
+        if not commit_id and head and head != expected_base and self._commit_matches_snapshot(
+            workspace, head, expected_base, manifest
+        ):
             commit_id = head
             status = "COMMITTED"
             self._publication_update(run_id, status=status, commit_id=commit_id, error=None)
-        if not commit_id and head == expected_base:
+        if head == expected_base and not commit_id:
             if not staged:
                 staged_raw = gitb("diff", "--cached", "--name-only", "-z")
                 if staged_raw.returncode == 0 and not staged_raw.stdout and status == "INTENT":
@@ -1069,15 +1132,48 @@ class Orchestrator:
             if not resume:
                 return {"status": "STAGED_PENDING_COMMIT", "run_id": run_id, "resume_available": True}
             message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
-            commit = gitt("commit", "-m", message, "--", *sorted(manifest.get("files", {})))
-            if commit.returncode:
-                self._publication_update(run_id, status="STAGED", error="git_commit_failed:" + commit.stderr[-900:])
-                return {"status": "BLOCKED", "run_id": run_id, "reason": "git_commit_failed"}
-            commit_id = gitt("rev-parse", "HEAD").stdout.strip()
-            if not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
-                self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error="committed_snapshot_mismatch")
-                return {"status": "BLOCKED", "run_id": run_id, "reason": "committed_snapshot_mismatch"}
-            self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error=None)
+            try:
+                commit_id = self._prepare_snapshot_commit(
+                    workspace, expected_base=expected_base, manifest=manifest, message=message
+                )
+            except Exception as exc:
+                self._publication_update(
+                    run_id, status="STAGED",
+                    error=f"{type(exc).__name__}:{str(exc)[:900]}"
+                )
+                return {"status": "BLOCKED", "run_id": run_id, "reason": "commit_prepare_failed"}
+            status = "PREPARED"
+            self._publication_update(run_id, status=status, commit_id=commit_id, error=None)
+        if commit_id and head == expected_base:
+            if not staged:
+                return {"status": "BLOCKED", "run_id": run_id, "reason": "unexpected_staging_state"}
+            if not resume:
+                return {
+                    "status": "PREPARED_PENDING_REF_UPDATE", "run_id": run_id,
+                    "commit": commit_id, "resume_available": True,
+                }
+            try:
+                self._cas_update_branch(
+                    workspace, branch=pub.get("branch", "main"),
+                    commit_id=commit_id, expected_base=expected_base,
+                )
+            except ValueError:
+                return {
+                    "status": "BLOCKED", "run_id": run_id,
+                    "reason": "publication_base_changed_during_commit",
+                }
+            head = commit_id
+            status = "COMMITTED"
+            self._publication_update(run_id, status=status, commit_id=commit_id, error=None)
+        if commit_id and head == commit_id:
+            if status != "COMMITTED":
+                status = "COMMITTED"
+                self._publication_update(run_id, status=status, commit_id=commit_id, error=None)
+        elif commit_id and head != commit_id:
+            return {
+                "status": "BLOCKED", "run_id": run_id,
+                "reason": "publication_base_changed", "head": head,
+            }
         if not commit_id or not self._commit_matches_snapshot(workspace, commit_id, expected_base, manifest):
             return {"status": "BLOCKED", "run_id": run_id, "reason": "commit_not_proven"}
         if pub.get("kind") == "git_local":

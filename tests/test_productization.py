@@ -180,6 +180,190 @@ class ProductizationTests(unittest.TestCase):
         probe=subprocess.run(['git','-C',str(self.repo),'show','HEAD:legacy.txt'],capture_output=True)
         self.assertNotEqual(probe.returncode,0)
 
+    def test_verifier_binds_git_base_when_plan_base_is_dynamic(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="BASE-DYNAMIC", goal="dynamic base",
+            allowed_paths=["dynamic.json"],
+        )
+        plan["tasks"][0]["publication"].pop("expected_base", None)
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "dynamic-base-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (self.repo / "dynamic.json").write_text('{"ok":true}\n')
+        receipt = self.home / "dynamic-base-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "BASE-DYNAMIC",
+            "changed_paths": ["dynamic.json"],
+        }))
+        lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        verified = orch.verify(claim["run_id"])
+        self.assertEqual(verified["status"], "VERIFIED")
+        with orch.connect() as conn:
+            snap = conn.execute(
+                "SELECT manifest_json FROM snapshots WHERE run_id=?", (claim["run_id"],)
+            ).fetchone()
+        self.assertEqual(json.loads(snap["manifest_json"])["git_head"], base)
+        published = orch.publish(claim["run_id"])
+        self.assertEqual(published["status"], "COMPLETE")
+
+    def test_verifier_blocks_head_change_from_declared_plan_base(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="BASE-DRIFT", goal="detect drift",
+            allowed_paths=["result.json"],
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "base-drift-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        (self.repo / "result.json").write_text('{"worker":true}\n')
+        foreign = self.repo / "foreign.txt"
+        foreign.write_text("foreign\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "foreign.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "foreign", "--", "foreign.txt"],
+            check=True, capture_output=True,
+        )
+        receipt = self.home / "base-drift-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "BASE-DRIFT",
+            "changed_paths": ["result.json"],
+        }))
+        lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        result = orch.verify(claim["run_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "workspace_base_changed")
+        self.assertNotEqual(
+            result["feedback"]["evidence"]["git_head"],
+            result["feedback"]["evidence"]["expected_base"],
+        )
+
+    def test_publication_ref_cas_prevents_commit_on_foreign_head(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="CAS-RACE", goal="cas race", allowed_paths=["result.json"]
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "cas-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        (self.repo / "result.json").write_text('{"worker":true}\n')
+        receipt = self.home / "cas-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "CAS-RACE",
+            "changed_paths": ["result.json"],
+        }))
+        lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+        original_cas = orch._cas_update_branch
+        foreign_commit = {"id": None}
+
+        def inject_foreign_commit(workspace, *, branch, commit_id, expected_base):
+            foreign = self.repo / "foreign-race.txt"
+            foreign.write_text("foreign race\n")
+            subprocess.run(["git", "-C", str(self.repo), "add", "foreign-race.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(self.repo), "commit", "-m", "foreign race", "--", "foreign-race.txt"],
+                check=True, capture_output=True,
+            )
+            foreign_commit["id"] = subprocess.run(
+                ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            return original_cas(
+                workspace, branch=branch, commit_id=commit_id, expected_base=expected_base
+            )
+
+        with mock.patch.object(
+            orch, "_cas_update_branch", side_effect=inject_foreign_commit
+        ):
+            with self.assertRaisesRegex(ValueError, "publication_base_changed_during_commit"):
+                orch.publish(claim["run_id"])
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, foreign_commit["id"])
+        show = subprocess.run(
+            ["git", "-C", str(self.repo), "show", "--format=", "--name-only", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        self.assertIn("foreign-race.txt", show)
+        self.assertNotIn("result.json", show)
+        with orch.connect() as conn:
+            journal = conn.execute(
+                "SELECT status,commit_id FROM publications WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone()
+        self.assertEqual(journal["status"], "PREPARED")
+        self.assertTrue(journal["commit_id"])
+        reconciled = orch.reconcile_publication(claim["run_id"])
+        self.assertEqual(reconciled["status"], "BLOCKED")
+        self.assertEqual(reconciled["reason"], "publication_base_changed")
+
+    def test_prepared_commit_recovers_after_restart_without_recommit(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="CAS-RECOVER", goal="recover prepared",
+            allowed_paths=["prepared.json"],
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "prepared-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        (self.repo / "prepared.json").write_text('{"prepared":true}\n')
+        receipt = self.home / "prepared-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "CAS-RECOVER",
+            "changed_paths": ["prepared.json"],
+        }))
+        lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+
+        with mock.patch.object(
+            orch, "_cas_update_branch", side_effect=RuntimeError("synthetic crash before ref update")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic crash"):
+                orch.publish(claim["run_id"])
+        restarted = Orchestrator(self.home)
+        pending = restarted.reconcile_publication(claim["run_id"])
+        self.assertEqual(pending["status"], "PREPARED_PENDING_REF_UPDATE")
+        commit_id = pending["commit"]
+        finished = restarted.reconcile_publication(claim["run_id"], resume=True)
+        self.assertEqual(finished["status"], "COMPLETE")
+        self.assertEqual(finished["commit"], commit_id)
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, commit_id)
+
     def test_publication_intent_without_side_effect_is_safe_to_retry(self):
         config=ProjectRegistry(self.home).add(self.repo,profile='standard',review_mode='off')['project']
         plan=build_single_task_plan(config,task_id='REC-1',goal='write result',allowed_paths=['result.json'])
@@ -283,6 +467,7 @@ class ProductizationTests(unittest.TestCase):
         self.assertIn('publish-reconcile --run-id <run_id>',text)
         self.assertIn('DO NOT blindly call publish again',text)
         self.assertIn('COMMIT_PROVEN_REMOTE_PENDING',text)
+        self.assertIn('PREPARED_PENDING_REF_UPDATE',text)
 
     def test_doctor_without_rdc_marker_is_attention_not_hard_block(self):
         result = run_doctor(self.home, check_codex=False)

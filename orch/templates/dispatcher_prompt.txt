@@ -21,7 +21,7 @@ Work:
 10. If verify returns NEEDS_FIX, leave the failed attempt frozen and continue to Dispatch. The next new ChatGPT receives bounded feedback from ORCH.
 11. If verify returns REVIEWING, run review-decision. Only if reviewer=codex, run codex-review --execute. If review is unavailable/blocked/unknown-billing, stop; never substitute another AI or paid API. If review returns NEEDS_FIX, continue to Dispatch.
 12. If VERIFIED: obey owner-approval and publication policy. For allowed git or git_local publication use publish; for publication kind=none use complete. Never force push/reset/clean/stash.
-13. If publish returns ERROR or its outcome is uncertain, DO NOT blindly call publish again. Run publish-reconcile --run-id <run_id> first. If it returns SAFE_TO_RETRY, call publish once. If it returns STAGED_PENDING_COMMIT or COMMIT_PROVEN_REMOTE_PENDING with resume_available=true, run publish-reconcile --run-id <run_id> --resume. If it returns BLOCKED or any unrecognized state, stop and do not dispatch another writer.
+13. If publish returns ERROR or its outcome is uncertain, DO NOT blindly call publish again. Run publish-reconcile --run-id <run_id> first. If it returns SAFE_TO_RETRY, call publish once. If it returns STAGED_PENDING_COMMIT, PREPARED_PENDING_REF_UPDATE, or COMMIT_PROVEN_REMOTE_PENDING with resume_available=true, run publish-reconcile --run-id <run_id> --resume. If it returns BLOCKED or any unrecognized state, stop and do not dispatch another writer.
 
 Dispatch:
 14. Only when the current run is no longer active, run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} next

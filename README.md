@@ -16,7 +16,7 @@ Implemented and locally verified through 2026-09-18:
 - Snapshot-bound review import; failed verification/review becomes `NEEDS_FIX` and is picked up by a **new** ChatGPT run.
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
-- Exact Git publication: verified bytes/deletions → exact stage → one commit → ordinary push → `ls-remote` verification. A schema-v2 publication journal records INTENT/STAGED/COMMITTED/PUSHED/REMOTE_VERIFIED so uncertain outcomes are reconciled before retry.
+- Exact Git publication: verified bytes/deletions → exact stage → snapshot-bound detached commit → compare-and-swap branch update → ordinary push → `ls-remote` verification. The durable publication journal records INTENT/STAGED/PREPARED/COMMITTED/PUSHED/REMOTE_VERIFIED so concurrent HEAD changes and uncertain outcomes are reconciled before retry.
 - Recovery/status commands do not auto-expire active writers; explicit `pause`, `resume`, and `abort --retry` are available. Transactional schema upgrades/history, `state check`, secret-free backups, stale-capability pruning, evidence retention controls, and publication reconciliation are implemented.
 - Owner acceptance is stored separately and bound to the exact `run_id + snapshot_id`.
 - Packaged Scheduled ChatGPT dispatcher template at `orch/templates/dispatcher_prompt.txt`; `orch dispatcher render` creates the user-specific prompt. `dispatcher_prompt.txt` is the repo-local development render.
