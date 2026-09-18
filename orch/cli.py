@@ -602,7 +602,7 @@ def main(argv=None) -> int:
             result = orch.heartbeat(args.run_id, lease)
         elif args.command == "submit":
             lease = args.lease or orch.lease_from_capability(args.run_id, Path(args.cap).expanduser())
-            result = orch.submit(args.run_id, lease, Path(args.receipt).expanduser().resolve())
+            result = orch.submit(args.run_id, lease, Path(args.receipt).expanduser())
         elif args.command == "quiesce":
             lease = args.lease or orch.lease_from_capability(args.run_id, Path(args.cap).expanduser())
             result = orch.quiesce(args.run_id, lease)

@@ -33,7 +33,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def write_result(self,claim,tid='T1',value=1):
         (self.ws/f'{tid}.json').write_text(json.dumps({'value':value})+'\n',encoding='utf-8')
-        receipt=self.root/f'{tid}-receipt.json'
+        receipt=Path(claim["receipt_file"])
         receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':tid,'changed_paths':[f'{tid}.json']})+'\n',encoding='utf-8')
         cap=Path(claim['capability_file'])
         lease=self.orch.lease_from_capability(claim['run_id'],cap)
@@ -160,7 +160,7 @@ class OrchestratorTests(unittest.TestCase):
         claim = self.orch.claim("worker")
         original = claim["context"]["claim_git_head"]
         (repo / "CLAIM-RACE.json").write_text('{"worker":true}\n')
-        receipt = self.root / "claim-race-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"],
             "task_id": "CLAIM-RACE",
@@ -594,9 +594,142 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(task["status"], "BLOCKED")
         self.assertEqual(self.orch.reconcile()["status"], "CLEAN")
 
+    def test_claim_exposes_exact_receipt_path_and_submit_records_digest(self):
+        self.load([self.task("RECEIPT-OK")], revision="receipt-ok")
+        claim = self.orch.claim("worker")
+        receipt = Path(claim["receipt_file"])
+        self.assertEqual(
+            receipt,
+            self.orch.runtime / "worker_receipts" / f"{claim['run_id']}.json",
+        )
+        self.assertEqual(claim["context"]["receipt_file"], str(receipt))
+        (self.ws / "RECEIPT-OK.json").write_text('{"ok":true}\n')
+        raw = (
+            json.dumps({
+                "schema_version": 1,
+                "run_id": claim["run_id"],
+                "task_id": "RECEIPT-OK",
+                "changed_paths": ["./RECEIPT-OK.json"],
+                "summary": "bounded receipt",
+            })
+            + "\n"
+        ).encode("utf-8")
+        receipt.write_bytes(raw)
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        submitted = self.orch.submit(claim["run_id"], lease, receipt)
+        self.assertEqual(submitted["status"], "RESULT_SUBMITTED")
+        self.assertEqual(submitted["receipt_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(submitted["receipt_bytes"], len(raw))
+        with self.orch.connect() as conn:
+            stored = conn.execute(
+                "SELECT receipt_json FROM runs WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone()["receipt_json"]
+        stored_data = json.loads(stored)
+        self.assertEqual(stored_data["schema_version"], 1)
+        self.assertEqual(stored_data["changed_paths"], ["RECEIPT-OK.json"])
+
+    def test_submit_rejects_receipt_outside_claim_path(self):
+        self.load([self.task("RECEIPT-PATH")], revision="receipt-path")
+        claim = self.orch.claim("worker")
+        wrong = self.root / "wrong-receipt.json"
+        wrong.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": claim["run_id"],
+            "task_id": "RECEIPT-PATH",
+            "changed_paths": ["RECEIPT-PATH.json"],
+        }))
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_receipt_path"):
+            self.orch.submit(claim["run_id"], lease, wrong)
+        self.assertEqual(
+            next(
+                item for item in self.orch.status()["runs"]
+                if item["run_id"] == claim["run_id"]
+            )["state"],
+            "RUNNING",
+        )
+
+    def test_submit_rejects_symlinked_receipt(self):
+        self.load([self.task("RECEIPT-LINK")], revision="receipt-link")
+        claim = self.orch.claim("worker")
+        external = self.root / "external-receipt.json"
+        external.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": claim["run_id"],
+            "task_id": "RECEIPT-LINK",
+            "changed_paths": ["RECEIPT-LINK.json"],
+        }))
+        receipt = Path(claim["receipt_file"])
+        receipt.symlink_to(external)
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        with self.assertRaisesRegex(ValueError, "receipt_file_missing_or_unsafe"):
+            self.orch.submit(claim["run_id"], lease, receipt)
+        self.assertTrue(receipt.is_symlink())
+
+    def test_submit_rejects_oversized_receipt(self):
+        self.load([self.task("RECEIPT-BIG")], revision="receipt-big")
+        claim = self.orch.claim("worker")
+        receipt = Path(claim["receipt_file"])
+        receipt.write_bytes(b"{" + b"x" * (64 * 1024 + 1))
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        with self.assertRaisesRegex(ValueError, "receipt_too_large"):
+            self.orch.submit(claim["run_id"], lease, receipt)
+
+    def test_submit_rejects_future_receipt_schema_and_unknown_fields(self):
+        self.load([self.task("RECEIPT-SCHEMA")], revision="receipt-schema")
+        claim = self.orch.claim("worker")
+        receipt = Path(claim["receipt_file"])
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        receipt.write_text(json.dumps({
+            "schema_version": 2,
+            "run_id": claim["run_id"],
+            "task_id": "RECEIPT-SCHEMA",
+            "changed_paths": ["RECEIPT-SCHEMA.json"],
+        }))
+        with self.assertRaisesRegex(ValueError, "invalid_receipt_schema"):
+            self.orch.submit(claim["run_id"], lease, receipt)
+        receipt.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": claim["run_id"],
+            "task_id": "RECEIPT-SCHEMA",
+            "changed_paths": ["RECEIPT-SCHEMA.json"],
+            "unexpected": True,
+        }))
+        with self.assertRaisesRegex(ValueError, "receipt_unknown_field:unexpected"):
+            self.orch.submit(claim["run_id"], lease, receipt)
+
+    def test_submit_bounds_changed_path_count(self):
+        task = self.task("RECEIPT-MANY")
+        task["allowed_paths"] = ["out/"]
+        self.load([task], revision="receipt-many")
+        claim = self.orch.claim("worker")
+        receipt = Path(claim["receipt_file"])
+        receipt.write_text(json.dumps({
+            "schema_version": 1,
+            "run_id": claim["run_id"],
+            "task_id": "RECEIPT-MANY",
+            "changed_paths": [f"out/{index}.json" for index in range(257)],
+        }))
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        with self.assertRaisesRegex(ValueError, "receipt_changed_paths_too_many"):
+            self.orch.submit(claim["run_id"], lease, receipt)
+
     def test_scope_escape_rejected(self):
         self.load([self.task('T1')]); c=self.orch.claim('w')
-        receipt=self.root/'bad.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')
+        receipt=Path(c["receipt_file"]); receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')
         lease=self.orch.lease_from_capability(c['run_id'],Path(c['capability_file']))
         with self.assertRaisesRegex(ValueError,'path_not_allowed'):
             self.orch.submit(c['run_id'],lease,receipt)
@@ -616,7 +749,7 @@ class OrchestratorTests(unittest.TestCase):
         digest=hashlib.sha256(sentinel.read_bytes()).hexdigest()
         self.load([self.task('T1',protected={'owner.txt':digest})])
         c=self.orch.claim('w'); (self.ws/'T1.json').write_text('{"value":1}\n'); sentinel.write_text('changed\n')
-        receipt=self.root/'r.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
+        receipt=Path(c["receipt_file"]); receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
         cap=Path(c['capability_file']); lease=self.orch.lease_from_capability(c['run_id'],cap)
         self.orch.submit(c['run_id'],lease,receipt); quiesced=self.orch.quiesce(c['run_id'],lease)
         self.assertTrue(quiesced['capability_revoked']); self.assertFalse(cap.exists())
@@ -703,7 +836,7 @@ class OrchestratorTests(unittest.TestCase):
         self.load([self.task('T1'),self.task('T2')])
         c1=self.orch.claim('w1'); cap1=Path(c1['capability_file']); lease1=self.orch.lease_from_capability(c1['run_id'],cap1)
         (self.ws/'T1.json').write_text('{"value":1}\n')
-        receipt=self.root/'cap-r.json'; receipt.write_text(json.dumps({'run_id':c1['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
+        receipt=Path(c1["receipt_file"]); receipt.write_text(json.dumps({'run_id':c1['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
         self.orch.submit(c1['run_id'],lease1,receipt); self.orch.quiesce(c1['run_id'],lease1)
         self.assertFalse(cap1.exists())
         self.orch.verify(c1['run_id']); self.orch.complete(c1['run_id'])
@@ -723,7 +856,7 @@ class OrchestratorTests(unittest.TestCase):
         task=self.task('T1',review=True); self.load([task])
         target=self.ws/'T1.json'; target.write_text('{"old":true}\n',encoding='utf-8')
         claim=self.orch.claim('w'); target.unlink()
-        receipt=self.root/'delete-review-receipt.json'
+        receipt=Path(claim["receipt_file"])
         receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'T1','changed_paths':['T1.json']})+'\n')
         lease=self.orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         self.orch.submit(claim['run_id'],lease,receipt); self.orch.quiesce(claim['run_id'],lease)

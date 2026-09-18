@@ -202,7 +202,7 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         (repo / relative).write_text(
             json.dumps({"task": task_id}) + "\n", encoding="utf-8"
         )
-        receipt = self.base / f"{task_id}-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"],
             "task_id": task_id,

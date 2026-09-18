@@ -543,7 +543,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(path)
         claim = orch.claim("fixture")
         (self.repo / "verified.json").write_text('{"ok":true}\n')
-        receipt = self.home / "verified-remove-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"],
             "task_id": "REMOVE-VERIFIED",
@@ -585,7 +585,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "result.json").write_text('{"ok":true}\n', encoding="utf-8")
-        receipt = self.home / "receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({"run_id": claim["run_id"], "task_id": "TASK-1", "changed_paths": ["result.json"]}), encoding="utf-8")
         lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
         orch.submit(claim["run_id"], lease, receipt)
@@ -606,7 +606,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "blob.bin").write_bytes(bytes([0, 255, 10, 128, 42]))
-        receipt = self.home / "binary-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({"run_id": claim["run_id"], "task_id": "BIN-1", "changed_paths": ["blob.bin"]}), encoding="utf-8")
         lease = orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
         orch.submit(claim["run_id"], lease, receipt)
@@ -660,7 +660,7 @@ class ProductizationTests(unittest.TestCase):
             policy_after_change["current"]["dirty_tracked_paths"],
         )
         self.assertFalse(sentinel.exists())
-        receipt = self.home / "filter-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "FILTER-1",
             "changed_paths": ["filtered.txt"],
@@ -707,7 +707,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "bound.json").write_text('{"bound":true}\n')
-        receipt = self.home / "bound-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "BOUND-REMOTE",
             "changed_paths": ["bound.json"],
@@ -766,7 +766,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "hook-safe.json").write_text('{"ok":true}\n')
-        receipt = self.home / "hook-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "HOOK-1",
             "changed_paths": ["hook-safe.json"],
@@ -795,7 +795,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'delete-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture'); legacy.unlink()
-        receipt=self.home/'delete-receipt.json'
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'DEL-1','changed_paths':['legacy.txt']}),encoding='utf-8')
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
@@ -824,7 +824,7 @@ class ProductizationTests(unittest.TestCase):
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         (self.repo / "dynamic.json").write_text('{"ok":true}\n')
-        receipt = self.home / "dynamic-base-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "BASE-DYNAMIC",
             "changed_paths": ["dynamic.json"],
@@ -863,7 +863,7 @@ class ProductizationTests(unittest.TestCase):
             ["git", "-C", str(self.repo), "commit", "-m", "foreign", "--", "foreign.txt"],
             check=True, capture_output=True,
         )
-        receipt = self.home / "base-drift-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "BASE-DRIFT",
             "changed_paths": ["result.json"],
@@ -892,7 +892,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "result.json").write_text('{"worker":true}\n')
-        receipt = self.home / "cas-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "CAS-RACE",
             "changed_paths": ["result.json"],
@@ -962,7 +962,7 @@ class ProductizationTests(unittest.TestCase):
         claim = orch.claim("fixture")
         target = self.repo / allowed_paths[0]
         target.write_text('{"ok":true}\n')
-        receipt = self.home / f"{task_id}-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": task_id,
             "changed_paths": [allowed_paths[0]],
@@ -1081,7 +1081,7 @@ class ProductizationTests(unittest.TestCase):
         orch.load_plan(plan_path)
         claim = orch.claim("fixture")
         (self.repo / "prepared.json").write_text('{"prepared":true}\n')
-        receipt = self.home / "prepared-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"], "task_id": "CAS-RECOVER",
             "changed_paths": ["prepared.json"],
@@ -1115,7 +1115,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'rec-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture'); (self.repo/'result.json').write_text('{"ok":1}\n')
-        receipt=self.home/'rec-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-1','changed_paths':['result.json']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-1','changed_paths':['result.json']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
         pub=claim['context']['publication']
@@ -1133,7 +1133,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'stage-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture'); (self.repo/'stage.json').write_text('{"ok":2}\n')
-        receipt=self.home/'stage-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-2','changed_paths':['stage.json']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-2','changed_paths':['stage.json']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
         subprocess.run(['git','-C',str(self.repo),'add','--','stage.json'],check=True)
@@ -1150,7 +1150,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'commit-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture'); (self.repo/'commit.json').write_text('{"ok":3}\n')
-        receipt=self.home/'commit-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-3','changed_paths':['commit.json']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'REC-3','changed_paths':['commit.json']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease); orch.verify(claim['run_id'])
         subprocess.run(['git','-C',str(self.repo),'add','--','commit.json'],check=True)
@@ -1168,7 +1168,7 @@ class ProductizationTests(unittest.TestCase):
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture')
         (self.repo/'result.json').write_text('{"ok":true}\n'); (self.repo/'rogue.txt').write_text('rogue\n')
-        receipt=self.home/'scope-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-1','changed_paths':['result.json']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-1','changed_paths':['result.json']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
         result=orch.verify(claim['run_id'])
@@ -1182,7 +1182,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'phantom-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture')
-        receipt=self.home/'phantom-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-2','changed_paths':['README.md']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-2','changed_paths':['README.md']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
         result=orch.verify(claim['run_id'])
@@ -1197,7 +1197,7 @@ class ProductizationTests(unittest.TestCase):
         orch=Orchestrator(self.home); plan_path=self.home/'protected-scope-plan.json'
         plan_path.write_text(json.dumps(plan),encoding='utf-8'); orch.load_plan(plan_path)
         claim=orch.claim('fixture'); (self.repo/'result.json').write_text('{"safe":true}\n')
-        receipt=self.home/'protected-scope-receipt.json'; receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-3','changed_paths':['result.json']}))
+        receipt=Path(claim["receipt_file"]); receipt.write_text(json.dumps({'run_id':claim['run_id'],'task_id':'SCOPE-3','changed_paths':['result.json']}))
         lease=orch.lease_from_capability(claim['run_id'],Path(claim['capability_file']))
         orch.submit(claim['run_id'],lease,receipt); orch.quiesce(claim['run_id'],lease)
         result=orch.verify(claim['run_id'])

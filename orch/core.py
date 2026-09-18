@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat as statmod
 import subprocess
 import time
 import uuid
@@ -21,6 +22,9 @@ ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "R
 WRITER_LOCK_RUN_STATES = ACTIVE_RUN_STATES | {"VERIFIED"}
 READY_TASK_STATES = {"PLANNED", "READY", "NEEDS_FIX"}
 STATE_SCHEMA_VERSION = 4
+WORKER_RECEIPT_MAX_BYTES = 64 * 1024
+WORKER_RECEIPT_MAX_CHANGED_PATHS = 256
+WORKER_RECEIPT_MAX_SUMMARY_BYTES = 4096
 
 
 def utc_now() -> str:
@@ -395,6 +399,86 @@ class Orchestrator:
         if re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
             raise ValueError("invalid_run_id")
         return self.runtime / "claims" / f"{run_id}.json"
+
+    def _receipt_path(self, run_id: str) -> Path:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
+            raise ValueError("invalid_run_id")
+        receipts = ensure_private_dir(self.runtime / "worker_receipts")
+        return receipts / f"{run_id}.json"
+
+    def _load_worker_receipt(
+        self, run_id: str, receipt_path: Path
+    ) -> Tuple[Dict[str, Any], str, int]:
+        expected = self._receipt_path(run_id)
+        supplied = Path(
+            os.path.abspath(os.path.expanduser(str(receipt_path)))
+        )
+        if supplied != expected:
+            raise ValueError("invalid_receipt_path")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(str(expected), flags)
+        except OSError as exc:
+            raise ValueError("receipt_file_missing_or_unsafe") from exc
+        try:
+            info = os.fstat(fd)
+            if not statmod.S_ISREG(info.st_mode):
+                raise ValueError("receipt_file_missing_or_unsafe")
+            if info.st_size > WORKER_RECEIPT_MAX_BYTES:
+                raise ValueError("receipt_too_large")
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                fd = -1
+                raw = handle.read(WORKER_RECEIPT_MAX_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(raw) > WORKER_RECEIPT_MAX_BYTES:
+            raise ValueError("receipt_too_large")
+        try:
+            receipt = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_receipt_json") from exc
+        if not isinstance(receipt, dict):
+            raise ValueError("invalid_receipt")
+        allowed_keys = {
+            "schema_version", "run_id", "task_id", "changed_paths", "summary"
+        }
+        unknown = sorted(set(receipt) - allowed_keys)
+        if unknown:
+            raise ValueError("receipt_unknown_field:" + unknown[0])
+        schema_version = receipt.get("schema_version", 1)
+        if schema_version != 1:
+            raise ValueError("invalid_receipt_schema")
+        receipt["schema_version"] = 1
+        summary = receipt.get("summary")
+        if summary is not None:
+            if not isinstance(summary, str):
+                raise ValueError("invalid_receipt_summary")
+            if len(summary.encode("utf-8")) > WORKER_RECEIPT_MAX_SUMMARY_BYTES:
+                raise ValueError("receipt_summary_too_large")
+        changed = receipt.get("changed_paths")
+        if not isinstance(changed, list) or not changed:
+            raise ValueError("receipt_changed_paths_required")
+        if len(changed) > WORKER_RECEIPT_MAX_CHANGED_PATHS:
+            raise ValueError("receipt_changed_paths_too_many")
+        normalized: List[str] = []
+        for relative in changed:
+            if not isinstance(relative, str) or not relative:
+                raise ValueError("invalid_receipt_changed_path")
+            if len(relative.encode("utf-8")) > 1024:
+                raise ValueError("receipt_changed_path_too_long")
+            try:
+                normalized.append(normalize_relative_path(relative))
+            except ValueError as exc:
+                raise ValueError(f"path_not_allowed:{relative}") from exc
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("duplicate_receipt_changed_path")
+        receipt["changed_paths"] = normalized
+        return receipt, sha256_bytes(raw), len(raw)
 
     def _revoke_capability(self, run_id: str) -> bool:
         path = self._capability_path(run_id)
@@ -1011,6 +1095,7 @@ class Orchestrator:
             "project_id": row["project_id"],
             "attempt": attempt,
             "capability_file": str(cap),
+            "receipt_file": str(self._receipt_path(run_id)),
             "context": context_pack,
         }
 
@@ -1055,6 +1140,7 @@ class Orchestrator:
             "writer_key": task["writer_key"],
             "queue_seq": task["queue_seq"],
             "claim_git_head": claim_git_head,
+            "receipt_file": str(self._receipt_path(run_id)),
             "goal": payload.get("goal"),
             "non_goals": payload.get("non_goals", []),
             "workspace": payload["workspace"],
@@ -1117,7 +1203,9 @@ class Orchestrator:
             return {"status": "OK", "heartbeat_at": now}
 
     def submit(self, run_id: str, lease_token: str, receipt_path: Path) -> Dict[str, Any]:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
+            run_id, receipt_path
+        )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -1143,10 +1231,22 @@ class Orchestrator:
             now = utc_now()
             conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
                          (canonical_json(receipt), now, now, run_id))
-            self._event(conn, "RESULT_SUBMITTED", task_id=run["task_id"], run_id=run_id,
-                        payload={"changed_paths": changed})
+            self._event(
+                conn, "RESULT_SUBMITTED",
+                task_id=run["task_id"], run_id=run_id,
+                payload={
+                    "changed_paths": changed,
+                    "receipt_sha256": receipt_sha256,
+                    "receipt_bytes": receipt_bytes,
+                },
+            )
             conn.execute("COMMIT")
-        return {"status": "RESULT_SUBMITTED", "run_id": run_id}
+        return {
+            "status": "RESULT_SUBMITTED",
+            "run_id": run_id,
+            "receipt_sha256": receipt_sha256,
+            "receipt_bytes": receipt_bytes,
+        }
 
     def quiesce(self, run_id: str, lease_token: str) -> Dict[str, Any]:
         with self.connect() as conn:

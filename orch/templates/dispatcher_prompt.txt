@@ -11,11 +11,11 @@ Bootstrap:
 1. Discover RDC and the expected computer.
 2. Via RDC terminal run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} claim --worker {{WORKER_ID}}{{PROJECT_ARG}}
 3. If status is NO_WORK, BUSY, BLOCKED, PAUSED, PROJECT_PAUSED, PROJECTS_PAUSED, or ERROR, do not edit a project and do not re-arm; report the actual state and stop.
-4. If CLAIMED, use only returned workspace, allowed_paths, protected_paths, checks, review policy, publication policy, feedback, run_id, and capability_file.
+4. If CLAIMED, use only returned workspace, allowed_paths, protected_paths, checks, review policy, publication policy, feedback, run_id, capability_file, and receipt_file.
 
 Work:
 5. Do the substantive task yourself as ChatGPT through RDC. Write only allowed_paths; do not modify protected paths or ORCH policy/ledger directly.
-6. Create a receipt JSON under {{ORCH_HOME}}/.runtime/worker_receipts/<run_id>.json containing schema_version=1, exact run_id/task_id, changed_paths, and a concise summary.
+6. Create the receipt JSON at the exact returned receipt_file path. It must contain schema_version=1, exact run_id/task_id, changed_paths, and an optional concise summary. Do not use a symlink or another path.
 7. Run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} submit --run-id <run_id> --cap <capability_file> --receipt <receipt_path>
 8. Run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} quiesce --run-id <run_id> --cap <capability_file>
 9. Run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} verify --run-id <run_id>

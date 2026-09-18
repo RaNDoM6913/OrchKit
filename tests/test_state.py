@@ -85,7 +85,7 @@ class StateMaintenanceTests(unittest.TestCase):
         workspace = self._load_recovery_task("RECOVERY-STAGES")
         claim = self.orch.claim("worker")
         (workspace / "result.json").write_text('{"ok":true}\n')
-        receipt = self.root / "recovery-receipt.json"
+        receipt = Path(claim["receipt_file"])
         receipt.write_text(json.dumps({
             "run_id": claim["run_id"],
             "task_id": "RECOVERY-STAGES",
