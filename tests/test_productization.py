@@ -18,6 +18,7 @@ from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
 from orch.project import ProjectRegistry
 from orch.review_policy import decide_review, normalize_review_policy
+from orch.state import backup_state
 
 
 class ProductizationTests(unittest.TestCase):
@@ -36,6 +37,41 @@ class ProductizationTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_state_independent_verify_does_not_initialize_command_root(self):
+        phantom = self.base / "phantom-verify-root"
+        invalid = self.base / "invalid.zip"
+        invalid.write_bytes(b"not-a-zip")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(phantom),
+                "state", "verify-backup", str(invalid),
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(phantom.exists())
+
+    def test_state_independent_restore_only_creates_destination(self):
+        source = self.base / "backup-source"
+        source.mkdir()
+        source_orch = Orchestrator(source)
+        archive = Path(backup_state(source_orch)["path"])
+        phantom = self.base / "phantom-restore-command-root"
+        destination = self.base / "explicit-restored-home"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(phantom),
+                "state", "restore-backup", str(archive),
+                "--destination", str(destination),
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "RESTORED")
+        self.assertFalse(phantom.exists())
+        self.assertTrue((destination / ".runtime" / "orch.sqlite3").is_file())
 
     def test_setup_persists_default_profile(self):
         configured = configure_home(self.home, profile="standard")

@@ -182,7 +182,23 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     root = root_from_args(args)
-    orch = Orchestrator(root)
+    state_independent = (
+        args.command in {
+            "setup", "doctor", "rdc", "dispatcher", "git", "codex-preflight",
+        }
+        or (
+            args.command == "project"
+            and args.project_command != "remove"
+        )
+        or (
+            args.command == "state"
+            and args.state_command in {
+                "verify-backup", "restore-backup",
+                "replace-backup", "replace-reconcile",
+            }
+        )
+    )
+    orch = None if state_independent else Orchestrator(root)
     try:
         if args.command == "setup":
             result = configure_home(root, profile=args.profile)
