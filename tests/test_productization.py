@@ -199,6 +199,50 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(conflict["error"], "plan_artifact_conflict")
         self.assertEqual(plan1.read_text(), original)
 
+    def test_queue_project_pause_resume_cli(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="CLI-PAUSE", goal="pause me",
+            allowed_paths=["pause.json"],
+        )
+        plan_path = self.home / "pause-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        Orchestrator(self.home).load_plan(plan_path)
+
+        def call(*args):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = cli_main(["--root", str(self.home), *args])
+            return rc, json.loads(output.getvalue())
+
+        rc1, paused = call(
+            "queue", "pause-project", config["project_id"],
+            "--reason", "operator maintenance",
+        )
+        self.assertEqual(rc1, 0)
+        self.assertEqual(paused["status"], "PROJECT_PAUSED")
+
+        rc2, view = call(
+            "queue", "list", "--project", config["project_id"]
+        )
+        self.assertEqual(rc2, 0)
+        self.assertEqual(view["status"], "PROJECT_PAUSED")
+        self.assertEqual(view["tasks"][0]["queue_state"], "PAUSED_PROJECT")
+
+        rc3, resumed = call(
+            "queue", "resume-project", config["project_id"]
+        )
+        self.assertEqual(rc3, 0)
+        self.assertEqual(resumed["status"], "PROJECT_RESUMED")
+        self.assertEqual(
+            Orchestrator(self.home).next_work(
+                project_id=config["project_id"]
+            )["status"],
+            "READY",
+        )
+
     def test_generated_plan_uses_git_local_when_commit_allowed_without_remote(self):
         config = ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="off")["project"]
         plan = build_single_task_plan(config, task_id="TASK-1", goal="create result", allowed_paths=["result.json"])
@@ -785,6 +829,8 @@ class ProductizationTests(unittest.TestCase):
         self.assertIn('DO NOT blindly call publish again',text)
         self.assertIn('COMMIT_PROVEN_REMOTE_PENDING',text)
         self.assertIn('PREPARED_PENDING_REF_UPDATE',text)
+        self.assertIn('PROJECT_PAUSED',text)
+        self.assertIn('PROJECTS_PAUSED',text)
 
     def test_doctor_without_rdc_marker_is_attention_not_hard_block(self):
         result = run_doctor(self.home, check_codex=False)

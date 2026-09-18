@@ -474,6 +474,19 @@ class Orchestrator:
         ).fetchall()
         return {row["writer_key"]: dict(row) for row in rows}
 
+    def _project_pauses(self, conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT key,value_json FROM settings WHERE key GLOB 'project_paused:*' ORDER BY key"
+        ).fetchall()
+        result: Dict[str, Dict[str, Any]] = {}
+        prefix = "project_paused:"
+        for row in rows:
+            project_id = row["key"][len(prefix):]
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+                continue
+            result[project_id] = json.loads(row["value_json"])
+        return result
+
     def claim(self, worker_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
         if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")
@@ -485,12 +498,24 @@ class Orchestrator:
                 conn.execute("COMMIT")
                 return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
             locks = self._active_writer_locks(conn)
+            project_pauses = self._project_pauses(conn)
+            if project_id is not None and project_id in project_pauses:
+                conn.execute("COMMIT")
+                return {
+                    "status": "PROJECT_PAUSED",
+                    "project_id": project_id,
+                    "details": project_pauses[project_id],
+                }
             blocked_locks: List[Dict[str, Any]] = []
+            paused_projects: Dict[str, Dict[str, Any]] = {}
             selected = None
             for row in conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall():
                 if row["status"] not in READY_TASK_STATES:
                     continue
                 if project_id is not None and row["project_id"] != project_id:
+                    continue
+                if row["project_id"] in project_pauses:
+                    paused_projects[row["project_id"]] = project_pauses[row["project_id"]]
                     continue
                 payload = self._task_payload(row)
                 if not self._dependencies_done(conn, payload):
@@ -520,6 +545,12 @@ class Orchestrator:
                     unique = {item["run_id"]: item for item in blocked_locks}
                     active = list(unique.values())
                     return {"status": "BUSY", "active": active[0], "locks": active}
+                if paused_projects:
+                    return {
+                        "status": "PROJECTS_PAUSED",
+                        "project_id": project_id,
+                        "paused_projects": paused_projects,
+                    }
                 return {"status": "NO_WORK", "project_id": project_id}
             row, payload, attempt = selected
             run_id = f"{row['task_id']}-A{attempt}-{uuid.uuid4().hex[:10]}"
@@ -1506,6 +1537,7 @@ class Orchestrator:
             raise ValueError("invalid_queue_limit")
         with self.connect() as conn:
             paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
+            project_pauses = self._project_pauses(conn)
             locks = self._active_writer_locks(conn)
             active_by_task = {item["task_id"]: item for item in locks.values()}
             rows = conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall()
@@ -1531,7 +1563,9 @@ class Orchestrator:
             if row["task_id"] in active_by_task:
                 queue_state = "ACTIVE"
             elif row["status"] in READY_TASK_STATES:
-                if attempts >= max_attempts:
+                if row["project_id"] in project_pauses:
+                    queue_state = "PAUSED_PROJECT"
+                elif attempts >= max_attempts:
                     queue_state = "EXHAUSTED"
                 elif waiting_dependencies:
                     queue_state = "WAITING_DEPENDENCY"
@@ -1562,20 +1596,96 @@ class Orchestrator:
                 }
             items.append(item)
         total = len(items)
+        visible_project_pauses = (
+            {project_id: project_pauses[project_id]}
+            if project_id is not None and project_id in project_pauses
+            else project_pauses if project_id is None else {}
+        )
         return {
-            "status": "PAUSED" if paused else "OK",
+            "status": (
+                "PAUSED" if paused
+                else "PROJECT_PAUSED" if project_id is not None and project_id in project_pauses
+                else "OK"
+            ),
             "project_id": project_id,
             "paused": json.loads(paused["value_json"]) if paused else None,
+            "project_pauses": visible_project_pauses,
             "summary": {
                 "total": total,
                 "task_status": dict(sorted(task_status_counts.items())),
                 "queue_state": dict(sorted(queue_state_counts.items())),
                 "active_writer_count": len(locks),
+                "paused_project_count": len(visible_project_pauses),
             },
             "active_writers": list(locks.values()),
             "tasks": items[:limit],
             "shown": min(total, limit),
             "truncated": total > limit,
+        }
+
+    def pause_project(self, project_id: str, reason: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        if not reason.strip():
+            raise ValueError("pause_reason_required")
+        details = {
+            "project_id": project_id,
+            "reason": reason.strip()[:500],
+            "paused_at": utc_now(),
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                "SELECT 1 FROM tasks WHERE project_id=? LIMIT 1", (project_id,)
+            ).fetchone()
+            if not exists:
+                conn.execute("ROLLBACK")
+                raise ValueError("unknown_project_queue")
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key,value_json,updated_at) VALUES(?,?,?)",
+                (
+                    f"project_paused:{project_id}",
+                    canonical_json(details),
+                    details["paused_at"],
+                ),
+            )
+            self._event(
+                conn, "PROJECT_PAUSED",
+                payload={
+                    "project_id": project_id,
+                    "reason": details["reason"],
+                },
+            )
+            conn.execute("COMMIT")
+        return {"status": "PROJECT_PAUSED", "project_id": project_id, "details": details}
+
+    def resume_project(self, project_id: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        key = f"project_paused:{project_id}"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?", (key,)
+            ).fetchone()
+            if not existing:
+                conn.execute("COMMIT")
+                return {
+                    "status": "PROJECT_RESUMED",
+                    "project_id": project_id,
+                    "already_resumed": True,
+                }
+            previous = json.loads(existing["value_json"])
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+            self._event(
+                conn, "PROJECT_RESUMED",
+                payload={"project_id": project_id, "previous_pause": previous},
+            )
+            conn.execute("COMMIT")
+        return {
+            "status": "PROJECT_RESUMED",
+            "project_id": project_id,
+            "already_resumed": False,
         }
 
     def cancel_task(self, task_id: str, reason: str) -> Dict[str, Any]:
@@ -1641,11 +1751,13 @@ class Orchestrator:
                 )
             ]
             paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
+            project_pauses = self._project_pauses(conn)
         for event in events:
             event["payload"] = json.loads(event.pop("payload_json"))
         return {
             "schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT",
             "paused": json.loads(paused["value_json"]) if paused else None,
+            "project_pauses": project_pauses,
             "tasks": tasks, "runs": runs, "recent_events": events,
         }
 
@@ -1684,11 +1796,22 @@ class Orchestrator:
             if paused:
                 return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
             locks = self._active_writer_locks(conn)
+            project_pauses = self._project_pauses(conn)
+            if project_id is not None and project_id in project_pauses:
+                return {
+                    "status": "PROJECT_PAUSED",
+                    "project_id": project_id,
+                    "details": project_pauses[project_id],
+                }
             blocked_locks: List[Dict[str, Any]] = []
+            paused_projects: Dict[str, Dict[str, Any]] = {}
             for row in conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall():
                 if row["status"] not in READY_TASK_STATES:
                     continue
                 if project_id is not None and row["project_id"] != project_id:
+                    continue
+                if row["project_id"] in project_pauses:
+                    paused_projects[row["project_id"]] = project_pauses[row["project_id"]]
                     continue
                 payload = self._task_payload(row)
                 if not self._dependencies_done(conn, payload):
@@ -1711,6 +1834,12 @@ class Orchestrator:
                 unique = {item["run_id"]: item for item in blocked_locks}
                 active = list(unique.values())
                 return {"status": "BUSY", "active": active[0], "locks": active}
+            if paused_projects:
+                return {
+                    "status": "PROJECTS_PAUSED",
+                    "project_id": project_id,
+                    "paused_projects": paused_projects,
+                }
             return {"status": "NO_WORK", "project_id": project_id}
 
     def reconcile(self) -> Dict[str, Any]:

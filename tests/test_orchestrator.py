@@ -183,6 +183,67 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(next_one["status"], "READY")
         self.assertEqual(next_one["task_id"], "P1-FIRST")
 
+    def test_project_pause_skips_only_that_project_and_persists(self):
+        ws2 = Path(self.tmp.name) / "pause-ws2"
+        ws2.mkdir()
+        one = self.task("PAUSE-P1")
+        one["project_id"] = "project-one"
+        two = self.task("PAUSE-P2")
+        two["project_id"] = "project-two"
+        two["workspace"] = str(ws2)
+        self.load([one, two], revision="project-pause")
+
+        paused = self.orch.pause_project("project-one", "maintenance")
+        self.assertEqual(paused["status"], "PROJECT_PAUSED")
+        scoped = self.orch.claim("w1", project_id="project-one")
+        self.assertEqual(scoped["status"], "PROJECT_PAUSED")
+
+        other = self.orch.claim("w2")
+        self.assertEqual(other["task_id"], "PAUSE-P2")
+        restarted = Orchestrator(self.root)
+        view = restarted.queue_view(project_id="project-one")
+        self.assertEqual(view["status"], "PROJECT_PAUSED")
+        self.assertEqual(view["tasks"][0]["queue_state"], "PAUSED_PROJECT")
+        self.assertEqual(view["summary"]["paused_project_count"], 1)
+        self.assertEqual(
+            restarted.next_work()["status"], "PROJECTS_PAUSED"
+        )
+
+        resumed = restarted.resume_project("project-one")
+        self.assertEqual(resumed["status"], "PROJECT_RESUMED")
+        first = restarted.claim("w3")
+        self.assertEqual(first["status"], "CLAIMED")
+        self.assertEqual(first["task_id"], "PAUSE-P1")
+
+    def test_project_pause_does_not_interrupt_existing_writer(self):
+        first = self.task("ACTIVE-P1")
+        first["project_id"] = "project-one"
+        second = self.task("AFTER-P1")
+        second["project_id"] = "project-one"
+        self.load([first, second], revision="project-pause-active")
+        claim = self.orch.claim("worker")
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        self.orch.pause_project("project-one", "hold new work")
+        self.assertEqual(
+            self.orch.heartbeat(claim["run_id"], lease)["status"], "OK"
+        )
+        self.assertEqual(
+            self.orch.next_work(project_id="project-one")["status"],
+            "PROJECT_PAUSED",
+        )
+        self.orch.resume_project("project-one")
+        busy = self.orch.next_work(project_id="project-one")
+        self.assertEqual(busy["status"], "BUSY")
+        self.assertEqual(busy["active"]["run_id"], claim["run_id"])
+
+    def test_project_pause_requires_existing_project_queue(self):
+        with self.assertRaisesRegex(ValueError, "unknown_project_queue"):
+            self.orch.pause_project("missing-project", "nothing loaded")
+        resumed = self.orch.resume_project("missing-project")
+        self.assertTrue(resumed["already_resumed"])
+
     def test_queue_view_explains_writer_and_dependency_waits(self):
         first = self.task("QUEUE-1")
         second = self.task("QUEUE-2")

@@ -17,7 +17,7 @@ Implemented and locally verified through 2026-09-18:
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
 - Exact Git publication: verified bytes/deletions → exact stage → snapshot-bound detached commit → compare-and-swap branch update → ordinary push → `ls-remote` verification. The durable publication journal records INTENT/STAGED/PREPARED/COMMITTED/PUSHED/REMOTE_VERIFIED so concurrent HEAD changes and uncertain outcomes are reconciled before retry.
-- Recovery/status commands do not auto-expire active writers; explicit `pause`, `resume`, and `abort --retry` are available. Transactional schema upgrades/history, `state check`, secret-free backups, stale-capability pruning, evidence retention controls, and publication reconciliation are implemented. Local ORCH authority is private-by-construction: runtime/state directories are `0700`, SQLite/WAL/SHM and durable authority artifacts are `0600`, and symlinked authority paths fail closed. Git inventory/verifier subprocesses neutralize configured clean/process filters, and publication disables repository hooks; changed filtered paths fail closed before staging.
+- Recovery/status commands do not auto-expire active writers; explicit global `pause`/`resume`, project-level queue pause/resume, and `abort --retry` are available. Transactional schema upgrades/history, `state check`, secret-free backups, stale-capability pruning, evidence retention controls, and publication reconciliation are implemented. Local ORCH authority is private-by-construction: runtime/state directories are `0700`, SQLite/WAL/SHM and durable authority artifacts are `0600`, and symlinked authority paths fail closed. Git inventory/verifier subprocesses neutralize configured clean/process filters, and publication disables repository hooks; changed filtered paths fail closed before staging.
 - Owner acceptance is stored separately and bound to the exact `run_id + snapshot_id`.
 - Packaged Scheduled ChatGPT dispatcher template at `orch/templates/dispatcher_prompt.txt`; `orch dispatcher render` creates the user-specific prompt. `dispatcher_prompt.txt` is the repo-local development render.
 
@@ -85,6 +85,15 @@ orch queue enqueue PROJECT_ID \
 ```
 
 The compiled plan is retained under the ORCH home with mode `0600`. Dependencies may refer to tasks loaded by earlier plan revisions; dependent Git tasks bind their exact publication base during verification after predecessors finish.
+
+Pause only one project queue without blocking independent projects:
+
+```sh
+orch queue pause-project PROJECT_ID --reason "maintenance"
+orch queue resume-project PROJECT_ID
+```
+
+A project pause affects only new dispatch. Existing active runs keep their explicit recovery semantics, and resumed tasks keep their original durable FIFO position.
 
 Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
 

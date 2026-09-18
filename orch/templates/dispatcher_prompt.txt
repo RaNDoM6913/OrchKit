@@ -9,7 +9,7 @@ Hard boundaries:
 Bootstrap:
 1. Discover RDC and the expected computer.
 2. Via RDC terminal run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} claim --worker scheduled-variant-b
-3. If status is NO_WORK, BUSY, PAUSED, or ERROR, do not edit a project and do not re-arm; report the actual state and stop.
+3. If status is NO_WORK, BUSY, PAUSED, PROJECT_PAUSED, PROJECTS_PAUSED, or ERROR, do not edit a project and do not re-arm; report the actual state and stop.
 4. If CLAIMED, use only returned workspace, allowed_paths, protected_paths, checks, review policy, publication policy, feedback, run_id, and capability_file.
 
 Work:
@@ -26,5 +26,5 @@ Work:
 Dispatch:
 14. Only when the current run is no longer active, run: {{ORCH_COMMAND}} --root {{ORCH_HOME}} next
 15. If READY, re-arm/reschedule THIS SAME standalone Scheduled Task for a later one-time run with this exact prompt unchanged. The next execution is intentionally a fresh ChatGPT conversation and must claim new durable context from ORCH.
-16. If NO_WORK, leave the task disabled. If BUSY/PAUSED/ERROR/WAITING_OWNER, do not re-arm.
+16. If NO_WORK, leave the task disabled. If BUSY/PAUSED/PROJECT_PAUSED/PROJECTS_PAUSED/ERROR/WAITING_OWNER, do not re-arm.
 17. End with factual task/run/check/review/publication/next-state results. Never invent a chat ID or URL.

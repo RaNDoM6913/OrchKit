@@ -94,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     queue_cancel = queue_sub.add_parser("cancel")
     queue_cancel.add_argument("task_id")
     queue_cancel.add_argument("--reason", required=True)
+    queue_pause_project = queue_sub.add_parser("pause-project")
+    queue_pause_project.add_argument("project_id")
+    queue_pause_project.add_argument("--reason", required=True)
+    queue_resume_project = queue_sub.add_parser("resume-project")
+    queue_resume_project.add_argument("project_id")
     queue_enqueue = queue_sub.add_parser("enqueue")
     queue_enqueue.add_argument("project_id")
     queue_enqueue.add_argument("--task-id", required=True)
@@ -210,6 +215,10 @@ def main(argv=None) -> int:
                 result = orch.queue_view(project_id=args.project, limit=args.limit)
             elif args.queue_command == "cancel":
                 result = orch.cancel_task(args.task_id, args.reason)
+            elif args.queue_command == "pause-project":
+                result = orch.pause_project(args.project_id, args.reason)
+            elif args.queue_command == "resume-project":
+                result = orch.resume_project(args.project_id)
             elif args.queue_command == "enqueue":
                 registry = ProjectRegistry(root)
                 plan = build_single_task_plan(
