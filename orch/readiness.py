@@ -7,7 +7,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .core import STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES
+from .core import (STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
+                   safe_workspace_path, sha256_file)
 from .git_policy import evaluate_project_git_policy
 from .project import PROFILE_DEFAULTS, inspect_project
 from .review_policy import normalize_review_policy
@@ -153,10 +154,150 @@ def _open_ledger_read_only(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _task_check_authority(
+    workspace: Path,
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    task_results: List[Dict[str, Any]] = []
+    blocked = False
+    for row in rows:
+        if row["status"] in _TERMINAL_TASK_STATES:
+            continue
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            task_results.append({
+                "task_id": row["task_id"],
+                "status": "BLOCKED",
+                "errors": ["invalid_task_payload_json"],
+                "checks": [],
+            })
+            blocked = True
+            continue
+
+        check_results: List[Dict[str, Any]] = []
+        task_errors: List[str] = []
+        checks = payload.get("checks", [])
+        if not isinstance(checks, list):
+            checks = []
+            task_errors.append("invalid_checks")
+
+        for check in checks:
+            check_id = str(check.get("id", "unnamed")) if isinstance(check, dict) else "unnamed"
+            errors: List[str] = []
+            if not isinstance(check, dict):
+                errors.append("invalid_check")
+                check_results.append({
+                    "id": check_id, "status": "BLOCKED", "errors": errors,
+                })
+                task_errors.extend(f"{check_id}:{item}" for item in errors)
+                continue
+
+            executable_value = check.get("executable_path")
+            expected_hash = check.get("executable_sha256")
+            actual_hash = None
+            executable = (
+                Path(executable_value)
+                if isinstance(executable_value, str)
+                else None
+            )
+            if (
+                executable is None
+                or not executable.is_absolute()
+                or executable.is_symlink()
+                or not executable.is_file()
+            ):
+                errors.append("executable_missing_or_unsafe")
+            elif (
+                not isinstance(expected_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            ):
+                errors.append("executable_hash_missing")
+            else:
+                actual_hash = sha256_file(executable)
+                if actual_hash != expected_hash:
+                    errors.append("executable_hash_changed")
+
+            authority_results: List[Dict[str, Any]] = []
+            authority_files = check.get("authority_files")
+            if not isinstance(authority_files, list):
+                errors.append("authority_files_missing")
+                authority_files = []
+            for record in authority_files:
+                if not isinstance(record, dict):
+                    errors.append("authority_record_invalid")
+                    continue
+                relative = record.get("path")
+                expected = record.get("expected")
+                expected_file_hash = record.get("sha256")
+                state = "PASS"
+                actual_file_hash = None
+                try:
+                    path = safe_workspace_path(
+                        workspace, relative, must_exist=False
+                    )
+                except (TypeError, ValueError):
+                    state = "INVALID_PATH"
+                    path = None
+                if path is not None:
+                    if path.is_symlink():
+                        state = "UNSAFE_SYMLINK"
+                    elif expected == "file":
+                        if not path.is_file():
+                            state = "MISSING"
+                        else:
+                            actual_file_hash = sha256_file(path)
+                            if actual_file_hash != expected_file_hash:
+                                state = "HASH_CHANGED"
+                    elif expected == "absent":
+                        if path.exists():
+                            state = "UNEXPECTED_PRESENT"
+                    else:
+                        state = "INVALID_EXPECTATION"
+                authority_results.append({
+                    "path": relative,
+                    "expected": expected,
+                    "status": state,
+                    "expected_sha256": expected_file_hash,
+                    "actual_sha256": actual_file_hash,
+                })
+                if state != "PASS":
+                    errors.append(f"authority_file:{relative}:{state}")
+
+            check_results.append({
+                "id": check_id,
+                "status": "BLOCKED" if errors else "PASS",
+                "executable_path": (
+                    str(executable) if executable is not None else None
+                ),
+                "expected_executable_sha256": expected_hash,
+                "actual_executable_sha256": actual_hash,
+                "authority_files": authority_results,
+                "errors": errors,
+            })
+            task_errors.extend(f"{check_id}:{item}" for item in errors)
+
+        if task_errors:
+            blocked = True
+        task_results.append({
+            "task_id": row["task_id"],
+            "task_status": row["status"],
+            "status": "BLOCKED" if task_errors else "PASS",
+            "errors": task_errors,
+            "checks": check_results,
+        })
+
+    return {
+        "status": "BLOCKED" if blocked else "PASS",
+        "tasks": task_results,
+    }
+
+
 def _ledger_snapshot(
     home: Path,
     project_id: str,
     writer_key: str,
+    workspace: Path,
 ) -> Dict[str, Any]:
     db_path = home / ".runtime" / "orch.sqlite3"
     with _open_ledger_read_only(db_path) as conn:
@@ -173,13 +314,18 @@ def _ledger_snapshot(
                 "foreign_key_violations": foreign,
             }
 
-        tasks = [
+        task_rows = [
             dict(row) for row in conn.execute(
-                "SELECT task_id,status,queue_seq,writer_key,updated_at "
+                "SELECT task_id,status,queue_seq,writer_key,updated_at,payload_json "
                 "FROM tasks WHERE project_id=? ORDER BY queue_seq,task_id",
                 (project_id,),
             ).fetchall()
         ]
+        tasks = [
+            {key: value for key, value in row.items() if key != "payload_json"}
+            for row in task_rows
+        ]
+        check_authority = _task_check_authority(workspace, task_rows)
         lock_states = tuple(sorted(WRITER_LOCK_RUN_STATES))
         placeholders = ",".join("?" for _ in lock_states)
         locks = [
@@ -243,7 +389,7 @@ def _ledger_snapshot(
     return {
         "status": (
             "BLOCKED"
-            if quick != ["ok"] or foreign
+            if quick != ["ok"] or foreign or check_authority["status"] == "BLOCKED"
             else "ATTENTION"
             if (
                 missing_caps
@@ -261,6 +407,7 @@ def _ledger_snapshot(
         "quick_check": quick,
         "foreign_key_violations": foreign,
         "tasks": tasks,
+        "check_authority": check_authority,
         "non_nominal_tasks": non_nominal_tasks,
         "writer_locks": locks,
         "pending_publications": pending_publications,
@@ -520,7 +667,9 @@ def audit_project(
     try:
         if not isinstance(writer_key, str) or not writer_key:
             raise ValueError("writer_key_unavailable")
-        ledger = _ledger_snapshot(resolved_home, project_id, writer_key)
+        ledger = _ledger_snapshot(
+            resolved_home, project_id, writer_key, registry["resolved_root"]
+        )
         ledger_writer_mismatches = [
             item
             for item in ledger.get("tasks", [])
@@ -544,6 +693,22 @@ def audit_project(
                     "expected_writer_key": writer_key,
                     "task_count": len(ledger.get("tasks", [])),
                 },
+            ))
+        authority = ledger.get("check_authority") or {
+            "status": "PASS", "tasks": []
+        }
+        if authority["status"] == "BLOCKED":
+            findings.append(_finding(
+                "check_execution_authority",
+                "BLOCKED",
+                authority,
+                severity="blocker",
+            ))
+        else:
+            findings.append(_finding(
+                "check_execution_authority",
+                "PASS",
+                authority,
             ))
         if ledger["status"] == "BLOCKED":
             findings.append(_finding(

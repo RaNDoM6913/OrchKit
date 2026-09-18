@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -171,6 +172,98 @@ class ProjectReadinessTests(unittest.TestCase):
         transport = self._check(result, "publication_transport")
         self.assertEqual(transport["status"], "BLOCKED")
         self.assertIn("remote_url_changed", transport["detail"]["push_blockers"])
+
+    def test_queued_check_support_drift_blocks_readiness_on_clean_worktree(self):
+        support = self.repo / "audit_check.py"
+        support.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "audit_check.py"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "add audit check"],
+            check=True, capture_output=True,
+        )
+        task = build_single_task_plan(
+            self.config,
+            task_id="AUDIT-CHECK-SUPPORT",
+            goal="bound check support",
+            allowed_paths=["result.json"],
+        )
+        task["tasks"][0]["checks"] = [{
+            "id": "support",
+            "argv": [sys.executable, "audit_check.py"],
+            "cwd": ".",
+            "timeout_sec": 5,
+        }]
+        plan_path = self.home / "audit-check-support.json"
+        plan_path.write_text(json.dumps(task), encoding="utf-8")
+        self.orch.load_plan(plan_path)
+
+        support.write_text("raise SystemExit(7)\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "audit_check.py"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "mutate audit check"],
+            check=True, capture_output=True,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(self.repo), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertEqual(status, "")
+
+        result = audit_project(self.home, self.config["project_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        authority = self._check(result, "check_execution_authority")
+        self.assertEqual(authority["status"], "BLOCKED")
+        errors = authority["detail"]["tasks"][0]["errors"]
+        self.assertIn(
+            "support:authority_file:audit_check.py:HASH_CHANGED", errors
+        )
+
+    def test_queued_check_executable_drift_blocks_readiness(self):
+        runner = self.repo / "audit-runner.sh"
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o755)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "audit-runner.sh"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "add audit runner"],
+            check=True, capture_output=True,
+        )
+        task = build_single_task_plan(
+            self.config,
+            task_id="AUDIT-CHECK-EXEC",
+            goal="bound executable",
+            allowed_paths=["result.json"],
+        )
+        task["tasks"][0]["checks"] = [{
+            "id": "runner",
+            "argv": ["./audit-runner.sh"],
+            "cwd": ".",
+            "timeout_sec": 5,
+        }]
+        plan_path = self.home / "audit-check-exec.json"
+        plan_path.write_text(json.dumps(task), encoding="utf-8")
+        self.orch.load_plan(plan_path)
+
+        runner.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+        runner.chmod(0o755)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "audit-runner.sh"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "mutate audit runner"],
+            check=True, capture_output=True,
+        )
+        result = audit_project(self.home, self.config["project_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        authority = self._check(result, "check_execution_authority")
+        self.assertEqual(authority["status"], "BLOCKED")
+        errors = authority["detail"]["tasks"][0]["errors"]
+        self.assertIn("runner:executable_hash_changed", errors)
 
     def test_active_writer_is_attention_not_integrity_block(self):
         plan = build_single_task_plan(
