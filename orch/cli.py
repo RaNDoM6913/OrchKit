@@ -15,7 +15,8 @@ from .git_policy import evaluate_project_git_policy
 from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
-from .state import backup_state, check_state, migration_history, prune_capabilities
+from .state import (backup_state, check_state, migration_history, prune_capabilities,
+                    prune_retention, retention_status)
 
 
 def root_from_args(args: argparse.Namespace) -> Path:
@@ -104,6 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
     state_sub.add_parser("migrations")
     state_backup = state_sub.add_parser("backup"); state_backup.add_argument("--output")
     state_sub.add_parser("prune-capabilities")
+    retention = state_sub.add_parser("retention")
+    retention.add_argument("--max-evidence-mb", type=int, default=256)
+    retention.add_argument("--max-backup-mb", type=int, default=512)
+    retention.add_argument("--keep-backups", type=int, default=5)
+    prune_ret = state_sub.add_parser("prune-retention")
+    prune_ret.add_argument("--older-than-days", type=int, default=30)
+    prune_ret.add_argument("--max-evidence-mb", type=int, default=256)
+    prune_ret.add_argument("--keep-recent-runs", type=int, default=20)
+    prune_ret.add_argument("--keep-backups", type=int, default=5)
+    prune_ret.add_argument("--max-backup-mb", type=int, default=512)
     load = sub.add_parser("load-plan"); load.add_argument("plan")
     claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True); claim.add_argument("--project")
     context = sub.add_parser("context"); context.add_argument("--run-id", required=True)
@@ -208,6 +219,22 @@ def main(argv=None) -> int:
                 result = backup_state(orch, output)
             elif args.state_command == "prune-capabilities":
                 result = prune_capabilities(orch)
+            elif args.state_command == "retention":
+                result = retention_status(
+                    orch,
+                    max_evidence_bytes=args.max_evidence_mb * 1024 * 1024,
+                    max_backup_bytes=args.max_backup_mb * 1024 * 1024,
+                    keep_backups=args.keep_backups,
+                )
+            elif args.state_command == "prune-retention":
+                result = prune_retention(
+                    orch,
+                    older_than_days=args.older_than_days,
+                    max_evidence_bytes=args.max_evidence_mb * 1024 * 1024,
+                    keep_recent_runs=args.keep_recent_runs,
+                    keep_backups=args.keep_backups,
+                    max_backup_bytes=args.max_backup_mb * 1024 * 1024,
+                )
             else:
                 raise ValueError("unknown_state_command")
         elif args.command == "load-plan":

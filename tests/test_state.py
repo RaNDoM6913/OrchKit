@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -7,7 +8,8 @@ from unittest import mock
 import zipfile
 
 from orch.core import Orchestrator
-from orch.state import backup_state, check_state, migration_history, prune_capabilities
+from orch.state import (backup_state, check_state, migration_history, prune_capabilities,
+                        prune_retention, retention_status)
 
 
 class StateMaintenanceTests(unittest.TestCase):
@@ -167,6 +169,92 @@ class StateMaintenanceTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 0)
         finally:
             db.close()
+
+    def test_retention_prunes_terminal_evidence_but_preserves_active_run(self):
+        ws1 = Path(self.tmp.name) / "retention-ws1"
+        ws2 = Path(self.tmp.name) / "retention-ws2"
+        ws1.mkdir(); ws2.mkdir()
+        plan = {
+            "schema_version": 1,
+            "plan_revision": "retention-v1",
+            "tasks": [
+                {
+                    "id": "OLD-1", "goal": "old", "workspace": str(ws1),
+                    "dependencies": [], "allowed_paths": ["out.json"], "protected_paths": {},
+                    "checks": [], "publication": {"kind": "none"}, "max_attempts": 2,
+                },
+                {
+                    "id": "ACTIVE-2", "goal": "active", "workspace": str(ws2),
+                    "dependencies": [], "allowed_paths": ["out.json"], "protected_paths": {},
+                    "checks": [], "publication": {"kind": "none"}, "max_attempts": 2,
+                },
+            ],
+        }
+        path = self.root / "retention-plan.json"
+        path.write_text(json.dumps(plan))
+        self.orch.load_plan(path)
+        old = self.orch.claim("worker-old")
+        self.orch.abort(old["run_id"], "terminal fixture", retry=False)
+        active = self.orch.claim("worker-active")
+        logs = self.orch.runtime / "logs"
+        receipts = self.orch.runtime / "worker_receipts"
+        exports = self.orch.runtime / "review_exports"
+        (logs / f"{old['run_id']}-scope.json").write_text('{"old":true}\n')
+        (receipts / f"{old['run_id']}.json").write_text('{"old":true}\n')
+        old_export = exports / old["run_id"]; old_export.mkdir(parents=True)
+        (old_export / "review.json").write_text('{"old":true}\n')
+        (logs / f"{active['run_id']}-scope.json").write_text('{"active":true}\n')
+        (receipts / f"{active['run_id']}.json").write_text('{"active":true}\n')
+        active_export = exports / active["run_id"]; active_export.mkdir(parents=True)
+        (active_export / "review.json").write_text('{"active":true}\n')
+
+        result = prune_retention(
+            self.orch, older_than_days=0, max_evidence_bytes=1024 * 1024,
+            keep_recent_runs=20, keep_backups=5, max_backup_bytes=1024 * 1024,
+        )
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertEqual(result["pruned"]["runs"][0]["run_id"], old["run_id"])
+        self.assertFalse((logs / f"{old['run_id']}-scope.json").exists())
+        self.assertFalse((receipts / f"{old['run_id']}.json").exists())
+        self.assertFalse(old_export.exists())
+        self.assertTrue((logs / f"{active['run_id']}-scope.json").exists())
+        self.assertTrue((receipts / f"{active['run_id']}.json").exists())
+        self.assertTrue(active_export.exists())
+        status = retention_status(self.orch)
+        self.assertIn(active["run_id"], status["evidence"]["protected_runs"])
+
+    def test_retention_reports_unknown_artifacts_without_deleting_them(self):
+        rogue = self.orch.runtime / "logs" / "manual-note.json"
+        rogue.write_text('{"owner":"keep"}\n')
+        result = prune_retention(
+            self.orch, older_than_days=0, max_evidence_bytes=0,
+            keep_recent_runs=0, keep_backups=1, max_backup_bytes=0,
+        )
+        self.assertTrue(rogue.exists())
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["evidence"]["unmanaged"][0]["reason"], "unknown_run")
+
+    def test_retention_prunes_only_managed_backup_files(self):
+        backups = self.root / "backups"
+        backups.mkdir()
+        managed = []
+        for index in range(3):
+            item = backups / f"orch-state-2026010{index + 1}.zip"
+            item.write_bytes(bytes([index + 1]) * 10)
+            os.utime(item, (100 + index, 100 + index))
+            managed.append(item)
+        owner = backups / "owner-copy.zip"
+        owner.write_bytes(b"keep")
+        result = prune_retention(
+            self.orch, older_than_days=30, max_evidence_bytes=1024,
+            keep_recent_runs=20, keep_backups=2, max_backup_bytes=1024,
+        )
+        self.assertFalse(managed[0].exists())
+        self.assertTrue(managed[1].exists())
+        self.assertTrue(managed[2].exists())
+        self.assertTrue(owner.exists())
+        self.assertEqual(result["pruned"]["backup_count"], 1)
+        self.assertEqual(Path(result["backups"]["unmanaged"][0]["path"]).resolve(), owner.resolve())
 
     def test_future_state_schema_is_rejected(self):
         other = Path(self.tmp.name) / "future"; runtime = other / ".runtime"

@@ -5,8 +5,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 
 from .core import ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, Orchestrator, utc_now
@@ -104,6 +105,259 @@ def prune_capabilities(orch: Orchestrator) -> Dict[str, Any]:
         path.unlink()
         pruned.append(run_id)
     return {"status": "PRUNED", "count": len(pruned), "run_ids": pruned}
+
+
+
+def _parse_utc(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _regular_file_size(path: Path) -> Optional[int]:
+    if not path.is_file() or path.is_symlink():
+        return None
+    return path.stat().st_size
+
+
+def _safe_tree_size(path: Path) -> Optional[int]:
+    if not path.is_dir() or path.is_symlink():
+        return None
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_symlink():
+            return None
+        if item.is_file():
+            total += item.stat().st_size
+    return total
+
+
+def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
+    with orch.connect() as conn:
+        runs = [dict(row) for row in conn.execute(
+            "SELECT r.run_id,r.task_id,r.state,r.started_at,r.heartbeat_at,r.completed_at,t.status AS task_status "
+            "FROM runs r JOIN tasks t ON t.task_id=r.task_id ORDER BY r.started_at"
+        )]
+        pending = {
+            row["run_id"] for row in conn.execute(
+                "SELECT run_id FROM publications WHERE status NOT IN ('COMPLETE','ABANDONED')"
+            )
+        }
+    managed: Dict[str, Dict[str, Any]] = {}
+    known_run_ids = {row["run_id"] for row in runs}
+    for row in runs:
+        run_id = row["run_id"]
+        artifacts = []
+        for log in sorted(orch.logs.glob(f"{run_id}-*.json")):
+            size = _regular_file_size(log)
+            if size is None:
+                continue
+            artifacts.append({"kind": "log", "path": str(log), "bytes": size})
+        receipt = orch.runtime / "worker_receipts" / f"{run_id}.json"
+        receipt_size = _regular_file_size(receipt)
+        if receipt_size is not None:
+            artifacts.append({"kind": "worker_receipt", "path": str(receipt), "bytes": receipt_size})
+        export = orch.runtime / "review_exports" / run_id
+        export_size = _safe_tree_size(export)
+        if export_size is not None:
+            artifacts.append({"kind": "review_export", "path": str(export), "bytes": export_size})
+        managed[run_id] = {
+            **row,
+            "protected": (
+                row["state"] in ACTIVE_RUN_STATES
+                or row["state"] == "VERIFIED"
+                or row["task_status"] in {"WAITING_REVIEW", "READY_TO_PUBLISH", "WAITING_OWNER"}
+                or run_id in pending
+            ),
+            "pending_publication": run_id in pending,
+            "reference_ts": (
+                _parse_utc(row["completed_at"])
+                or _parse_utc(row["heartbeat_at"])
+                or _parse_utc(row["started_at"])
+                or 0.0
+            ),
+            "artifacts": artifacts,
+            "bytes": sum(item["bytes"] for item in artifacts),
+        }
+
+    unmanaged: List[Dict[str, Any]] = []
+    for log in sorted(orch.logs.glob("*")):
+        if not log.is_file() or log.is_symlink():
+            if log.exists():
+                unmanaged.append({"path": str(log), "reason": "non_regular_or_symlink"})
+            continue
+        if not any(log.name.startswith(run_id + "-") for run_id in known_run_ids):
+            unmanaged.append({"path": str(log), "bytes": log.stat().st_size, "reason": "unknown_run"})
+    receipts = orch.runtime / "worker_receipts"
+    if receipts.is_dir():
+        for item in sorted(receipts.iterdir()):
+            if item.is_symlink() or not item.is_file():
+                unmanaged.append({"path": str(item), "reason": "non_regular_or_symlink"})
+            elif item.stem not in known_run_ids:
+                unmanaged.append({"path": str(item), "bytes": item.stat().st_size, "reason": "unknown_run"})
+    exports = orch.runtime / "review_exports"
+    if exports.is_dir():
+        for item in sorted(exports.iterdir()):
+            if item.name not in known_run_ids:
+                size = _safe_tree_size(item) if item.is_dir() and not item.is_symlink() else _regular_file_size(item)
+                record = {"path": str(item), "reason": "unknown_run"}
+                if size is not None:
+                    record["bytes"] = size
+                unmanaged.append(record)
+            elif _safe_tree_size(item) is None:
+                unmanaged.append({"path": str(item), "reason": "unsafe_review_export"})
+
+    backups_dir = orch.root / "backups"
+    backups: List[Dict[str, Any]] = []
+    unmanaged_backups: List[Dict[str, Any]] = []
+    if backups_dir.is_dir():
+        for item in sorted(backups_dir.iterdir()):
+            if item.name.startswith("orch-state-") and item.suffix == ".zip" and item.is_file() and not item.is_symlink():
+                backups.append({
+                    "path": str(item),
+                    "bytes": item.stat().st_size,
+                    "mtime": item.stat().st_mtime,
+                })
+            elif item.exists():
+                unmanaged_backups.append({"path": str(item), "reason": "unmanaged_backup_artifact"})
+    return {
+        "runs": managed,
+        "unmanaged": unmanaged,
+        "backups": backups,
+        "unmanaged_backups": unmanaged_backups,
+    }
+
+
+def retention_status(
+    orch: Orchestrator, *, max_evidence_bytes: int = 256 * 1024 * 1024,
+    max_backup_bytes: int = 512 * 1024 * 1024, keep_backups: int = 5,
+) -> Dict[str, Any]:
+    if max_evidence_bytes < 0 or max_backup_bytes < 0 or keep_backups < 1:
+        raise ValueError("invalid_retention_policy")
+    inventory = _retention_inventory(orch)
+    runs = list(inventory["runs"].values())
+    evidence_bytes = sum(item["bytes"] for item in runs)
+    protected_bytes = sum(item["bytes"] for item in runs if item["protected"])
+    backup_bytes = sum(item["bytes"] for item in inventory["backups"])
+    unmanaged_bytes = sum(int(item.get("bytes", 0)) for item in inventory["unmanaged"])
+    return {
+        "status": "ATTENTION" if (
+            evidence_bytes > max_evidence_bytes
+            or backup_bytes > max_backup_bytes
+            or len(inventory["backups"]) > keep_backups
+            or inventory["unmanaged"]
+            or inventory["unmanaged_backups"]
+        ) else "READY",
+        "policy": {
+            "max_evidence_bytes": max_evidence_bytes,
+            "max_backup_bytes": max_backup_bytes,
+            "keep_backups": keep_backups,
+        },
+        "evidence": {
+            "bytes": evidence_bytes,
+            "run_count": sum(1 for item in runs if item["bytes"]),
+            "protected_bytes": protected_bytes,
+            "protected_runs": sorted(item["run_id"] for item in runs if item["protected"] and item["bytes"]),
+            "unmanaged_bytes": unmanaged_bytes,
+            "unmanaged": inventory["unmanaged"],
+        },
+        "backups": {
+            "bytes": backup_bytes,
+            "count": len(inventory["backups"]),
+            "unmanaged": inventory["unmanaged_backups"],
+        },
+    }
+
+
+def prune_retention(
+    orch: Orchestrator, *, older_than_days: int = 30,
+    max_evidence_bytes: int = 256 * 1024 * 1024, keep_recent_runs: int = 20,
+    keep_backups: int = 5, max_backup_bytes: int = 512 * 1024 * 1024,
+) -> Dict[str, Any]:
+    if (
+        older_than_days < 0 or max_evidence_bytes < 0 or keep_recent_runs < 0
+        or keep_backups < 1 or max_backup_bytes < 0
+    ):
+        raise ValueError("invalid_retention_policy")
+    import time
+    inventory = _retention_inventory(orch)
+    runs = list(inventory["runs"].values())
+    terminal = sorted(
+        (item for item in runs if not item["protected"] and item["bytes"] > 0),
+        key=lambda item: (item["reference_ts"], item["run_id"]),
+    )
+    newest_keep = {
+        item["run_id"] for item in sorted(
+            terminal, key=lambda item: (item["reference_ts"], item["run_id"]), reverse=True
+        )[:keep_recent_runs]
+    }
+    total = sum(item["bytes"] for item in runs)
+    cutoff = time.time() - older_than_days * 86400
+    deleted_runs: List[Dict[str, Any]] = []
+    for item in terminal:
+        age_due = item["reference_ts"] <= cutoff
+        budget_due = total > max_evidence_bytes and item["run_id"] not in newest_keep
+        if not age_due and not budget_due:
+            continue
+        removed = 0
+        paths = []
+        for artifact in item["artifacts"]:
+            path = Path(artifact["path"])
+            if artifact["kind"] == "review_export":
+                if _safe_tree_size(path) is None:
+                    continue
+                removed += artifact["bytes"]
+                paths.append(str(path))
+                shutil.rmtree(path)
+            else:
+                if _regular_file_size(path) is None:
+                    continue
+                removed += artifact["bytes"]
+                paths.append(str(path))
+                path.unlink()
+        if removed:
+            total -= removed
+            deleted_runs.append({"run_id": item["run_id"], "bytes": removed, "paths": paths})
+    backups = sorted(inventory["backups"], key=lambda item: (item["mtime"], item["path"]))
+    backup_total = sum(item["bytes"] for item in backups)
+    deleted_backups: List[Dict[str, Any]] = []
+    while len(backups) > keep_backups or backup_total > max_backup_bytes:
+        if len(backups) <= 1:
+            break
+        item = backups.pop(0)
+        path = Path(item["path"])
+        if _regular_file_size(path) is None:
+            continue
+        path.unlink()
+        backup_total -= item["bytes"]
+        deleted_backups.append({"path": str(path), "bytes": item["bytes"]})
+    after = retention_status(
+        orch,
+        max_evidence_bytes=max_evidence_bytes,
+        max_backup_bytes=max_backup_bytes,
+        keep_backups=keep_backups,
+    )
+    after["status"] = "PRUNED" if deleted_runs or deleted_backups else after["status"]
+    after["pruned"] = {
+        "runs": deleted_runs,
+        "run_count": len(deleted_runs),
+        "evidence_bytes": sum(item["bytes"] for item in deleted_runs),
+        "backups": deleted_backups,
+        "backup_count": len(deleted_backups),
+        "backup_bytes": sum(item["bytes"] for item in deleted_backups),
+    }
+    after["bounded"] = (
+        after["evidence"]["bytes"] + after["evidence"]["unmanaged_bytes"] <= max_evidence_bytes
+        and after["backups"]["bytes"] <= max_backup_bytes
+        and after["backups"]["count"] <= keep_backups
+        and not after["evidence"]["unmanaged"]
+        and not after["backups"]["unmanaged"]
+    )
+    return after
 
 
 def _backup_members(orch: Orchestrator) -> List[Path]:
