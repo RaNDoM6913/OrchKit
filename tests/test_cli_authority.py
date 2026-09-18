@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from orch.cli import main as cli_main
+from orch.core import Orchestrator
 from orch.project import ProjectRegistry
 
 
@@ -196,6 +197,107 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         )
         plans = home / "plans"
         self.assertFalse(plans.exists() and any(plans.iterdir()))
+
+    def _finish_git_task(self, orch, repo, claim, task_id, relative):
+        (repo / relative).write_text(
+            json.dumps({"task": task_id}) + "\n", encoding="utf-8"
+        )
+        receipt = self.base / f"{task_id}-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": task_id,
+            "changed_paths": [relative],
+        }) + "\n", encoding="utf-8")
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        verified = orch.verify(claim["run_id"])
+        self.assertEqual(verified["status"], "VERIFIED")
+        return orch.publish(claim["run_id"])
+
+    def test_independent_prequeued_git_tasks_bind_base_at_execution_boundary(self):
+        home = self.base / "dynamic-base-home"
+        repo = self.make_repo("dynamic-base-repo")
+        config = self.register_via_cli(home, repo)
+
+        rc, first = self.invoke(
+            "--root", str(home),
+            "queue", "enqueue", config["project_id"],
+            "--task-id", "QUEUE-BASE-1",
+            "--goal", "first publication",
+            "--allowed-path", "one.json",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(first["base_binding"], "admission_head")
+
+        rc, second = self.invoke(
+            "--root", str(home),
+            "queue", "enqueue", config["project_id"],
+            "--task-id", "QUEUE-BASE-2",
+            "--goal", "second publication",
+            "--allowed-path", "two.json",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(second["base_binding"], "dynamic_at_verify")
+        second_plan = json.loads(
+            Path(second["plan_path"]).read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "expected_base", second_plan["tasks"][0]["publication"]
+        )
+
+        orch = Orchestrator(home)
+        claim_one = orch.claim("worker-one", project_id=config["project_id"])
+        published_one = self._finish_git_task(
+            orch, repo, claim_one, "QUEUE-BASE-1", "one.json"
+        )
+        self.assertEqual(published_one["status"], "COMPLETE")
+
+        claim_two = orch.claim("worker-two", project_id=config["project_id"])
+        published_two = self._finish_git_task(
+            orch, repo, claim_two, "QUEUE-BASE-2", "two.json"
+        )
+        self.assertEqual(published_two["status"], "COMPLETE")
+        self.assertNotEqual(published_one["commit"], published_two["commit"])
+        remote = self.base / "dynamic-base-repo-remote.git"
+        remote_head = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(remote_head, published_two["commit"])
+
+    def test_batch_independent_git_tasks_only_bind_first_admission_base(self):
+        home = self.base / "batch-base-home"
+        repo = self.make_repo("batch-base-repo")
+        config = self.register_via_cli(home, repo)
+        manifest = self.base / "batch-base.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "batch-base-v1",
+            "tasks": [
+                {
+                    "id": "BATCH-BASE-1",
+                    "goal": "first",
+                    "allowed_paths": ["first.json"],
+                },
+                {
+                    "id": "BATCH-BASE-2",
+                    "goal": "second",
+                    "allowed_paths": ["second.json"],
+                },
+            ],
+        }) + "\n", encoding="utf-8")
+        rc, result = self.invoke(
+            "--root", str(home),
+            "queue", "enqueue-batch", config["project_id"], str(manifest),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["base_binding"], "first_task_admission_head")
+        plan = json.loads(Path(result["plan_path"]).read_text(encoding="utf-8"))
+        self.assertIn("expected_base", plan["tasks"][0]["publication"])
+        self.assertNotIn("expected_base", plan["tasks"][1]["publication"])
 
     def test_project_make_plan_blocks_foreign_workspace_before_output(self):
         home = self.base / "foreign-plan-home"

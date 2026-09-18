@@ -86,7 +86,9 @@ orch queue enqueue PROJECT_ID \
   --depends TASK-001
 ```
 
-The compiled plan is retained under the ORCH home with mode `0600`. Dependencies may refer to tasks loaded by earlier plan revisions; dependent Git tasks bind their exact publication base during verification after predecessors finish.
+For a bounded multi-task DAG, use: orch queue enqueue-batch PROJECT_ID /absolute/path/to/tasks.json. The source manifest is read-only, size-bounded, SHA-256 provenance is retained, and the whole DAG is admitted transactionally.
+
+The compiled plan is retained under the ORCH home with mode `0600`. Dependencies may refer to tasks loaded by earlier plan revisions. Git publication bases are admission-bound only when safe: tasks queued behind unresolved work, explicit dependencies, and later tasks in a batch bind their exact Git HEAD during verification so prior ORCH publications do not create false stale-base failures.
 
 Pause only one project queue without blocking independent projects:
 
@@ -207,4 +209,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current **150-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **158-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

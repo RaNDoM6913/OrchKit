@@ -12,7 +12,9 @@ from .core import Orchestrator
 from .doctor import run_doctor
 from .dispatcher import bootstrap_prompt, read_rdc, record_rdc, render_dispatcher
 from .git_policy import evaluate_project_git_policy
-from .plan import build_single_task_plan, write_plan
+from .plan import (build_batch_plan, build_single_task_plan,
+                   existing_plan_initial_base_binding,
+                   read_batch_manifest, write_plan)
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .readiness import audit_project
 from .review_policy import MODES, REVIEWERS
@@ -115,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     queue_enqueue.add_argument("--owner-approval", action="store_true")
     queue_enqueue.add_argument("--max-attempts", type=int, default=2)
     queue_enqueue.add_argument("--plan-revision")
+    queue_batch = queue_sub.add_parser(
+        "enqueue-batch",
+        help="atomically compile and enqueue a bounded JSON task manifest",
+    )
+    queue_batch.add_argument("project_id")
+    queue_batch.add_argument("manifest")
 
     git = sub.add_parser("git", help="read-only Git inspection through a registered project")
     git_sub = git.add_subparsers(dest="git_command", required=True)
@@ -314,13 +322,20 @@ def main(argv=None) -> int:
                         "audit": readiness,
                     }
                 else:
+                    project_orch = _open_existing_orchestrator(root)
+                    prior = project_orch.project_unresolved_tasks(args.project_id)
                     plan = build_single_task_plan(
                         registry.get(args.project_id), task_id=args.task_id, goal=args.goal,
                         allowed_paths=args.allowed_path, risk_tags=args.risk_tag,
                         owner_acceptance=args.owner_approval, plan_revision=args.plan_revision,
                         dependencies=args.depends, max_attempts=args.max_attempts,
+                        bind_expected_base=not prior["has_unresolved"],
                     )
                     result = write_plan(Path(args.output).expanduser(), plan)
+                    result["base_binding"] = (
+                        "dynamic_at_verify" if prior["has_unresolved"]
+                        else "admission_head"
+                    )
                     result["plan"] = plan
                     result["audit_status"] = readiness["status"]
             elif args.project_command == "remove":
@@ -364,6 +379,70 @@ def main(argv=None) -> int:
                 result = orch.pause_project(args.project_id, args.reason)
             elif args.queue_command == "resume-project":
                 result = orch.resume_project(args.project_id)
+            elif args.queue_command == "enqueue-batch":
+                readiness = audit_project(root, args.project_id)
+                if readiness["status"] == "BLOCKED":
+                    result = {
+                        "status": "BLOCKED",
+                        "reason": "project_readiness_blocked",
+                        "project_id": args.project_id,
+                        "audit": readiness,
+                    }
+                else:
+                    registry = ProjectRegistry(root)
+                    manifest_path = Path(args.manifest).expanduser()
+                    manifest, source_digest = read_batch_manifest(manifest_path)
+                    prior = orch.project_unresolved_tasks(args.project_id)
+                    plans_dir = ensure_private_dir(root / "plans")
+                    manifest_revision = manifest.get("plan_revision")
+                    existing_binding = None
+                    if isinstance(manifest_revision, str):
+                        existing_binding = existing_plan_initial_base_binding(
+                            plans_dir / f"{manifest_revision}.json"
+                        )
+                    bind_initial_base = (
+                        existing_binding
+                        if existing_binding is not None
+                        else not prior["has_unresolved"]
+                    )
+                    plan = build_batch_plan(
+                        registry.get(args.project_id),
+                        manifest,
+                        source_digest=source_digest,
+                        bind_initial_base=bind_initial_base,
+                    )
+                    plan_path = plans_dir / f"{plan['plan_revision']}.json"
+                    existed = plan_path.exists()
+                    written = write_plan(plan_path, plan, replace=False)
+                    try:
+                        loaded = orch.load_plan(plan_path)
+                    except Exception:
+                        if (
+                            not existed
+                            and written["status"] == "CREATED"
+                            and plan_path.is_file()
+                            and not plan_path.is_symlink()
+                        ):
+                            plan_path.unlink()
+                        raise
+                    result = {
+                        "status": "ENQUEUED",
+                        "project_id": args.project_id,
+                        "task_ids": [item["id"] for item in plan["tasks"]],
+                        "task_count": len(plan["tasks"]),
+                        "plan_revision": plan["plan_revision"],
+                        "plan_path": written["path"],
+                        "plan_artifact_status": written["status"],
+                        "source_manifest": str(manifest_path.resolve()),
+                        "source_sha256": source_digest,
+                        "audit_status": readiness["status"],
+                        "base_binding": (
+                            "dynamic_at_verify"
+                            if prior["has_unresolved"]
+                            else "first_task_admission_head"
+                        ),
+                        "load": loaded,
+                    }
             elif args.queue_command == "enqueue":
                 readiness = audit_project(root, args.project_id)
                 if readiness["status"] == "BLOCKED":
@@ -375,6 +454,18 @@ def main(argv=None) -> int:
                     }
                 else:
                     registry = ProjectRegistry(root)
+                    prior = orch.project_unresolved_tasks(args.project_id)
+                    plans_dir = ensure_private_dir(root / "plans")
+                    existing_binding = None
+                    if args.plan_revision:
+                        existing_binding = existing_plan_initial_base_binding(
+                            plans_dir / f"{args.plan_revision}.json"
+                        )
+                    bind_expected_base = (
+                        existing_binding
+                        if existing_binding is not None
+                        else not prior["has_unresolved"]
+                    )
                     plan = build_single_task_plan(
                         registry.get(args.project_id),
                         task_id=args.task_id,
@@ -385,8 +476,8 @@ def main(argv=None) -> int:
                         plan_revision=args.plan_revision,
                         dependencies=args.depends,
                         max_attempts=args.max_attempts,
+                        bind_expected_base=bind_expected_base,
                     )
-                    plans_dir = ensure_private_dir(root / "plans")
                     plan_path = plans_dir / f"{plan['plan_revision']}.json"
                     existed = plan_path.exists()
                     written = write_plan(plan_path, plan, replace=False)
@@ -404,6 +495,11 @@ def main(argv=None) -> int:
                         "plan_path": written["path"],
                         "plan_artifact_status": written["status"],
                         "audit_status": readiness["status"],
+                        "base_binding": (
+                            "dynamic_at_verify"
+                            if prior["has_unresolved"]
+                            else "admission_head"
+                        ),
                         "load": loaded,
                     }
             else:

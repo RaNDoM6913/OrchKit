@@ -1911,6 +1911,26 @@ class Orchestrator:
             "truncated": total > limit,
         }
 
+    def project_unresolved_tasks(self, project_id: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        terminal = {"DONE", "CANCELLED"}
+        with self.connect() as conn:
+            rows = [
+                dict(row) for row in conn.execute(
+                    "SELECT task_id,status,queue_seq FROM tasks "
+                    "WHERE project_id=? ORDER BY queue_seq,task_id",
+                    (project_id,),
+                ).fetchall()
+            ]
+        unresolved = [item for item in rows if item["status"] not in terminal]
+        return {
+            "project_id": project_id,
+            "has_unresolved": bool(unresolved),
+            "unresolved_tasks": unresolved,
+            "historical_task_count": len(rows),
+        }
+
     def project_removal_guard(self, project_id: str) -> Dict[str, Any]:
         if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")
