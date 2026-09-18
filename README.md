@@ -12,7 +12,7 @@ Implemented and locally verified through 2026-09-18:
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.
 - Cooperative quiescence marker with the direct-RDC residual risk explicitly recorded.
-- Independent Git scope census, registered checks, protected-file hashes, content snapshots and stale-snapshot detection. The verifier blocks unreported/out-of-allowlist repository changes before checks/publication.
+- Independent Git scope census, registered checks, protected-file hashes, content snapshots and stale-snapshot detection. The verifier blocks unreported/out-of-allowlist repository changes, and Git publication repeats the scope census before side effects and before the compare-and-swap ref update so foreign post-verification worktree changes fail closed.
 - Snapshot-bound review import; failed verification/review becomes `NEEDS_FIX` and is picked up by a **new** ChatGPT run.
 - Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
 - Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.

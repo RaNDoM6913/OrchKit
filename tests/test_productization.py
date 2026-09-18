@@ -519,6 +519,126 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "BLOCKED")
         self.assertEqual(reconciled["reason"], "publication_base_changed")
 
+    def _verified_local_publication(self, task_id, allowed_paths):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id=task_id, goal="publication guard",
+            allowed_paths=allowed_paths,
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / f"{task_id}.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        target = self.repo / allowed_paths[0]
+        target.write_text('{"ok":true}\n')
+        receipt = self.home / f"{task_id}-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": task_id,
+            "changed_paths": [allowed_paths[0]],
+        }))
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+        return orch, claim
+
+    def test_publish_blocks_foreign_workspace_change_after_verification(self):
+        orch, claim = self._verified_local_publication(
+            "PUB-SCOPE-1", ["result.json"]
+        )
+        base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (self.repo / "rogue.txt").write_text("foreign\n")
+        with self.assertRaisesRegex(
+            ValueError,
+            "publication_workspace_scope_changed:outside_allowlist:rogue.txt",
+        ):
+            orch.publish(claim["run_id"])
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, base)
+        staged = subprocess.run(
+            ["git", "-C", str(self.repo), "diff", "--cached", "--name-only"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(staged, "")
+        with orch.connect() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT status FROM publications WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone())
+        log = orch.logs / (
+            f"{claim['run_id']}-publication-scope-preflight.json"
+        )
+        evidence = json.loads(log.read_text())
+        self.assertEqual(evidence["publication_guard_status"], "BLOCKED")
+        self.assertEqual(evidence["reason"], "outside_allowlist:rogue.txt")
+
+    def test_publish_blocks_new_allowed_but_unsnapshotted_path(self):
+        orch, claim = self._verified_local_publication(
+            "PUB-SCOPE-2", ["result.json", "extra.json"]
+        )
+        (self.repo / "extra.json").write_text('{"foreign":true}\n')
+        with self.assertRaisesRegex(
+            ValueError,
+            "publication_workspace_scope_changed:unexpected_path:extra.json",
+        ):
+            orch.publish(claim["run_id"])
+
+    def test_prepared_recovery_rechecks_foreign_workspace_scope(self):
+        orch, claim = self._verified_local_publication(
+            "PUB-SCOPE-REC", ["prepared.json"]
+        )
+        original_prepare = orch._prepare_snapshot_commit
+
+        def prepare_then_dirty(*args, **kwargs):
+            commit_id = original_prepare(*args, **kwargs)
+            (self.repo / "rogue-after-prepare.txt").write_text("foreign\n")
+            return commit_id
+
+        with mock.patch.object(
+            orch, "_prepare_snapshot_commit", side_effect=prepare_then_dirty
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "publication_workspace_scope_changed:"
+                "outside_allowlist:rogue-after-prepare.txt",
+            ):
+                orch.publish(claim["run_id"])
+        with orch.connect() as conn:
+            journal = conn.execute(
+                "SELECT status,commit_id FROM publications WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone()
+        self.assertEqual(journal["status"], "PREPARED")
+        self.assertTrue(journal["commit_id"])
+
+        restarted = Orchestrator(self.home)
+        blocked = restarted.reconcile_publication(claim["run_id"])
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIn(
+            "publication_workspace_scope_changed:"
+            "outside_allowlist:rogue-after-prepare.txt",
+            blocked["reason"],
+        )
+        (self.repo / "rogue-after-prepare.txt").unlink()
+        pending = restarted.reconcile_publication(claim["run_id"])
+        self.assertEqual(pending["status"], "PREPARED_PENDING_REF_UPDATE")
+        finished = restarted.reconcile_publication(
+            claim["run_id"], resume=True
+        )
+        self.assertEqual(finished["status"], "COMPLETE")
+        self.assertEqual(finished["commit"], journal["commit_id"])
+
     def test_prepared_commit_recovers_after_restart_without_recommit(self):
         config = ProjectRegistry(self.home).add(
             self.repo, profile="standard", review_mode="off"

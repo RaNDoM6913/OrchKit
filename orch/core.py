@@ -1008,12 +1008,8 @@ class Orchestrator:
             conn.execute("COMMIT")
         return {"status": verdict, "run_id": run_id}
 
-    def _assert_snapshot_current(self, conn: sqlite3.Connection, run: sqlite3.Row,
-                                 payload: Dict[str, Any]) -> Dict[str, Any]:
-        snap = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?", (run["snapshot_id"],)).fetchone()
-        if not snap:
-            raise ValueError("snapshot_missing")
-        manifest = json.loads(snap["manifest_json"])
+    def _assert_manifest_current(self, payload: Dict[str, Any],
+                                 manifest: Dict[str, Any]) -> None:
         workspace = Path(payload["workspace"]).resolve()
         for relative, recorded in manifest.get("files", {}).items():
             path = safe_workspace_path(workspace, relative, must_exist=False)
@@ -1027,7 +1023,66 @@ class Orchestrator:
             path = safe_workspace_path(workspace, relative, must_exist=True)
             if sha256_file(path) != recorded["actual"]:
                 raise ValueError(f"protected_stale:{relative}")
+
+    def _assert_snapshot_current(self, conn: sqlite3.Connection, run: sqlite3.Row,
+                                 payload: Dict[str, Any]) -> Dict[str, Any]:
+        snap = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?", (run["snapshot_id"],)).fetchone()
+        if not snap:
+            raise ValueError("snapshot_missing")
+        manifest = json.loads(snap["manifest_json"])
+        self._assert_manifest_current(payload, manifest)
         return manifest
+
+    def _publication_workspace_guard(
+        self, run_id: str, payload: Dict[str, Any], manifest: Dict[str, Any],
+        expected_base: str, *, phase: str,
+    ) -> Dict[str, Any]:
+        safe_phase = re.sub(r"[^A-Za-z0-9._-]+", "-", phase).strip("-") or "check"
+        log_path = self.logs / f"{run_id}-publication-scope-{safe_phase}.json"
+        try:
+            self._assert_manifest_current(payload, manifest)
+        except ValueError as exc:
+            evidence = {
+                "status": "BLOCKED",
+                "phase": phase,
+                "expected_base": expected_base,
+                "reason": str(exc),
+            }
+            log_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            ensure_private_file(log_path)
+            raise ValueError(f"publication_workspace_snapshot_changed:{exc}") from exc
+
+        changed = sorted(manifest.get("files", {}))
+        evidence = self._workspace_scope_evidence(payload, changed)
+        evidence.update({
+            "phase": phase,
+            "expected_base": expected_base,
+            "manifest_git_head": manifest.get("git_head"),
+        })
+        reason = None
+        if evidence.get("status") == "NON_GIT_UNAVAILABLE":
+            reason = "git_unavailable"
+        elif evidence.get("status") != "PASS":
+            if evidence.get("outside_allowlist"):
+                reason = "outside_allowlist:" + evidence["outside_allowlist"][0]
+            elif evidence.get("omitted_from_receipt"):
+                reason = "unexpected_path:" + evidence["omitted_from_receipt"][0]
+            elif evidence.get("declared_but_unobserved"):
+                reason = "snapshot_path_not_observed:" + evidence["declared_but_unobserved"][0]
+            else:
+                reason = "scope_mismatch"
+        elif evidence.get("git_head") != expected_base:
+            reason = "base_changed:" + str(evidence.get("git_head") or "unknown")
+
+        evidence["publication_guard_status"] = "BLOCKED" if reason else "PASS"
+        if reason:
+            evidence["reason"] = reason
+        log_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        ensure_private_file(log_path)
+        evidence["log_path"] = str(log_path)
+        if reason:
+            raise ValueError("publication_workspace_scope_changed:" + reason)
+        return evidence
 
     def complete(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:
@@ -1262,6 +1317,9 @@ class Orchestrator:
         existing_staged = gitb("diff", "--cached", "--name-only", "-z")
         if existing_staged.returncode or existing_staged.stdout:
             raise ValueError("preexisting_staging_not_empty")
+        self._publication_workspace_guard(
+            run_id, payload, manifest, expected_base, phase="preflight"
+        )
         operation_id = uuid.uuid4().hex
         self._publication_update(run_id, status="INTENT", operation_id=operation_id, kind=pub["kind"], expected_base=expected_base)
         phase = "INTENT"
@@ -1279,6 +1337,9 @@ class Orchestrator:
             )
             phase = "PREPARED"
             self._publication_update(run_id, status=phase, commit_id=commit_id)
+            self._publication_workspace_guard(
+                run_id, payload, manifest, expected_base, phase="pre-ref-update"
+            )
             self._cas_update_branch(
                 workspace, branch=branch.stdout.strip(),
                 commit_id=commit_id, expected_base=expected_base,
@@ -1351,6 +1412,12 @@ class Orchestrator:
                     self._publication_update(run_id, status="ABANDONED", error=None)
                     return {"status": "SAFE_TO_RETRY", "run_id": run_id, "reason": "no_git_side_effect_observed"}
                 return {"status": "BLOCKED", "run_id": run_id, "reason": "unexpected_staging_state"}
+            try:
+                self._publication_workspace_guard(
+                    run_id, payload, manifest, expected_base, phase="reconcile-staged"
+                )
+            except ValueError as exc:
+                return {"status": "BLOCKED", "run_id": run_id, "reason": str(exc)}
             if not resume:
                 return {"status": "STAGED_PENDING_COMMIT", "run_id": run_id, "resume_available": True}
             message = pub.get("commit_message") or f"orch: complete {run['task_id']}"
@@ -1369,6 +1436,12 @@ class Orchestrator:
         if commit_id and head == expected_base:
             if not staged:
                 return {"status": "BLOCKED", "run_id": run_id, "reason": "unexpected_staging_state"}
+            try:
+                self._publication_workspace_guard(
+                    run_id, payload, manifest, expected_base, phase="reconcile-pre-ref-update"
+                )
+            except ValueError as exc:
+                return {"status": "BLOCKED", "run_id": run_id, "reason": str(exc)}
             if not resume:
                 return {
                     "status": "PREPARED_PENDING_REF_UPDATE", "run_id": run_id,
