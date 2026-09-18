@@ -720,6 +720,83 @@ class Orchestrator:
             raise ValueError("claim_expected_base_changed")
         return claim_head, branch_name or None
 
+    def _claim_workspace_guard(
+        self, payload: Dict[str, Any], claim_git_head: Optional[str]
+    ) -> Dict[str, Any]:
+        workspace = Path(payload["workspace"]).resolve()
+        protected_results: List[Dict[str, Any]] = []
+        for relative, expected_hash in sorted(
+            payload.get("protected_paths", {}).items()
+        ):
+            try:
+                path = safe_workspace_path(
+                    workspace, relative, must_exist=False
+                )
+            except ValueError as exc:
+                return {
+                    "status": "BLOCKED",
+                    "reason": f"claim_protected_path_unsafe:{relative}:{exc}",
+                    "protected": protected_results,
+                }
+            actual_hash = (
+                sha256_file(path)
+                if path.is_file() and not path.is_symlink()
+                else None
+            )
+            item = {
+                "path": relative,
+                "expected_sha256": expected_hash,
+                "actual_sha256": actual_hash,
+                "matches": actual_hash == expected_hash,
+            }
+            protected_results.append(item)
+            if actual_hash != expected_hash:
+                return {
+                    "status": "BLOCKED",
+                    "reason": f"claim_protected_path_changed:{relative}",
+                    "protected": protected_results,
+                }
+
+        scope = self._workspace_scope_evidence(payload, [])
+        if scope.get("status") == "BLOCKED":
+            observed = scope.get("observed_paths") or []
+            first = observed[0] if observed else "unknown"
+            return {
+                "status": "BLOCKED",
+                "reason": f"claim_workspace_dirty:{first}",
+                "scope": scope,
+                "protected": protected_results,
+            }
+        if (
+            scope.get("status") == "PASS"
+            and claim_git_head is not None
+            and scope.get("git_head") != claim_git_head
+        ):
+            return {
+                "status": "BLOCKED",
+                "reason": "claim_git_head_changed_during_preflight",
+                "scope": scope,
+                "protected": protected_results,
+            }
+
+        authority = self._check_authority_evidence(
+            workspace, payload.get("checks", [])
+        )
+        if authority.get("status") == "BLOCKED":
+            return {
+                "status": "BLOCKED",
+                "reason": authority.get("reason") or "claim_check_authority_changed",
+                "scope": scope,
+                "protected": protected_results,
+                "check_authority": authority,
+            }
+        return {
+            "status": "PASS",
+            "scope": scope,
+            "protected": protected_results,
+            "check_authority": authority,
+        }
+
     def claim(self, worker_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
         if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")
@@ -786,25 +863,38 @@ class Orchestrator:
                     }
                 return {"status": "NO_WORK", "project_id": project_id}
             row, payload, attempt = selected
+            claim_guard = None
             try:
                 claim_git_head, claim_branch = self._claim_git_state(payload)
+                claim_guard = self._claim_workspace_guard(
+                    payload, claim_git_head
+                )
+                if claim_guard["status"] != "PASS":
+                    raise ValueError(claim_guard["reason"])
             except ValueError as exc:
                 reason = str(exc)
+                details = claim_guard
                 conn.execute(
                     "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
                     (now, row["task_id"]),
                 )
                 self._event(
                     conn, "TASK_BLOCKED_AT_CLAIM", task_id=row["task_id"],
-                    payload={"reason": reason, "project_id": row["project_id"]},
+                    payload={
+                        "reason": reason,
+                        "project_id": row["project_id"],
+                    },
                 )
                 conn.execute("COMMIT")
-                return {
+                result = {
                     "status": "BLOCKED",
                     "task_id": row["task_id"],
                     "project_id": row["project_id"],
                     "reason": reason,
                 }
+                if isinstance(details, dict) and details.get("status") == "BLOCKED":
+                    result["details"] = details
+                return result
             run_id = f"{row['task_id']}-A{attempt}-{uuid.uuid4().hex[:10]}"
             lease = secrets.token_urlsafe(24)
             conn.execute(

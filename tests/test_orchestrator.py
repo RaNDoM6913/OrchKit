@@ -218,6 +218,75 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(task_row["status"], "BLOCKED")
 
+    def test_foreign_workspace_bytes_block_before_capability(self):
+        repo = self._make_git_workspace("preclaim-dirty")
+        task = self.task("PRECLAIM-DIRTY")
+        task["workspace"] = str(repo)
+        task["publication"] = {
+            "kind": "git_local",
+            "branch": "main",
+            "commit_message": "preclaim dirty",
+        }
+        self.load([task], revision="preclaim-dirty")
+        (repo / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["status"], "BLOCKED")
+        self.assertEqual(
+            claim["reason"], "claim_workspace_dirty:foreign.txt"
+        )
+        self.assertEqual(
+            claim["details"]["scope"]["observed_paths"], ["foreign.txt"]
+        )
+        self.assertEqual(
+            list((self.orch.runtime / "claims").glob("*.json")), []
+        )
+
+    def test_unchanged_protected_preexisting_dirty_bytes_allow_claim(self):
+        repo = self._make_git_workspace("preclaim-protected")
+        owner = repo / "owner-note.txt"
+        owner.write_text("owner dirty\n", encoding="utf-8")
+        import hashlib
+        digest = hashlib.sha256(owner.read_bytes()).hexdigest()
+        task = self.task("PRECLAIM-PROTECTED", protected={"owner-note.txt": digest})
+        task["workspace"] = str(repo)
+        task["publication"] = {
+            "kind": "git_local",
+            "branch": "main",
+            "commit_message": "preclaim protected",
+        }
+        self.load([task], revision="preclaim-protected")
+
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["status"], "CLAIMED")
+        self.assertTrue(Path(claim["capability_file"]).is_file())
+
+    def test_check_authority_drift_blocks_before_capability(self):
+        support = self.ws / "preclaim_check.py"
+        support.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        check = {
+            "id": "preclaim-support",
+            "argv": [sys.executable, "preclaim_check.py"],
+            "cwd": ".",
+            "timeout_sec": 5,
+        }
+        self.load(
+            [self.task("PRECLAIM-AUTH", checks=[check])],
+            revision="preclaim-auth",
+        )
+        support.write_text("raise SystemExit(9)\n", encoding="utf-8")
+
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["status"], "BLOCKED")
+        self.assertIn(
+            "check_authority_changed:preclaim-support:"
+            "authority_file:preclaim_check.py:HASH_CHANGED",
+            claim["reason"],
+        )
+        self.assertEqual(
+            list((self.orch.runtime / "claims").glob("*.json")), []
+        )
+
     def test_fifo_order_is_preserved_across_separately_loaded_plans(self):
         self.load([self.task("Z-FIRST")], revision="fifo-p1")
         path = self.root / "fifo-p2.json"
