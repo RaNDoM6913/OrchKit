@@ -16,6 +16,7 @@ from .config import ensure_private_dir, ensure_private_file
 from .review_policy import decide_review, normalize_review_policy
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
+WRITER_LOCK_RUN_STATES = ACTIVE_RUN_STATES | {"VERIFIED"}
 READY_TASK_STATES = {"PLANNED", "READY", "NEEDS_FIX"}
 STATE_SCHEMA_VERSION = 3
 
@@ -94,14 +95,50 @@ def path_allowed(relative: str, allowlist: Iterable[str]) -> bool:
     return False
 
 
+def derive_writer_key(workspace: Path) -> str:
+    resolved = workspace.expanduser().resolve()
+    env = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+        if key in os.environ
+    }
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+    prefix = [
+        "git", "--no-pager",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false",
+        "-c", "core.hooksPath=/dev/null",
+        "-C", str(resolved),
+    ]
+    inside = subprocess.run(
+        prefix + ["rev-parse", "--is-inside-work-tree"],
+        env=env, capture_output=True, text=True, timeout=10, check=False,
+    )
+    if inside.returncode == 0 and inside.stdout.strip() == "true":
+        common = subprocess.run(
+            prefix + ["rev-parse", "--git-common-dir"],
+            env=env, capture_output=True, text=True, timeout=10, check=False,
+        )
+        if common.returncode == 0 and common.stdout.strip():
+            raw = Path(common.stdout.strip())
+            common_dir = raw.resolve() if raw.is_absolute() else (resolved / raw).resolve()
+            return "git:" + sha256_bytes(str(common_dir).encode("utf-8"))[:32]
+    return "workspace:" + sha256_bytes(str(resolved).encode("utf-8"))[:32]
+
+
 def task_writer_key(item: Dict[str, Any]) -> str:
+    workspace = Path(item.get("workspace", "")).expanduser().resolve()
+    derived = derive_writer_key(workspace)
     explicit = item.get("writer_key")
     if explicit is not None:
-        if not isinstance(explicit, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", explicit) is None:
+        if (
+            not isinstance(explicit, str)
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", explicit) is None
+        ):
             raise ValueError("invalid_writer_key")
-        return explicit
-    workspace = Path(item.get("workspace", "")).expanduser().resolve()
-    return "workspace:" + sha256_bytes(str(workspace).encode("utf-8"))[:32]
+        if explicit != derived:
+            raise ValueError("writer_key_mismatch")
+    return derived
 
 
 def validate_task_definition(item: Dict[str, Any]) -> None:
@@ -428,11 +465,12 @@ class Orchestrator:
         return True
 
     def _active_writer_locks(self, conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+        placeholders = ",".join("?" for _ in WRITER_LOCK_RUN_STATES)
         rows = conn.execute(
             "SELECT r.run_id,r.task_id,r.state,r.heartbeat_at,t.project_id,t.writer_key "
             "FROM runs r JOIN tasks t ON t.task_id=r.task_id "
-            "WHERE r.state IN (?,?,?,?,?) ORDER BY r.started_at",
-            tuple(ACTIVE_RUN_STATES),
+            f"WHERE r.state IN ({placeholders}) ORDER BY r.started_at",
+            tuple(sorted(WRITER_LOCK_RUN_STATES)),
         ).fetchall()
         return {row["writer_key"]: dict(row) for row in rows}
 
@@ -1604,12 +1642,20 @@ class Orchestrator:
 
     def reconcile(self) -> Dict[str, Any]:
         with self.connect() as conn:
-            active = [dict(row) for row in conn.execute("SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at",
-                                                       tuple(ACTIVE_RUN_STATES))]
+            active = [dict(row) for row in conn.execute(
+                "SELECT run_id,task_id,state,heartbeat_at FROM runs "
+                "WHERE state IN (?,?,?,?,?) ORDER BY started_at",
+                tuple(ACTIVE_RUN_STATES),
+            )]
+            writer_locks = list(self._active_writer_locks(conn).values())
             pending_publications = [dict(row) for row in conn.execute(
                 "SELECT run_id,status,commit_id,remote_commit,error,updated_at FROM publications "
                 "WHERE status NOT IN ('COMPLETE','ABANDONED') ORDER BY updated_at"
             )]
-        return {"status": "ATTENTION" if active or pending_publications else "CLEAN",
-                "active_runs": active, "pending_publications": pending_publications,
-                "rule": "No automatic lease expiry or blind publication retry; reconcile observed state before a new writer."}
+        return {
+            "status": "ATTENTION" if writer_locks or pending_publications else "CLEAN",
+            "active_runs": active,
+            "writer_locks": writer_locks,
+            "pending_publications": pending_publications,
+            "rule": "No automatic lease expiry or blind publication retry; reconcile observed state before a new writer.",
+        }

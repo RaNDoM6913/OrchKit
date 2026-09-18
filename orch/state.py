@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 
 from .config import ensure_private_dir
-from .core import ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, Orchestrator, utc_now
+from .core import (ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
+                   Orchestrator, utc_now)
 
 
 def _sha256(path: Path) -> str:
@@ -113,6 +114,13 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
             "WHERE r.state IN (?,?,?,?,?) ORDER BY r.started_at",
             tuple(ACTIVE_RUN_STATES),
         )]
+        lock_placeholders = ",".join("?" for _ in WRITER_LOCK_RUN_STATES)
+        writer_locks = [dict(row) for row in conn.execute(
+            "SELECT r.run_id,r.task_id,r.state,r.heartbeat_at,t.project_id,t.writer_key "
+            "FROM runs r JOIN tasks t ON t.task_id=r.task_id "
+            f"WHERE r.state IN ({lock_placeholders}) ORDER BY r.started_at",
+            tuple(sorted(WRITER_LOCK_RUN_STATES)),
+        )]
         pending_publications = [dict(row) for row in conn.execute(
             "SELECT run_id,status,commit_id,remote_commit,error,updated_at FROM publications "
             "WHERE status NOT IN ('COMPLETE','ABANDONED') ORDER BY updated_at"
@@ -121,7 +129,7 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
     caps = capability_health(orch)
     permissions = permission_health(orch)
     blocked = quick_values != ["ok"] or bool(foreign) or permissions["status"] != "READY"
-    attention = bool(active) or caps["status"] != "READY" or bool(pending_publications)
+    attention = bool(writer_locks) or caps["status"] != "READY" or bool(pending_publications)
     history = migration_history(orch)["migrations"]
     return {
         "status": "BLOCKED" if blocked else "ATTENTION" if attention else "READY",
@@ -132,6 +140,7 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
         "foreign_key_violations": [list(row) for row in foreign],
         "journal_mode": journal_mode,
         "active_runs": active,
+        "writer_locks": writer_locks,
         "pending_publications": pending_publications,
         "capabilities": caps,
         "permissions": permissions,

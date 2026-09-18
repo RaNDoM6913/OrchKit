@@ -7,7 +7,7 @@ A local, subscription-only coordinator for development performed by real ChatGPT
 Implemented and locally verified through 2026-09-18:
 
 - SQLite durable plan/task/run/event ledger with immutable plan-revision digests.
-- DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation.
+- DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation. Writer identity is independently derived from the resolved workspace/Git common directory, so plans cannot spoof isolation; VERIFIED snapshots retain that writer reservation until completion/publication.
 - Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capabilities are revoked at quiesce/abort.
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.

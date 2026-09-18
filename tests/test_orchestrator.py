@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -82,6 +83,24 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(first['status'],'CLAIMED'); self.assertEqual(second['status'],'BUSY')
         self.assertEqual(second['active']['run_id'],first['run_id'])
 
+    def test_verified_run_keeps_writer_lock_until_completion(self):
+        self.load([self.task("VERIFY-1"), self.task("VERIFY-2")], revision="verified-lock")
+        first = self.orch.claim("w1")
+        verified = self.write_result(first, "VERIFY-1")
+        self.assertEqual(verified["status"], "VERIFIED")
+        blocked = self.orch.claim("w2")
+        self.assertEqual(blocked["status"], "BUSY")
+        self.assertEqual(blocked["active"]["run_id"], first["run_id"])
+        self.assertEqual(blocked["active"]["state"], "VERIFIED")
+        reconciled = self.orch.reconcile()
+        self.assertEqual(reconciled["status"], "ATTENTION")
+        self.assertEqual(reconciled["active_runs"], [])
+        self.assertEqual(reconciled["writer_locks"][0]["run_id"], first["run_id"])
+        self.assertEqual(self.orch.complete(first["run_id"])["status"], "COMPLETE")
+        second = self.orch.claim("w2")
+        self.assertEqual(second["status"], "CLAIMED")
+        self.assertEqual(second["task_id"], "VERIFY-2")
+
     def test_fifo_order_is_preserved_across_separately_loaded_plans(self):
         self.load([self.task("Z-FIRST")], revision="fifo-p1")
         path = self.root / "fifo-p2.json"
@@ -113,20 +132,40 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotEqual(c1["context"]["writer_key"], c2["context"]["writer_key"])
         self.assertEqual(len(self.orch.reconcile()["active_runs"]), 2)
 
-    def test_shared_writer_key_blocks_concurrent_claim_across_workspaces(self):
-        ws2 = Path(self.tmp.name) / "ws2"
-        ws2.mkdir()
+    def test_linked_git_worktrees_share_derived_writer_lock(self):
+        repo = Path(self.tmp.name) / "shared-repo"
+        linked = Path(self.tmp.name) / "shared-worktree"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture"], check=True)
+        (repo / "README.md").write_text("base\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "linked", str(linked)],
+            check=True,
+        )
         first = self.task("SHARED-1")
+        first["workspace"] = str(repo)
         second = self.task("SHARED-2")
-        second["workspace"] = str(ws2)
-        first["writer_key"] = "git:shared-fixture"
-        second["writer_key"] = "git:shared-fixture"
-        self.load([first, second], revision="shared-writer")
+        second["workspace"] = str(linked)
+        self.load([first, second], revision="shared-worktree")
+        status = self.orch.status()
+        keys = {item["task_id"]: item["writer_key"] for item in status["tasks"]}
+        self.assertEqual(keys["SHARED-1"], keys["SHARED-2"])
+        self.assertTrue(keys["SHARED-1"].startswith("git:"))
         c1 = self.orch.claim("w1")
         c2 = self.orch.claim("w2")
         self.assertEqual(c1["status"], "CLAIMED")
         self.assertEqual(c2["status"], "BUSY")
         self.assertEqual(c2["active"]["run_id"], c1["run_id"])
+
+    def test_plan_cannot_spoof_writer_key(self):
+        task = self.task("SPOOF-1")
+        task["writer_key"] = "workspace:" + ("0" * 32)
+        with self.assertRaisesRegex(ValueError, "writer_key_mismatch"):
+            self.load([task], revision="spoof-writer")
+        self.assertEqual(self.orch.status()["tasks"], [])
 
     def test_project_scoped_claim_can_skip_earlier_other_project(self):
         ws2 = Path(self.tmp.name) / "ws2"
