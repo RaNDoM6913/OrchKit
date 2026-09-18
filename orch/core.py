@@ -1724,9 +1724,12 @@ class Orchestrator:
                                  "checks": [{"id": c["id"], "exit_code": c["exit_code"]} for c in checks],
                                  "review_decision": decision, "scope_evidence": scope_evidence})
             conn.execute("COMMIT")
-        return {"status": next_state, "snapshot_id": snapshot_id, "checks": checks,
-                "review_decision": decision, "scope_evidence": scope_evidence,
-                "check_authority": authority_evidence}
+        result = {"status": next_state, "snapshot_id": snapshot_id, "checks": checks,
+                  "review_decision": decision, "scope_evidence": scope_evidence,
+                  "check_authority": authority_evidence}
+        if next_state == "REVIEWING":
+            result["review_report_file"] = str(self._review_report_path(run_id))
+        return result
 
     def review_decision(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:

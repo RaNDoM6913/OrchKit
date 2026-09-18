@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.9 claim boundary hardening
+# Agent Workflow Orchestrator — v0.10 bounded handoff ingestion
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -36,7 +36,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.9 keeps the v0.8 batch/verifier-authority guarantees and adds durable claim-time Git base binding (state schema v4) plus fail-closed pre-claim workspace/protected/check-authority validation before a writer capability is issued. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.10 keeps the v0.9 claim-boundary guarantees and adds bounded, exact-path, no-follow ingestion for both worker receipts and reviewer reports, with durable raw SHA-256/byte evidence. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -44,7 +44,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current agent_workflow_orchestrator-0.9.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers schema-v4 state, advancing-base pre-queued Git work, claim-time HEAD persistence, foreign-commit rejection after claim, and pre-claim refusal without capability when foreign workspace bytes already exist. Exact wheel size, SHA-256 and evidence are recorded in docs/55_V09_CLAIM_BOUNDARY_RELEASE.md.
+The current agent_workflow_orchestrator-0.10.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers claim-bound worker receipts and frozen-path review report import without invoking a model reviewer. Exact wheel size, SHA-256 and evidence are recorded in docs/59_V010_BOUNDED_HANDOFF_INGESTION.md.
 
 First-run flow for another user:
 

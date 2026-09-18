@@ -8,7 +8,7 @@
 
 ## Frozen report authority
 
-A review report is now accepted only from the exact frozen export path `ORCH_HOME/.runtime/review_exports/<run_id>/review.json`. `prepare_review` exposes that path explicitly as `report`.
+A review report is now accepted only from the exact frozen export path `ORCH_HOME/.runtime/review_exports/<run_id>/review.json`. `prepare_review` exposes that path explicitly as `report`, and `verify` returns the same canonical path as `review_report_file` whenever the run enters REVIEWING so manual import does not need to reconstruct filesystem aliases.
 
 The file is opened with no-follow semantics when supported, must be regular, and is limited to 256 KiB. Alternate paths, symlinks, missing files and oversized reports fail before any review state transition.
 

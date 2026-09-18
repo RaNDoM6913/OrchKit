@@ -763,8 +763,13 @@ class OrchestratorTests(unittest.TestCase):
         self.load([self.task('T1',review=True)])
         c1=self.orch.claim('w1'); verified=self.write_result(c1,'T1')
         self.assertEqual(verified['status'],'REVIEWING')
+        self.assertEqual(
+            Path(verified['review_report_file']),
+            self.orch.runtime / 'review_exports' / c1['run_id'] / 'review.json',
+        )
         prepared=prepare_review(self.orch,c1['run_id'])
         report=Path(prepared['report'])
+        self.assertEqual(report, Path(verified['review_report_file']))
         report.write_text(json.dumps({
             'run_id':c1['run_id'],
             'snapshot_id':'sha256:' + ('0' * 64),
