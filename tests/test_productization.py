@@ -1215,6 +1215,48 @@ class ProductizationTests(unittest.TestCase):
         self.assertIn('PROJECT_PAUSED',text)
         self.assertIn('PROJECTS_PAUSED',text)
 
+    def test_project_scoped_dispatcher_binds_claim_and_next(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        project_id = config["project_id"]
+        with mock.patch.dict(
+            os.environ, {"ORCH_EXECUTABLE": "/tmp/orch"}, clear=False
+        ):
+            rendered = render_dispatcher(self.home, project_id=project_id)
+        self.assertEqual(rendered["scope"], "project")
+        self.assertEqual(rendered["project_id"], project_id)
+        self.assertEqual(
+            Path(rendered["path"]),
+            self.home.resolve() / "dispatchers" / f"{project_id}.txt",
+        )
+        self.assertEqual(Path(rendered["path"]).stat().st_mode & 0o777, 0o600)
+        text = Path(rendered["path"]).read_text(encoding="utf-8")
+        self.assertIn(
+            f"claim --worker scheduled-variant-b-{project_id} --project {project_id}",
+            text,
+        )
+        self.assertIn(f"next --project {project_id}", text)
+        self.assertIn(f"permanently scoped to project_id={project_id}", text)
+
+    def test_global_dispatcher_remains_unscoped(self):
+        target = self.base / "global-dispatcher.txt"
+        with mock.patch.dict(
+            os.environ, {"ORCH_EXECUTABLE": "/tmp/orch"}, clear=False
+        ):
+            rendered = render_dispatcher(self.home, output=target)
+        self.assertEqual(rendered["scope"], "global")
+        self.assertIsNone(rendered["project_id"])
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("claim --worker scheduled-variant-b", text)
+        self.assertNotIn("claim --worker scheduled-variant-b --project", text)
+        self.assertIn("oldest runnable task whose writer key is free", text)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_project_scoped_dispatcher_requires_registered_project(self):
+        with self.assertRaisesRegex(ValueError, "unknown_project"):
+            render_dispatcher(self.home, project_id="missing-project")
+
     def test_doctor_without_rdc_marker_is_attention_not_hard_block(self):
         result = run_doctor(self.home, check_codex=False)
         self.assertIn(result["status"], {"ATTENTION", "READY"})

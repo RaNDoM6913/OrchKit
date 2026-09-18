@@ -179,9 +179,11 @@ Reconciliation can prove a staged snapshot, adopt a commit that happened before 
 
 ## Scheduled dispatcher
 
-The dispatcher template packaged with ORCH is the durable bootstrap. `orch dispatcher render` substitutes the user's ORCH home and executable into a reusable standalone Scheduled Task prompt. One task uses it to claim one task, do the work via RDC, verify/review/publish, call `orch next`, and — only when `READY` — re-arm itself for one later run with the same prompt. ORCH-001 established that a later standalone run does not inherit the previous model context, so each block receives a clean ChatGPT execution context while the local ledger supplies the durable handoff. When the queue reaches `NO_WORK`, the task is left disabled.
+The dispatcher template packaged with ORCH is the durable bootstrap. The default dispatcher render command substitutes the user's ORCH home and executable into a reusable standalone Scheduled Task prompt. One task claims one queued attempt, works through RDC, verifies/reviews/publishes it, calls next, and only when READY re-arms itself for one later fresh ChatGPT conversation. When the queue reaches NO_WORK, the task is left disabled.
 
-The launcher is intentionally platform-native. The local Python program does **not** hold or repurpose OpenAI OAuth tokens and does not call a model API.
+For multi-project operation, dispatcher render --project PROJECT_ID creates a private prompt permanently scoped to that registered project. Separate native Scheduled ChatGPT tasks can use separate scoped prompts so independent repositories can be worked concurrently; ORCH writer keys still serialize linked worktrees or any projects sharing one Git authority. The original unscoped/global renderer remains the default.
+
+The launcher is intentionally platform-native. The local Python program does not hold or repurpose OpenAI OAuth tokens and does not call a model API.
 
 ## Real Codex review evidence
 
@@ -199,4 +201,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current **122-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **125-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

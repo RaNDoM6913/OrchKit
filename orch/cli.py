@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatcher_sub = dispatcher.add_subparsers(dest="dispatcher_command", required=True)
     dispatcher_render = dispatcher_sub.add_parser("render")
     dispatcher_render.add_argument("--output")
+    dispatcher_render.add_argument("--project")
 
     project = sub.add_parser("project", help="register and inspect project folders")
     project_sub = project.add_subparsers(dest="project_command", required=True)
@@ -225,7 +226,7 @@ def main(argv=None) -> int:
             if args.dispatcher_command != "render":
                 raise ValueError("unknown_dispatcher_command")
             output = Path(args.output).expanduser().resolve() if args.output else None
-            result = render_dispatcher(root, output=output)
+            result = render_dispatcher(root, output=output, project_id=args.project)
         elif args.command == "project":
             registry = ProjectRegistry(root)
             if args.project_command == "add":
