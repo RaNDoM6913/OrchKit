@@ -602,6 +602,178 @@ def _backup_members(orch: Orchestrator) -> List[Path]:
     return sorted(set(members))
 
 
+def verify_backup_archive(
+    path: Path, *, max_uncompressed_bytes: int = 1024 * 1024 * 1024,
+) -> Dict[str, Any]:
+    from pathlib import PurePosixPath
+    import re
+
+    target = path.expanduser().resolve()
+    base = {
+        "status": "BLOCKED",
+        "path": str(target),
+        "errors": [],
+        "warnings": [],
+    }
+    if max_uncompressed_bytes <= 0:
+        raise ValueError("invalid_backup_verify_limit")
+    if path.is_symlink() or not target.is_file():
+        base["errors"].append("backup_not_regular_file")
+        return base
+
+    try:
+        with zipfile.ZipFile(target, "r") as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)):
+                base["errors"].append("duplicate_backup_member")
+
+            total = 0
+            unsafe: List[str] = []
+            forbidden: List[str] = []
+            for info in infos:
+                name = info.filename
+                total += int(info.file_size)
+                pure = PurePosixPath(name)
+                if (
+                    not name
+                    or "\x00" in name
+                    or "\\" in name
+                    or pure.is_absolute()
+                    or ".." in pure.parts
+                    or name.startswith("/")
+                ):
+                    unsafe.append(name)
+                    continue
+                if not (
+                    name in {"state/orch.sqlite3", "state/manifest.json"}
+                    or name.startswith("files/")
+                ):
+                    unsafe.append(name)
+                if name.startswith("files/.runtime/claims/") or name == "files/.runtime/claims":
+                    forbidden.append(name)
+                file_type = (info.external_attr >> 16) & 0o170000
+                if file_type == 0o120000:
+                    unsafe.append(name)
+            if unsafe:
+                base["errors"].append("unsafe_backup_member")
+                base["unsafe_members"] = sorted(set(unsafe))
+            if forbidden:
+                base["errors"].append("forbidden_secret_member")
+                base["forbidden_members"] = sorted(set(forbidden))
+            if total > max_uncompressed_bytes:
+                base["errors"].append("backup_uncompressed_limit_exceeded")
+            base["member_count"] = len(infos)
+            base["uncompressed_bytes"] = total
+
+            required = {"state/orch.sqlite3", "state/manifest.json"}
+            missing = sorted(required - set(names))
+            if missing:
+                base["errors"].append("backup_required_member_missing")
+                base["missing_members"] = missing
+            if base["errors"]:
+                return base
+
+            try:
+                manifest = json.loads(
+                    archive.read("state/manifest.json").decode("utf-8")
+                )
+            except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+                base["errors"].append("backup_manifest_invalid")
+                return base
+            if not isinstance(manifest, dict):
+                base["errors"].append("backup_manifest_invalid")
+                return base
+            digest = manifest.get("database_sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                base["errors"].append("backup_manifest_database_hash_invalid")
+                return base
+            excluded = manifest.get("excluded_secret_classes")
+            required_exclusions = {"claims", "capability_files", "provider_credentials"}
+            if not isinstance(excluded, list) or not required_exclusions.issubset(set(excluded)):
+                base["errors"].append("backup_secret_exclusion_contract_missing")
+                return base
+
+            with tempfile.TemporaryDirectory(prefix="orch-backup-verify-") as tmp:
+                db_copy = Path(tmp) / "orch.sqlite3"
+                sha = hashlib.sha256()
+                written = 0
+                try:
+                    with archive.open("state/orch.sqlite3", "r") as source, db_copy.open("wb") as dest:
+                        while True:
+                            block = source.read(1024 * 1024)
+                            if not block:
+                                break
+                            written += len(block)
+                            if written > max_uncompressed_bytes:
+                                base["errors"].append("backup_database_limit_exceeded")
+                                return base
+                            sha.update(block)
+                            dest.write(block)
+                except (OSError, RuntimeError, zipfile.BadZipFile):
+                    base["errors"].append("backup_database_read_failed")
+                    return base
+                os.chmod(db_copy, 0o600)
+                actual_digest = sha.hexdigest()
+                if actual_digest != digest:
+                    base["errors"].append("backup_database_hash_mismatch")
+                    base["database_sha256"] = actual_digest
+                    base["manifest_database_sha256"] = digest
+                    return base
+
+                try:
+                    uri = db_copy.resolve().as_uri() + "?mode=ro&immutable=1"
+                    conn = sqlite3.connect(uri, uri=True)
+                    try:
+                        quick = [row[0] for row in conn.execute("PRAGMA quick_check").fetchall()]
+                        foreign = [list(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()]
+                        db_schema = conn.execute("PRAGMA user_version").fetchone()[0]
+                    finally:
+                        conn.close()
+                except sqlite3.DatabaseError:
+                    base["errors"].append("backup_database_invalid")
+                    return base
+
+            manifest_schema = manifest.get("schema_version")
+            if not isinstance(manifest_schema, int) or isinstance(manifest_schema, bool):
+                base["errors"].append("backup_manifest_schema_invalid")
+            elif manifest_schema != db_schema:
+                base["errors"].append("backup_schema_binding_mismatch")
+            if quick != ["ok"]:
+                base["errors"].append("backup_database_quick_check_failed")
+            if foreign:
+                base["errors"].append("backup_database_foreign_key_violation")
+            if db_schema > STATE_SCHEMA_VERSION:
+                base["errors"].append("backup_future_schema_unsupported")
+                compatibility = "FUTURE_UNSUPPORTED"
+            elif db_schema < STATE_SCHEMA_VERSION:
+                compatibility = "UPGRADE_REQUIRED"
+            else:
+                compatibility = "CURRENT"
+
+            base.update({
+                "manifest": manifest,
+                "database_sha256": actual_digest,
+                "quick_check": quick,
+                "foreign_key_violations": foreign,
+                "schema_version": db_schema,
+                "current_schema_version": STATE_SCHEMA_VERSION,
+                "compatibility": compatibility,
+            })
+            if base["errors"]:
+                return base
+            bad_crc = archive.testzip()
+            if bad_crc is not None:
+                base["errors"].append("backup_crc_failure")
+                base["crc_member"] = bad_crc
+                return base
+            base["status"] = "VERIFIED"
+            return base
+    except (OSError, zipfile.BadZipFile):
+        base["errors"].append("backup_zip_invalid")
+        return base
+
+
 def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, Any]:
     health = check_state(orch)
     if health["status"] == "BLOCKED":

@@ -124,6 +124,7 @@ cd <orchkit-root>
 ./bin/orch state migrations
 ./bin/orch state retention
 ./bin/orch state backup
+./bin/orch state verify-backup /absolute/path/to/orch-state-....zip
 ```
 
 A scheduled ChatGPT worker claims exactly one attempt:

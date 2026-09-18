@@ -10,7 +10,8 @@ import zipfile
 
 from orch.core import Orchestrator
 from orch.state import (backup_state, check_state, migration_history, prune_capabilities,
-                        prune_retention, recovery_inspect, retention_status)
+                        prune_retention, recovery_inspect, retention_status,
+                        verify_backup_archive)
 
 
 class StateMaintenanceTests(unittest.TestCase):
@@ -226,6 +227,66 @@ class StateMaintenanceTests(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
         finally:
             conn.close()
+
+    def test_backup_verifier_accepts_current_secret_free_backup(self):
+        result = backup_state(self.orch)
+        verified = verify_backup_archive(Path(result["path"]))
+        self.assertEqual(verified["status"], "VERIFIED")
+        self.assertEqual(verified["schema_version"], 3)
+        self.assertEqual(verified["compatibility"], "CURRENT")
+        self.assertEqual(verified["quick_check"], ["ok"])
+        self.assertEqual(verified["foreign_key_violations"], [])
+        self.assertEqual(
+            verified["database_sha256"],
+            verified["manifest"]["database_sha256"],
+        )
+
+    def test_backup_verifier_rejects_manifest_database_hash_mismatch(self):
+        source_path = Path(backup_state(self.orch)["path"])
+        tampered = self.root / "tampered-hash.zip"
+        with zipfile.ZipFile(source_path, "r") as source, zipfile.ZipFile(
+            tampered, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "state/manifest.json":
+                    manifest = json.loads(data.decode("utf-8"))
+                    manifest["database_sha256"] = "0" * 64
+                    data = (
+                        json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+                    ).encode("utf-8")
+                target.writestr(info, data)
+        checked = verify_backup_archive(tampered)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("backup_database_hash_mismatch", checked["errors"])
+
+    def test_backup_verifier_rejects_path_traversal_and_claim_secret(self):
+        source_path = Path(backup_state(self.orch)["path"])
+
+        traversal = self.root / "traversal.zip"
+        traversal.write_bytes(source_path.read_bytes())
+        with zipfile.ZipFile(traversal, "a") as archive:
+            archive.writestr("../escape.txt", "blocked")
+        checked = verify_backup_archive(traversal)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("unsafe_backup_member", checked["errors"])
+
+        secret = self.root / "secret-member.zip"
+        secret.write_bytes(source_path.read_bytes())
+        with zipfile.ZipFile(secret, "a") as archive:
+            archive.writestr(
+                "files/.runtime/claims/forbidden.json", "{}"
+            )
+        checked = verify_backup_archive(secret)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("forbidden_secret_member", checked["errors"])
+
+    def test_backup_verifier_rejects_invalid_zip(self):
+        invalid = self.root / "invalid-backup.zip"
+        invalid.write_bytes(b"not-a-zip")
+        checked = verify_backup_archive(invalid)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertEqual(checked["errors"], ["backup_zip_invalid"])
 
     def test_backup_refuses_active_writer(self):
         workspace = Path(self.tmp.name) / "ws"; workspace.mkdir()

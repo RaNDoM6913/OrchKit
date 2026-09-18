@@ -20,5 +20,6 @@ A deterministic failure-injection test proves that an invalid legacy writer iden
 
 - Run `orch state check` before and after upgrades.
 - A user-created `orch state backup` remains the portable secret-free backup mechanism when the current binary can open the state safely.
+- `orch state verify-backup PATH` validates archive path safety, secret exclusions, manifest/database hash binding, SQLite integrity, and schema compatibility without restoring into the live home.
 - Automatic migration does not create a raw SQLite copy because the live database contains run lease material; silently retaining that copy would weaken the existing secret-handling boundary.
 - Future schema versions should add a deterministic migration test and an induced-failure rollback test before release.
