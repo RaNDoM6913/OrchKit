@@ -14,6 +14,7 @@ from orch.config import configure_home
 from orch.doctor import run_doctor
 from orch.dispatcher import render_dispatcher
 from orch.git_policy import evaluate_project_git_policy
+from orch.git_transport import inspect_transport_url
 from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
 from orch.project import ProjectRegistry
@@ -287,6 +288,67 @@ class ProductizationTests(unittest.TestCase):
         self.assertFalse(policy["can_commit"])
         self.assertFalse(policy["can_push"])
         self.assertFalse(policy["force_push_allowed"])
+
+    def test_transport_policy_rejects_unsafe_remote_forms(self):
+        blocked = [
+            ("http://example.invalid/repo.git", "remote_transport_insecure"),
+            ("git://example.invalid/repo.git", "remote_transport_insecure"),
+            ("ext::unsupported", "remote_transport_unsupported"),
+            ("https://user:secret@example.invalid/repo.git", "remote_embedded_password"),
+        ]
+        for value, reason in blocked:
+            with self.subTest(value=value):
+                result = inspect_transport_url(value, self.repo)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(result["reason"], reason)
+        self.assertEqual(
+            inspect_transport_url("https://example.invalid/repo.git", self.repo)["kind"],
+            "https",
+        )
+        self.assertEqual(
+            inspect_transport_url("git@example.invalid:owner/repo.git", self.repo)["kind"],
+            "ssh",
+        )
+        local = inspect_transport_url("../remote.git", self.repo)
+        self.assertEqual(local["kind"], "file")
+        self.assertTrue(Path(local["canonical_url"]).is_absolute())
+
+    def test_unsupported_remote_transport_falls_back_to_local_commit_policy(self):
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", "ext::unsupported"],
+            check=True,
+        )
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        policy = evaluate_project_git_policy(config)
+        self.assertTrue(policy["can_commit"])
+        self.assertFalse(policy["can_push"])
+        self.assertIn(
+            "remote_transport_blocked:remote_transport_unsupported",
+            policy["push_blockers"],
+        )
+
+    def test_registered_remote_url_change_blocks_push_policy(self):
+        remote_one = self.base / "remote-one.git"
+        remote_two = self.base / "remote-two.git"
+        subprocess.run(["git", "init", "--bare", str(remote_one)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "--bare", str(remote_two)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", str(remote_one)],
+            check=True,
+        )
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "set-url", "origin", str(remote_two)],
+            check=True,
+        )
+        policy = evaluate_project_git_policy(config)
+        self.assertTrue(policy["can_commit"])
+        self.assertFalse(policy["can_push"])
+        self.assertIn("remote_url_changed", policy["push_blockers"])
 
     def test_standard_without_remote_can_commit_but_not_push(self):
         registry = ProjectRegistry(self.home)
@@ -619,6 +681,59 @@ class ProductizationTests(unittest.TestCase):
         ):
             orch.publish(claim["run_id"])
         self.assertFalse(sentinel.exists())
+
+    def test_git_publication_uses_bound_url_not_mutated_repo_transport_config(self):
+        remote = self.base / "bound-remote.git"
+        decoy = self.base / "decoy-remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "--bare", str(decoy)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", str(remote)],
+            check=True,
+        )
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="BOUND-REMOTE", goal="publish to bound remote",
+            allowed_paths=["bound.json"],
+        )
+        publication = plan["tasks"][0]["publication"]
+        self.assertEqual(publication["remote_url"], str(remote.resolve()))
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "bound-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        (self.repo / "bound.json").write_text('{"bound":true}\n')
+        receipt = self.home / "bound-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "BOUND-REMOTE",
+            "changed_paths": ["bound.json"],
+        }))
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "remote.origin.pushurl", str(decoy)],
+            check=True,
+        )
+        published = orch.publish(claim["run_id"])
+        self.assertEqual(published["status"], "COMPLETE")
+        actual = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(actual, published["commit"])
+        decoy_probe = subprocess.run(
+            ["git", "--git-dir", str(decoy), "rev-parse", "refs/heads/main"],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(decoy_probe.returncode, 0)
 
     def test_git_publication_disables_repository_pre_push_hook(self):
         remote = self.base / "remote.git"

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import atomic_write_json, ensure_private_dir
 from .core import sha256_file
+from .git_transport import inspect_transport_url
 from .review_policy import MODES, REVIEWERS
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -151,6 +152,8 @@ def inspect_project(path: Path) -> Dict[str, Any]:
     branch = _safe_git(root, "branch", "--show-current")
     head = _safe_git(root, "rev-parse", "HEAD")
     remote = _safe_git(root, "remote", "get-url", "origin")
+    origin_url = remote.stdout.strip() if remote.returncode == 0 else None
+    transport = inspect_transport_url(origin_url, root) if origin_url else None
     upstream = _safe_git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
     status = _safe_git(root, "status", "--porcelain=v2", "--branch", "--untracked-files=normal")
     staged = _safe_git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z")
@@ -171,7 +174,8 @@ def inspect_project(path: Path) -> Dict[str, Any]:
         "writer_key": writer_key,
         "branch": branch.stdout.strip() if branch.returncode == 0 else None,
         "head": head.stdout.strip() if head.returncode == 0 else None,
-        "origin_url": remote.stdout.strip() if remote.returncode == 0 else None,
+        "origin_url": origin_url,
+        "transport": transport,
         "upstream": upstream.stdout.strip() if upstream.returncode == 0 else None,
         "status_porcelain_v2": status.stdout.splitlines() if status.returncode == 0 else [],
         "staged_paths": [os.fsdecode(item) for item in staged.stdout.split(b"\0") if item] if staged.returncode == 0 else [],
@@ -264,6 +268,7 @@ class ProjectRegistry:
                 **defaults["git"],
                 "branch": inventory["branch"],
                 "remote": "origin" if inventory["origin_url"] else None,
+                "remote_url": inventory["origin_url"],
                 "ref": inventory["branch"],
                 "allow_reset": False,
                 "allow_clean": False,

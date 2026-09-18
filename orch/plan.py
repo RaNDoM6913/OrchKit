@@ -46,6 +46,8 @@ def build_single_task_plan(
             "kind": "git",
             "branch": git_config.get("branch"),
             "remote": git_config.get("remote") or "origin",
+            "remote_url": git_state["transport"]["canonical_url"],
+            "transport_kind": git_state["transport"]["kind"],
             "ref": git_config.get("ref") or git_config.get("branch"),
             "commit_message": f"orch: {task_id}",
         }

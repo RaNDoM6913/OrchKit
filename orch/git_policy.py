@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .core import sha256_file
+from .git_transport import inspect_transport_url
 from .project import inspect_project
 
 
@@ -26,8 +27,19 @@ def evaluate_project_git_policy(config: Dict[str, Any]) -> Dict[str, Any]:
             changed_protected.append(relative)
     if changed_protected:
         safety_blockers.append("protected_baseline_changed")
-    if policy.get("allow_push") and not current.get("origin_url"):
-        push_blockers.append("remote_missing")
+    remote_url = current.get("origin_url")
+    expected_remote_url = policy.get("remote_url")
+    if expected_remote_url is None:
+        expected_remote_url = (config.get("inventory_at_registration") or {}).get("origin_url")
+    transport = inspect_transport_url(remote_url, Path(config["root"])) if remote_url else None
+    if policy.get("allow_push"):
+        if not remote_url:
+            push_blockers.append("remote_missing")
+        elif expected_remote_url and remote_url != expected_remote_url:
+            push_blockers.append("remote_url_changed")
+        elif not transport or transport.get("status") != "READY":
+            reason = transport.get("reason") if transport else "remote_transport_unknown"
+            push_blockers.append("remote_transport_blocked:" + reason)
     can_commit = bool(policy.get("allow_commit")) and not safety_blockers
     can_push = bool(policy.get("allow_push")) and can_commit and not push_blockers
     return {
@@ -39,5 +51,6 @@ def evaluate_project_git_policy(config: Dict[str, Any]) -> Dict[str, Any]:
         "safety_blockers": safety_blockers,
         "push_blockers": push_blockers,
         "changed_protected_paths": changed_protected,
+        "transport": transport,
         "current": current,
     }

@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import ensure_private_dir, ensure_private_file
+from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .review_policy import decide_review, normalize_review_policy
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
@@ -1212,6 +1213,16 @@ class Orchestrator:
             )
         return run
 
+    def _publication_transport_git(
+        self, workspace: Path, remote_url: str, *args: str, binary: bool = False
+    ) -> subprocess.CompletedProcess:
+        policy = inspect_transport_url(remote_url, workspace)
+        if policy.get("status") != "READY":
+            raise ValueError("git_transport_blocked:" + str(policy.get("reason")))
+        return run_sandboxed_transport(
+            workspace, self.runtime, policy["canonical_url"], args, binary=binary
+        )
+
     def _assert_publication_paths_unfiltered(self, workspace: Path, paths: List[str]) -> None:
         attributes = self._git_filter_attributes(workspace, paths)
         filtered = sorted(
@@ -1379,14 +1390,22 @@ class Orchestrator:
             self._publication_update(run_id, status=phase, commit_id=commit_id)
             remote_commit = None
             remote = pub.get("remote", "origin")
+            remote_url = pub.get("remote_url")
             ref = pub.get("ref", "main")
             if pub.get("kind") == "git":
-                push = gitt("push", remote, f"HEAD:{ref}")
+                if not isinstance(remote_url, str) or not remote_url:
+                    raise ValueError("publication_remote_url_missing")
+                push = self._publication_transport_git(
+                    workspace, remote_url, "push", remote_url,
+                    f"{commit_id}:refs/heads/{ref}",
+                )
                 if push.returncode:
                     raise RuntimeError("git_push_failed:" + push.stderr[-1000:])
                 phase = "PUSHED"
                 self._publication_update(run_id, status=phase, commit_id=commit_id)
-                remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+                remote_ref = self._publication_transport_git(
+                    workspace, remote_url, "ls-remote", remote_url, f"refs/heads/{ref}"
+                )
                 remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
                 if remote_commit != commit_id:
                     raise ValueError("remote_verification_failed")
@@ -1505,8 +1524,14 @@ class Orchestrator:
         if pub.get("kind") == "git_local":
             return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
                                               remote_commit=None, kind="git_local", remote=None, ref=None)
-        remote = pub.get("remote", "origin"); ref = pub.get("ref", "main")
-        remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+        remote = pub.get("remote", "origin")
+        remote_url = pub.get("remote_url")
+        ref = pub.get("ref", "main")
+        if not isinstance(remote_url, str) or not remote_url:
+            return {"status": "BLOCKED", "run_id": run_id, "reason": "publication_remote_url_missing"}
+        remote_ref = self._publication_transport_git(
+            workspace, remote_url, "ls-remote", remote_url, f"refs/heads/{ref}"
+        )
         remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
         if remote_commit == commit_id:
             self._publication_update(run_id, status="REMOTE_VERIFIED", commit_id=commit_id, remote_commit=remote_commit, error=None)
@@ -1517,12 +1542,16 @@ class Orchestrator:
                     "commit": commit_id, "remote_commit": remote_commit, "resume_available": True}
         if remote_commit not in {None, expected_base}:
             return {"status": "BLOCKED", "run_id": run_id, "reason": "remote_advanced", "remote_commit": remote_commit}
-        push = gitt("push", remote, f"{commit_id}:refs/heads/{ref}")
+        push = self._publication_transport_git(
+            workspace, remote_url, "push", remote_url, f"{commit_id}:refs/heads/{ref}"
+        )
         if push.returncode:
             self._publication_update(run_id, status="COMMITTED", commit_id=commit_id, error="git_push_failed:" + push.stderr[-900:])
             return {"status": "BLOCKED", "run_id": run_id, "reason": "git_push_failed"}
         self._publication_update(run_id, status="PUSHED", commit_id=commit_id, error=None)
-        remote_ref = gitt("ls-remote", remote, f"refs/heads/{ref}")
+        remote_ref = self._publication_transport_git(
+            workspace, remote_url, "ls-remote", remote_url, f"refs/heads/{ref}"
+        )
         remote_commit = remote_ref.stdout.split()[0] if remote_ref.returncode == 0 and remote_ref.stdout.strip() else None
         if remote_commit != commit_id:
             return {"status": "BLOCKED", "run_id": run_id, "reason": "remote_verification_failed", "remote_commit": remote_commit}
