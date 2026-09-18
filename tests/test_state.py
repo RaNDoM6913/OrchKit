@@ -474,6 +474,49 @@ class StateMaintenanceTests(unittest.TestCase):
             replace_home_from_backup(archive, live)
         self.assertEqual((live / "owner-source.py").read_text(), "keep\n")
 
+    def test_replace_backup_refuses_nonterminal_queued_work(self):
+        live, _source, archive = self._replacement_fixture("replace-queued")
+        live_orch = Orchestrator(live)
+        workspace = Path(self.tmp.name) / "replace-queued-workspace"
+        workspace.mkdir()
+        plans_dir = live / "plans"
+        plans_dir.mkdir(mode=0o700)
+        plan = {
+            "schema_version": 1,
+            "plan_revision": "replace-queued-v1",
+            "tasks": [{
+                "id": "REPLACE-QUEUED",
+                "goal": "queued",
+                "workspace": str(workspace),
+                "dependencies": [],
+                "allowed_paths": ["out.json"],
+                "protected_paths": {},
+                "checks": [],
+                "publication": {"kind": "none"},
+                "max_attempts": 2,
+            }],
+        }
+        path = plans_dir / "replace-queued.json"
+        path.write_text(json.dumps(plan))
+        os.chmod(path, 0o600)
+        live_orch.load_plan(path)
+        self.assertEqual(check_state(live_orch)["status"], "READY")
+        self.assertEqual(live_orch.reconcile()["status"], "CLEAN")
+        self.assertEqual(recovery_inspect(live_orch)["status"], "CLEAN")
+        with self.assertRaisesRegex(
+            ValueError, "replacement_live_nonterminal_tasks:REPLACE-QUEUED"
+        ):
+            replace_home_from_backup(archive, live)
+        self.assertTrue((live / ".runtime" / "orch.sqlite3").is_file())
+
+    def test_replace_backup_refuses_paused_live_state(self):
+        live, _source, archive = self._replacement_fixture("replace-paused")
+        live_orch = Orchestrator(live)
+        live_orch.pause("operator maintenance")
+        self.assertEqual(check_state(live_orch)["status"], "READY")
+        with self.assertRaisesRegex(ValueError, "replacement_live_pause_present"):
+            replace_home_from_backup(archive, live)
+
     def test_replace_backup_refuses_active_live_state(self):
         live, _source, archive = self._replacement_fixture("replace-active")
         live_orch = Orchestrator(live)

@@ -1072,6 +1072,30 @@ def replace_home_from_backup(path: Path, destination: Path) -> Dict[str, Any]:
         raise ValueError("replacement_live_reconcile_not_clean")
     if recovery_inspect(live)["status"] != "CLEAN":
         raise ValueError("replacement_live_recovery_not_clean")
+    with live.connect() as conn:
+        nonterminal = [
+            dict(row) for row in conn.execute(
+                "SELECT task_id,project_id,status,queue_seq FROM tasks "
+                "WHERE status NOT IN ('DONE','CANCELLED') "
+                "ORDER BY queue_seq,task_id"
+            ).fetchall()
+        ]
+        global_pause = conn.execute(
+            "SELECT value_json FROM settings WHERE key='paused'"
+        ).fetchone()
+        project_pauses = [
+            row["key"] for row in conn.execute(
+                "SELECT key FROM settings WHERE key GLOB 'project_paused:*' "
+                "ORDER BY key"
+            ).fetchall()
+        ]
+    if nonterminal:
+        raise ValueError(
+            "replacement_live_nonterminal_tasks:"
+            + nonterminal[0]["task_id"]
+        )
+    if global_pause or project_pauses:
+        raise ValueError("replacement_live_pause_present")
 
     verified = verify_backup_archive(path)
     if verified["status"] != "VERIFIED":
