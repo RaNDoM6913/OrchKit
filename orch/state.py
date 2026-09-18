@@ -1539,6 +1539,257 @@ def reconcile_home_replacement(
     }
 
 
+def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
+    dest = destination.expanduser().resolve()
+    journal_path = _replacement_journal_path(dest)
+    if journal_path.is_symlink():
+        return {
+            "status": "BLOCKED",
+            "classification": "REPLACEMENT_JOURNAL_UNSAFE",
+            "destination": str(dest),
+            "journal": str(journal_path),
+            "safe_next_steps": [],
+        }
+    if not journal_path.is_file():
+        return {
+            "status": "CLEAN",
+            "classification": "NO_REPLACEMENT",
+            "destination": str(dest),
+            "journal": str(journal_path),
+            "safe_next_steps": [],
+        }
+    try:
+        journal, data = _replacement_load(dest)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "BLOCKED",
+            "classification": "REPLACEMENT_JOURNAL_INVALID",
+            "destination": str(dest),
+            "journal": str(journal_path),
+            "reason": str(exc),
+            "safe_next_steps": [],
+        }
+
+    prepared = Path(data["prepared_home"])
+    rollback_home = Path(data["rollback_home"])
+    discard = Path(data["discard_home"])
+    failed = Path(data["failed_home"])
+    archive_sha = data.get("archive_sha256")
+    if not isinstance(archive_sha, str):
+        return {
+            "status": "BLOCKED",
+            "classification": "REPLACEMENT_JOURNAL_INVALID",
+            "destination": str(dest),
+            "journal": str(journal),
+            "reason": "archive_sha256_missing",
+            "safe_next_steps": [],
+        }
+
+    observed = {
+        "destination_exists": dest.is_dir() and not dest.is_symlink(),
+        "destination_is_new": _restored_home_matches(dest, archive_sha),
+        "destination_is_old": _old_home_identity_matches(dest, data),
+        "prepared_exists": prepared.is_dir() and not prepared.is_symlink(),
+        "prepared_is_new": _restored_home_matches(prepared, archive_sha),
+        "rollback_exists": rollback_home.is_dir() and not rollback_home.is_symlink(),
+        "rollback_is_old": _old_home_identity_matches(rollback_home, data),
+        "failed_exists": failed.is_dir() and not failed.is_symlink(),
+        "failed_is_new": _restored_home_matches(failed, archive_sha),
+        "discard_exists": discard.is_dir() and not discard.is_symlink(),
+    }
+    status = data.get("status")
+    classification = None
+    actions: List[str] = []
+
+    if status == "PREPARED":
+        if (
+            observed["destination_exists"]
+            and not observed["destination_is_new"]
+            and observed["prepared_is_new"]
+            and not observed["rollback_exists"]
+        ):
+            classification = "REPLACEMENT_PREPARED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --resume"
+            ]
+        elif (
+            not observed["destination_exists"]
+            and observed["rollback_is_old"]
+            and observed["prepared_is_new"]
+        ):
+            classification = "REPLACEMENT_GAP_OLD_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --resume"
+            ]
+        elif (
+            observed["destination_is_new"]
+            and observed["rollback_is_old"]
+            and not observed["prepared_exists"]
+        ):
+            classification = "REPLACEMENT_GAP_NEW_ACTIVE"
+            actions = [
+                f"orch state replace-reconcile --destination {dest}",
+                f"orch state replace-reconcile --destination {dest} --rollback",
+                f"orch state replace-reconcile --destination {dest} --finalize",
+            ]
+    elif status == "OLD_MOVED":
+        if (
+            not observed["destination_exists"]
+            and observed["rollback_is_old"]
+            and observed["prepared_is_new"]
+        ):
+            classification = "REPLACEMENT_OLD_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --resume"
+            ]
+        elif (
+            observed["destination_is_new"]
+            and observed["rollback_is_old"]
+            and not observed["prepared_exists"]
+        ):
+            classification = "REPLACEMENT_GAP_NEW_ACTIVE"
+            actions = [
+                f"orch state replace-reconcile --destination {dest}",
+                f"orch state replace-reconcile --destination {dest} --rollback",
+                f"orch state replace-reconcile --destination {dest} --finalize",
+            ]
+    elif status == "NEW_ACTIVE":
+        if (
+            observed["destination_is_new"]
+            and observed["rollback_is_old"]
+            and not observed["prepared_exists"]
+            and not observed["discard_exists"]
+            and not observed["failed_exists"]
+        ):
+            classification = "REPLACEMENT_ROLLBACK_AVAILABLE"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --rollback",
+                f"orch state replace-reconcile --destination {dest} --finalize",
+            ]
+        elif (
+            observed["destination_is_new"]
+            and not observed["rollback_exists"]
+            and observed["discard_exists"]
+        ):
+            classification = "REPLACEMENT_GAP_FINALIZE_DISCARD_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --finalize"
+            ]
+    elif status == "FINALIZE_PENDING_DELETE":
+        if (
+            observed["destination_is_new"]
+            and not observed["rollback_exists"]
+            and not observed["prepared_exists"]
+        ):
+            classification = "REPLACEMENT_FINALIZE_PENDING"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --finalize"
+            ]
+    elif status == "ROLLBACK_PREPARED":
+        if (
+            observed["destination_is_new"]
+            and observed["rollback_is_old"]
+            and not observed["failed_exists"]
+        ):
+            classification = "ROLLBACK_PREPARED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --rollback"
+            ]
+        elif (
+            not observed["destination_exists"]
+            and observed["rollback_is_old"]
+            and observed["failed_is_new"]
+        ):
+            classification = "ROLLBACK_GAP_NEW_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --rollback"
+            ]
+        elif (
+            observed["destination_is_old"]
+            and not observed["rollback_exists"]
+            and observed["failed_is_new"]
+        ):
+            classification = "ROLLBACK_GAP_OLD_RESTORED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest}",
+                f"orch state replace-reconcile --destination {dest} --finalize",
+            ]
+    elif status == "ROLLBACK_NEW_MOVED":
+        if (
+            not observed["destination_exists"]
+            and observed["rollback_is_old"]
+            and observed["failed_is_new"]
+        ):
+            classification = "ROLLBACK_NEW_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --rollback"
+            ]
+        elif (
+            observed["destination_is_old"]
+            and not observed["rollback_exists"]
+            and observed["failed_is_new"]
+        ):
+            classification = "ROLLBACK_GAP_OLD_RESTORED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest}",
+                f"orch state replace-reconcile --destination {dest} --finalize",
+            ]
+    elif status == "ROLLED_BACK":
+        if (
+            observed["destination_is_old"]
+            and not observed["rollback_exists"]
+            and observed["failed_is_new"]
+            and not observed["discard_exists"]
+        ):
+            classification = "ROLLED_BACK_FORWARD_COPY_AVAILABLE"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --finalize"
+            ]
+        elif (
+            observed["destination_is_old"]
+            and not observed["rollback_exists"]
+            and not observed["failed_exists"]
+            and observed["discard_exists"]
+        ):
+            classification = "ROLLBACK_GAP_FINALIZE_DISCARD_MOVED"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --finalize"
+            ]
+    elif status == "ROLLBACK_FINALIZE_PENDING_DELETE":
+        if (
+            observed["destination_is_old"]
+            and not observed["rollback_exists"]
+            and not observed["failed_exists"]
+        ):
+            classification = "ROLLBACK_FINALIZE_PENDING"
+            actions = [
+                f"orch state replace-reconcile --destination {dest} --finalize"
+            ]
+
+    if classification is None:
+        return {
+            "status": "BLOCKED",
+            "classification": "REPLACEMENT_STATE_AMBIGUOUS",
+            "destination": str(dest),
+            "journal": str(journal),
+            "journal_status": status,
+            "operation_id": data.get("operation_id"),
+            "observed": observed,
+            "safe_next_steps": [],
+        }
+    return {
+        "status": "ATTENTION",
+        "classification": classification,
+        "destination": str(dest),
+        "journal": str(journal),
+        "journal_status": status,
+        "operation_id": data.get("operation_id"),
+        "observed": observed,
+        "safe_next_steps": actions,
+        "automatic_action": False,
+    }
+
+
 def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, Any]:
     health = check_state(orch)
     if health["status"] == "BLOCKED":

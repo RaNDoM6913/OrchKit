@@ -10,8 +10,9 @@ import zipfile
 
 import orch.state as state_module
 from orch.core import Orchestrator
-from orch.state import (backup_state, check_state, migration_history, prune_capabilities,
-                        prune_retention, recovery_inspect, reconcile_home_replacement,
+from orch.state import (backup_state, check_state, inspect_home_replacement,
+                        migration_history, prune_capabilities, prune_retention,
+                        recovery_inspect, reconcile_home_replacement,
                         replace_home_from_backup, restore_backup_archive,
                         retention_status, verify_backup_archive)
 
@@ -663,6 +664,61 @@ class StateMaintenanceTests(unittest.TestCase):
         finished = reconcile_home_replacement(live, finalize=True)
         self.assertEqual(finished["status"], "COMPLETE")
         self.assertEqual(finished["outcome"], "ROLLED_BACK")
+
+    def test_replacement_recovery_inspect_is_read_only_for_new_active(self):
+        live, _source, archive = self._replacement_fixture("inspect-new-active")
+        result = replace_home_from_backup(archive, live)
+        journal = Path(result["journal"])
+        before = journal.read_bytes()
+        inspected = inspect_home_replacement(live)
+        after = journal.read_bytes()
+        self.assertEqual(inspected["status"], "ATTENTION")
+        self.assertEqual(
+            inspected["classification"], "REPLACEMENT_ROLLBACK_AVAILABLE"
+        )
+        self.assertIn("--rollback", " ".join(inspected["safe_next_steps"]))
+        self.assertIn("--finalize", " ".join(inspected["safe_next_steps"]))
+        self.assertEqual(before, after)
+        self.assertFalse(inspected["automatic_action"])
+        reconcile_home_replacement(live, finalize=True)
+
+    def test_replacement_recovery_inspect_sees_old_moved_without_creating_dest(self):
+        live, _source, archive = self._replacement_fixture("inspect-old-moved")
+        original = state_module._replacement_rename
+        calls = {"count": 0}
+
+        def flaky(source, destination):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("synthetic activation failure")
+            return original(source, destination)
+
+        with mock.patch.object(state_module, "_replacement_rename", side_effect=flaky):
+            with self.assertRaisesRegex(OSError, "synthetic activation failure"):
+                replace_home_from_backup(archive, live)
+        self.assertFalse(live.exists())
+        journal = Path(state_module._replacement_journal_path(live))
+        before = journal.read_bytes()
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(inspected["classification"], "REPLACEMENT_OLD_MOVED")
+        self.assertIn("--resume", inspected["safe_next_steps"][0])
+        self.assertFalse(live.exists())
+        self.assertEqual(before, journal.read_bytes())
+        reconcile_home_replacement(live, resume=True)
+        reconcile_home_replacement(live, finalize=True)
+
+    def test_replacement_recovery_inspect_tracks_rolled_back_forward_copy(self):
+        live, _source, archive = self._replacement_fixture("inspect-rolled-back")
+        replace_home_from_backup(archive, live)
+        reconcile_home_replacement(live, rollback=True)
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(
+            inspected["classification"], "ROLLED_BACK_FORWARD_COPY_AVAILABLE"
+        )
+        self.assertTrue(inspected["observed"]["destination_is_old"])
+        self.assertTrue(inspected["observed"]["failed_is_new"])
+        self.assertIn("--finalize", inspected["safe_next_steps"][0])
+        reconcile_home_replacement(live, finalize=True)
 
     def test_backup_refuses_active_writer(self):
         workspace = Path(self.tmp.name) / "ws"; workspace.mkdir()

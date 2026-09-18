@@ -15,8 +15,9 @@ from .git_policy import evaluate_project_git_policy
 from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
-from .state import (backup_state, check_state, migration_history, prune_capabilities,
-                    prune_retention, recovery_inspect, reconcile_home_replacement,
+from .state import (backup_state, check_state, inspect_home_replacement,
+                    migration_history, prune_capabilities, prune_retention,
+                    recovery_inspect, reconcile_home_replacement,
                     replace_home_from_backup, restore_backup_archive,
                     retention_status, verify_backup_archive)
 
@@ -123,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_inspect_cmd = recovery_sub.add_parser("inspect")
     recovery_inspect_cmd.add_argument("--run-id")
     recovery_inspect_cmd.add_argument("--project")
+    recovery_inspect_cmd.add_argument("--replacement-home")
     state = sub.add_parser("state", help="inspect and maintain durable ORCH state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
     state_sub.add_parser("check")
@@ -196,6 +198,13 @@ def main(argv=None) -> int:
                 "verify-backup", "restore-backup",
                 "replace-backup", "replace-reconcile",
             }
+        )
+        or (
+            args.command == "recovery"
+            and args.recovery_command == "inspect"
+            and args.replacement_home is not None
+            and args.run_id is None
+            and args.project is None
         )
     )
     orch = None if state_independent else Orchestrator(root)
@@ -313,9 +322,32 @@ def main(argv=None) -> int:
             result = {"status": "OK", "root": str(root), "db": str(orch.db_path)}
         elif args.command == "recovery":
             if args.recovery_command == "inspect":
-                result = recovery_inspect(
-                    orch, run_id=args.run_id, project_id=args.project
+                replacement = (
+                    inspect_home_replacement(
+                        Path(args.replacement_home).expanduser()
+                    )
+                    if args.replacement_home else None
                 )
+                if orch is None:
+                    result = {
+                        "status": replacement["status"],
+                        "automatic_expiry": False,
+                        "items": [],
+                        "replacement": replacement,
+                    }
+                else:
+                    result = recovery_inspect(
+                        orch, run_id=args.run_id, project_id=args.project
+                    )
+                    if replacement is not None:
+                        result["replacement"] = replacement
+                        if replacement["status"] == "BLOCKED":
+                            result["status"] = "BLOCKED"
+                        elif (
+                            replacement["status"] == "ATTENTION"
+                            and result["status"] == "CLEAN"
+                        ):
+                            result["status"] = "ATTENTION"
             else:
                 raise ValueError("unknown_recovery_command")
         elif args.command == "state":

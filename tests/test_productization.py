@@ -18,7 +18,8 @@ from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
 from orch.project import ProjectRegistry
 from orch.review_policy import decide_review, normalize_review_policy
-from orch.state import backup_state
+from orch.state import (backup_state, reconcile_home_replacement,
+                        replace_home_from_backup)
 
 
 class ProductizationTests(unittest.TestCase):
@@ -72,6 +73,33 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(result["status"], "RESTORED")
         self.assertFalse(phantom.exists())
         self.assertTrue((destination / ".runtime" / "orch.sqlite3").is_file())
+
+    def test_replacement_only_recovery_does_not_initialize_command_root(self):
+        live = self.base / "replacement-live"
+        source = self.base / "replacement-source"
+        live.mkdir()
+        source.mkdir()
+        Orchestrator(live)
+        source_orch = Orchestrator(source)
+        archive = Path(backup_state(source_orch)["path"])
+        replace_home_from_backup(archive, live)
+        phantom = self.base / "phantom-recovery-command-root"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(phantom),
+                "recovery", "inspect",
+                "--replacement-home", str(live),
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(
+            result["replacement"]["classification"],
+            "REPLACEMENT_ROLLBACK_AVAILABLE",
+        )
+        self.assertFalse(phantom.exists())
+        reconcile_home_replacement(live, finalize=True)
 
     def test_setup_persists_default_profile(self):
         configured = configure_home(self.home, profile="standard")
