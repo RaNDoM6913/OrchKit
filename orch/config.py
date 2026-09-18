@@ -9,6 +9,27 @@ SCHEMA_VERSION = 1
 DEFAULT_PROFILE = "safe"
 
 
+
+
+def ensure_private_dir(path: Path) -> Path:
+    target = path.expanduser()
+    if target.exists():
+        if target.is_symlink() or not target.is_dir():
+            raise ValueError("private_directory_unsafe")
+    else:
+        target.mkdir(parents=True, mode=0o700, exist_ok=False)
+    os.chmod(target, 0o700)
+    return target
+
+
+def ensure_private_file(path: Path) -> Path:
+    target = path.expanduser()
+    if target.exists():
+        if target.is_symlink() or not target.is_file():
+            raise ValueError("private_file_unsafe")
+        os.chmod(target, 0o600)
+    return target
+
 def default_home() -> Path:
     value = os.environ.get("ORCH_HOME")
     return Path(value).expanduser().resolve() if value else (Path.home() / ".orch").resolve()
@@ -29,9 +50,10 @@ def atomic_write_json(path: Path, value: Dict[str, Any], *, mode: int = 0o600) -
 def ensure_home(home: Path) -> Dict[str, Any]:
     home = home.expanduser().resolve()
     for relative in ("projects", "logs", "snapshots", "reviews", "claims"):
-        (home / relative).mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(home / relative)
     config_path = home / "config.json"
     if config_path.exists():
+        ensure_private_file(config_path)
         config = json.loads(config_path.read_text(encoding="utf-8"))
     else:
         config = {

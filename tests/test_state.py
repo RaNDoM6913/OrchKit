@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import json
 import os
 import sqlite3
 import tempfile
@@ -33,6 +34,49 @@ class StateMaintenanceTests(unittest.TestCase):
             "transactional_upgrade", "observed_existing_schema",
         })
 
+    def test_runtime_permissions_are_private_and_existing_modes_are_repaired(self):
+        private_dirs = [
+            self.orch.runtime,
+            self.orch.runtime / "logs",
+            self.orch.runtime / "worker_receipts",
+            self.orch.runtime / "claims",
+            self.orch.runtime / "review_exports",
+        ]
+        for path in private_dirs:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.orch.db_path.stat().st_mode & 0o777, 0o600)
+
+        os.chmod(self.orch.runtime, 0o755)
+        os.chmod(self.orch.db_path, 0o644)
+        for sidecar in (
+            self.orch.db_path.with_name(self.orch.db_path.name + "-wal"),
+            self.orch.db_path.with_name(self.orch.db_path.name + "-shm"),
+        ):
+            if sidecar.exists():
+                os.chmod(sidecar, 0o644)
+
+        repaired = Orchestrator(self.root)
+        self.assertEqual(repaired.runtime.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(repaired.db_path.stat().st_mode & 0o777, 0o600)
+        for sidecar in (
+            repaired.db_path.with_name(repaired.db_path.name + "-wal"),
+            repaired.db_path.with_name(repaired.db_path.name + "-shm"),
+        ):
+            if sidecar.exists():
+                self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+        health = check_state(repaired)
+        self.assertEqual(health["permissions"]["status"], "READY")
+        self.assertNotEqual(health["status"], "BLOCKED")
+
+    def test_runtime_symlink_is_rejected(self):
+        other = Path(self.tmp.name) / "symlink-root"
+        other.mkdir()
+        external = Path(self.tmp.name) / "external-runtime"
+        external.mkdir()
+        (other / ".runtime").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "private_directory_unsafe"):
+            Orchestrator(other)
+
     def test_orphan_capability_is_reported_and_pruned(self):
         claims = self.orch.runtime / "claims"
         claims.mkdir(exist_ok=True)
@@ -52,6 +96,8 @@ class StateMaintenanceTests(unittest.TestCase):
         result = backup_state(self.orch)
         archive = Path(result["path"])
         self.assertTrue(archive.is_file())
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(archive.parent.stat().st_mode & 0o777, 0o700)
         with zipfile.ZipFile(archive) as bundle:
             names = set(bundle.namelist())
             self.assertIn("state/orch.sqlite3", names)

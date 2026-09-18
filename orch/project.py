@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import atomic_write_json
+from .config import atomic_write_json, ensure_private_dir
 from .core import sha256_file
 from .review_policy import MODES, REVIEWERS
 
@@ -123,8 +123,7 @@ def inspect_project(path: Path) -> Dict[str, Any]:
 class ProjectRegistry:
     def __init__(self, home: Path):
         self.home = home.expanduser().resolve()
-        self.projects_dir = self.home / "projects"
-        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir = ensure_private_dir(self.home / "projects")
 
     def _path(self, project_id: str) -> Path:
         if not re.fullmatch(r"[a-z0-9._-]+", project_id):
@@ -205,6 +204,9 @@ class ProjectRegistry:
         rows: List[Dict[str, Any]] = []
         for path in sorted(self.projects_dir.glob("*.json")):
             try:
+                if path.is_symlink() or not path.is_file():
+                    rows.append({"project_id": path.stem, "status": "UNSAFE"})
+                    continue
                 item = json.loads(path.read_text(encoding="utf-8"))
                 rows.append({"project_id": item.get("project_id"), "name": item.get("name"), "root": item.get("root"), "profile": item.get("profile")})
             except (OSError, json.JSONDecodeError):
@@ -213,8 +215,11 @@ class ProjectRegistry:
 
     def get(self, project_id: str) -> Dict[str, Any]:
         path = self._path(project_id)
+        if path.is_symlink():
+            raise ValueError("project_config_unsafe")
         if not path.is_file():
             raise ValueError("unknown_project")
+        os.chmod(path, 0o600)
         config = json.loads(path.read_text(encoding="utf-8"))
         if not config.get("writer_key") and config.get("root"):
             root = Path(config["root"]).expanduser().resolve()
@@ -232,6 +237,8 @@ class ProjectRegistry:
 
     def remove(self, project_id: str) -> Dict[str, Any]:
         path = self._path(project_id)
+        if path.is_symlink():
+            raise ValueError("project_config_unsafe")
         if not path.is_file():
             raise ValueError("unknown_project")
         path.unlink()

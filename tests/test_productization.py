@@ -77,6 +77,8 @@ class ProductizationTests(unittest.TestCase):
         registry = ProjectRegistry(self.home)
         registered = registry.add(self.repo, profile="standard", review_mode="off")
         config = registered["project"]
+        self.assertEqual(registry.projects_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(Path(registered["config_path"]).stat().st_mode & 0o777, 0o600)
         self.assertEqual(config["review"]["mode"], "off")
         self.assertEqual(config["review"]["reviewer"], "none")
         self.assertTrue(config["git"]["allow_commit"])
@@ -89,6 +91,20 @@ class ProductizationTests(unittest.TestCase):
         blocked = evaluate_project_git_policy(config)
         self.assertEqual(blocked["status"], "BLOCKED")
         self.assertIn("protected_baseline_changed", blocked["safety_blockers"])
+
+    def test_project_registry_rejects_symlinked_config(self):
+        registry = ProjectRegistry(self.home)
+        registered = registry.add(self.repo, profile="standard", review_mode="off")
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        external = self.base / "external-config.json"
+        external.write_text(config_path.read_text())
+        config_path.unlink()
+        config_path.symlink_to(external)
+        with self.assertRaisesRegex(ValueError, "project_config_unsafe"):
+            registry.get(project_id)
+        listed = {item["project_id"]: item for item in registry.list()}
+        self.assertEqual(listed[project_id]["status"], "UNSAFE")
 
     def test_safe_profile_denies_publication_by_default(self):
         registry = ProjectRegistry(self.home)
@@ -146,6 +162,7 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(first["load"]["queued_count"], 1)
         plan1 = Path(first["plan_path"])
         self.assertEqual(plan1.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(plan1.parent.stat().st_mode & 0o777, 0o700)
 
         rc2, second = enqueue(
             "--task-id", "ENQ-2", "--goal", "second",

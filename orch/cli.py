@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import __version__
 from .codex_review import run_review, subscription_preflight
-from .config import configure_home, default_home
+from .config import configure_home, default_home, ensure_private_dir
 from .core import Orchestrator
 from .doctor import run_doctor
 from .dispatcher import bootstrap_prompt, read_rdc, record_rdc, render_dispatcher
@@ -223,8 +223,7 @@ def main(argv=None) -> int:
                     dependencies=args.depends,
                     max_attempts=args.max_attempts,
                 )
-                plans_dir = root / "plans"
-                plans_dir.mkdir(parents=True, exist_ok=True)
+                plans_dir = ensure_private_dir(root / "plans")
                 plan_path = plans_dir / f"{plan['plan_revision']}.json"
                 existed = plan_path.exists()
                 written = write_plan(plan_path, plan, replace=False)

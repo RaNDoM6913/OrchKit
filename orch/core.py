@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .config import ensure_private_dir, ensure_private_file
 from .review_policy import decide_review, normalize_review_policy
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
@@ -170,19 +171,35 @@ def validate_dependency_graph(tasks: List[Dict[str, Any]]) -> None:
 class Orchestrator:
     def __init__(self, root: Path):
         self.root = root.resolve()
-        self.runtime = self.root / ".runtime"
-        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.runtime = ensure_private_dir(self.root / ".runtime")
         self.db_path = self.runtime / "orch.sqlite3"
-        self.logs = self.runtime / "logs"
-        self.logs.mkdir(exist_ok=True)
-        (self.runtime / "worker_receipts").mkdir(exist_ok=True)
+        self.logs = ensure_private_dir(self.runtime / "logs")
+        ensure_private_dir(self.runtime / "worker_receipts")
+        ensure_private_dir(self.runtime / "claims")
+        ensure_private_dir(self.runtime / "review_exports")
+        for optional_state_dir in ("projects", "plans", "backups"):
+            candidate = self.root / optional_state_dir
+            if candidate.exists():
+                ensure_private_dir(candidate)
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=5, isolation_level=None)
+        ensure_private_file(self.db_path)
+        for sidecar in (
+            self.db_path.with_name(self.db_path.name + "-wal"),
+            self.db_path.with_name(self.db_path.name + "-shm"),
+        ):
+            ensure_private_file(sidecar)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
+        ensure_private_file(self.db_path)
+        for sidecar in (
+            self.db_path.with_name(self.db_path.name + "-wal"),
+            self.db_path.with_name(self.db_path.name + "-shm"),
+        ):
+            ensure_private_file(sidecar)
         return conn
 
     def _capability_path(self, run_id: str) -> Path:
@@ -485,8 +502,7 @@ class Orchestrator:
                 },
             )
             conn.execute("COMMIT")
-        claims = self.runtime / "claims"
-        claims.mkdir(exist_ok=True)
+        claims = ensure_private_dir(self.runtime / "claims")
         cap = self._capability_path(run_id)
         cap.write_text(
             json.dumps({"run_id": run_id, "lease_token": lease}, separators=(",", ":")) + "\n",

@@ -10,6 +10,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 
+from .config import ensure_private_dir
 from .core import ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, Orchestrator, utc_now
 
 
@@ -57,6 +58,48 @@ def capability_health(orch: Orchestrator) -> Dict[str, Any]:
     }
 
 
+def permission_health(orch: Orchestrator) -> Dict[str, Any]:
+    targets = [
+        (orch.runtime, 0o700, True),
+        (orch.runtime / "logs", 0o700, True),
+        (orch.runtime / "worker_receipts", 0o700, True),
+        (orch.runtime / "claims", 0o700, True),
+        (orch.runtime / "review_exports", 0o700, True),
+        (orch.db_path, 0o600, True),
+        (orch.db_path.with_name(orch.db_path.name + "-wal"), 0o600, False),
+        (orch.db_path.with_name(orch.db_path.name + "-shm"), 0o600, False),
+        (orch.root / "projects", 0o700, False),
+        (orch.root / "plans", 0o700, False),
+        (orch.root / "backups", 0o700, False),
+    ]
+    rows: List[Dict[str, Any]] = []
+    blocked = False
+    for path, expected, required in targets:
+        if not path.exists():
+            if required:
+                blocked = True
+                rows.append({
+                    "path": str(path), "status": "MISSING",
+                    "expected_mode": oct(expected), "actual_mode": None,
+                })
+            continue
+        if path.is_symlink():
+            blocked = True
+            rows.append({
+                "path": str(path), "status": "UNSAFE_SYMLINK",
+                "expected_mode": oct(expected), "actual_mode": None,
+            })
+            continue
+        actual = path.stat().st_mode & 0o777
+        status = "PASS" if actual == expected else "MODE_MISMATCH"
+        blocked = blocked or status != "PASS"
+        rows.append({
+            "path": str(path), "status": status,
+            "expected_mode": oct(expected), "actual_mode": oct(actual),
+        })
+    return {"status": "BLOCKED" if blocked else "READY", "paths": rows}
+
+
 def check_state(orch: Orchestrator) -> Dict[str, Any]:
     with orch.connect() as conn:
         quick = conn.execute("PRAGMA quick_check").fetchall()
@@ -75,7 +118,8 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
         )]
     quick_values = [row[0] for row in quick]
     caps = capability_health(orch)
-    blocked = quick_values != ["ok"] or bool(foreign)
+    permissions = permission_health(orch)
+    blocked = quick_values != ["ok"] or bool(foreign) or permissions["status"] != "READY"
     attention = bool(active) or caps["status"] != "READY" or bool(pending_publications)
     history = migration_history(orch)["migrations"]
     return {
@@ -89,6 +133,7 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
         "active_runs": active,
         "pending_publications": pending_publications,
         "capabilities": caps,
+        "permissions": permissions,
     }
 
 
@@ -214,7 +259,9 @@ def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
     backups_dir = orch.root / "backups"
     backups: List[Dict[str, Any]] = []
     unmanaged_backups: List[Dict[str, Any]] = []
-    if backups_dir.is_dir():
+    if backups_dir.is_symlink():
+        unmanaged_backups.append({"path": str(backups_dir), "reason": "unsafe_backup_directory"})
+    elif backups_dir.is_dir():
         for item in sorted(backups_dir.iterdir()):
             if item.name.startswith("orch-state-") and item.suffix == ".zip" and item.is_file() and not item.is_symlink():
                 backups.append({
@@ -384,8 +431,7 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
         raise ValueError("state_integrity_blocked")
     if health["active_runs"]:
         raise ValueError("active_runs_present")
-    backups = orch.root / "backups"
-    backups.mkdir(parents=True, exist_ok=True)
+    backups = ensure_private_dir(orch.root / "backups")
     target = output.expanduser().resolve() if output else backups / f"orch-state-{utc_now().replace(':','').replace('+0000','Z')}.zip"
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="orch-backup-", dir=str(orch.runtime)) as tmp:
