@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     state_backup = state_sub.add_parser("backup"); state_backup.add_argument("--output")
     state_sub.add_parser("prune-capabilities")
     load = sub.add_parser("load-plan"); load.add_argument("plan")
-    claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True)
+    claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True); claim.add_argument("--project")
     context = sub.add_parser("context"); context.add_argument("--run-id", required=True)
     heartbeat = sub.add_parser("heartbeat"); heartbeat.add_argument("--run-id", required=True); heartbeat.add_argument("--lease"); heartbeat.add_argument("--cap")
     submit = sub.add_parser("submit"); submit.add_argument("--run-id", required=True); submit.add_argument("--lease"); submit.add_argument("--cap"); submit.add_argument("--receipt", required=True)
@@ -109,7 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
     publish_reconcile = sub.add_parser("publish-reconcile")
     publish_reconcile.add_argument("--run-id", required=True)
     publish_reconcile.add_argument("--resume", action="store_true")
-    sub.add_parser("status"); sub.add_parser("reconcile"); sub.add_parser("next")
+    sub.add_parser("status"); sub.add_parser("reconcile")
+    next_cmd = sub.add_parser("next"); next_cmd.add_argument("--project")
     pause = sub.add_parser("pause"); pause.add_argument("--reason", required=True)
     sub.add_parser("resume")
     abort = sub.add_parser("abort"); abort.add_argument("--run-id", required=True); abort.add_argument("--reason", required=True); abort.add_argument("--retry", action="store_true")
@@ -193,7 +194,7 @@ def main(argv=None) -> int:
         elif args.command == "load-plan":
             result = orch.load_plan(Path(args.plan).expanduser().resolve())
         elif args.command == "claim":
-            result = orch.claim(args.worker)
+            result = orch.claim(args.worker, project_id=args.project)
         elif args.command == "context":
             result = orch.context(args.run_id)
         elif args.command == "heartbeat":
@@ -224,7 +225,7 @@ def main(argv=None) -> int:
         elif args.command == "reconcile":
             result = orch.reconcile()
         elif args.command == "next":
-            result = orch.next_work()
+            result = orch.next_work(project_id=args.project)
         elif args.command == "pause":
             result = orch.pause(args.reason)
         elif args.command == "resume":

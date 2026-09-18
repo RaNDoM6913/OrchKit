@@ -16,6 +16,7 @@ from .review_policy import decide_review, normalize_review_policy
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
 READY_TASK_STATES = {"PLANNED", "READY", "NEEDS_FIX"}
+STATE_SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -92,10 +93,26 @@ def path_allowed(relative: str, allowlist: Iterable[str]) -> bool:
     return False
 
 
+def task_writer_key(item: Dict[str, Any]) -> str:
+    explicit = item.get("writer_key")
+    if explicit is not None:
+        if not isinstance(explicit, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", explicit) is None:
+            raise ValueError("invalid_writer_key")
+        return explicit
+    workspace = Path(item.get("workspace", "")).expanduser().resolve()
+    return "workspace:" + sha256_bytes(str(workspace).encode("utf-8"))[:32]
+
+
 def validate_task_definition(item: Dict[str, Any]) -> None:
     workspace = Path(item.get("workspace", ""))
     if not workspace.is_absolute():
         raise ValueError("workspace_must_be_absolute")
+    project_id = item.get("project_id")
+    if project_id is not None and (
+        not isinstance(project_id, str) or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None
+    ):
+        raise ValueError("invalid_project_id")
+    task_writer_key(item)
     allowed = item.get("allowed_paths", [])
     if not isinstance(allowed, list) or not allowed:
         raise ValueError("allowed_paths_required")
@@ -188,6 +205,7 @@ class Orchestrator:
         );
         CREATE TABLE IF NOT EXISTS tasks (
           task_id TEXT PRIMARY KEY, plan_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,
+          project_id TEXT, writer_key TEXT NOT NULL, queue_seq INTEGER NOT NULL,
           status TEXT NOT NULL, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS runs (
@@ -223,10 +241,35 @@ class Orchestrator:
         with self.connect() as conn:
             conn.executescript(schema)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise ValueError(f"unsupported_state_schema:{version}")
-            if version < 2:
-                conn.execute("PRAGMA user_version=2")
+            if version < 3:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+                if "project_id" not in columns:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
+                if "writer_key" not in columns:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN writer_key TEXT")
+                if "queue_seq" not in columns:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN queue_seq INTEGER")
+                rows = conn.execute(
+                    "SELECT rowid,task_id,payload_json,project_id,writer_key,queue_seq FROM tasks ORDER BY rowid"
+                ).fetchall()
+                next_seq = 0
+                for row in rows:
+                    payload = json.loads(row["payload_json"])
+                    next_seq = max(next_seq + 1, int(row["queue_seq"] or 0))
+                    conn.execute(
+                        "UPDATE tasks SET project_id=?,writer_key=?,queue_seq=? WHERE task_id=?",
+                        (
+                            row["project_id"] if row["project_id"] is not None else payload.get("project_id"),
+                            row["writer_key"] or task_writer_key(payload),
+                            next_seq,
+                            row["task_id"],
+                        ),
+                    )
+                conn.execute(f"PRAGMA user_version={STATE_SCHEMA_VERSION}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
 
     def _event(self, conn: sqlite3.Connection, kind: str, *, task_id: str = None,
                run_id: str = None, payload: Dict[str, Any] = None) -> None:
@@ -252,6 +295,7 @@ class Orchestrator:
         validate_dependency_graph(tasks)
         digest = sha256_file(plan_path)
         now = utc_now()
+        queued_count = 0
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute("SELECT source_digest FROM plans WHERE plan_revision=?",
@@ -259,14 +303,22 @@ class Orchestrator:
             if existing and existing["source_digest"] != digest:
                 conn.execute("ROLLBACK")
                 raise ValueError("plan_revision_digest_conflict")
+            existing_task_ids = set()
             for item in tasks:
-                task_existing = conn.execute("SELECT plan_revision FROM tasks WHERE task_id=?", (item["id"],)).fetchone()
+                task_existing = conn.execute(
+                    "SELECT plan_revision FROM tasks WHERE task_id=?", (item["id"],)
+                ).fetchone()
                 if task_existing and task_existing["plan_revision"] != data["plan_revision"]:
                     conn.execute("ROLLBACK")
                     raise ValueError(f"task_id_conflict:{item['id']}")
+                if task_existing:
+                    existing_task_ids.add(item["id"])
             conn.execute("INSERT OR IGNORE INTO plans(plan_revision,source_digest,loaded_at) VALUES(?,?,?)",
                          (data["plan_revision"], digest, now))
+            next_queue = conn.execute("SELECT COALESCE(MAX(queue_seq),0) FROM tasks").fetchone()[0]
             for ordinal, item in enumerate(tasks):
+                if item["id"] in existing_task_ids:
+                    continue
                 payload = dict(item)
                 payload.setdefault("max_attempts", 2)
                 payload.setdefault("checks", [])
@@ -275,11 +327,26 @@ class Orchestrator:
                 payload["review"] = normalize_review_policy(payload)
                 payload.setdefault("owner_acceptance", False)
                 payload.setdefault("publication", {"kind": "none"})
-                conn.execute("INSERT OR IGNORE INTO tasks(task_id,plan_revision,ordinal,status,payload_json,updated_at) VALUES(?,?,?,?,?,?)",
-                             (item["id"], data["plan_revision"], ordinal, "PLANNED", canonical_json(payload), now))
-            self._event(conn, "PLAN_LOADED", payload={"revision": data["plan_revision"], "digest": digest})
+                payload["writer_key"] = task_writer_key(payload)
+                next_queue += 1
+                conn.execute(
+                    "INSERT INTO tasks(task_id,plan_revision,ordinal,project_id,writer_key,queue_seq,status,payload_json,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        item["id"], data["plan_revision"], ordinal, payload.get("project_id"),
+                        payload["writer_key"], next_queue, "PLANNED", canonical_json(payload), now,
+                    ),
+                )
+                queued_count += 1
+            self._event(
+                conn, "PLAN_LOADED",
+                payload={"revision": data["plan_revision"], "digest": digest, "queued_count": queued_count},
+            )
             conn.execute("COMMIT")
-        return {"status": "OK", "plan_revision": data["plan_revision"], "digest": digest, "task_count": len(tasks)}
+        return {
+            "status": "OK", "plan_revision": data["plan_revision"], "digest": digest,
+            "task_count": len(tasks), "queued_count": queued_count,
+        }
 
     def _task_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
         return json.loads(row["payload_json"])
@@ -291,7 +358,18 @@ class Orchestrator:
                 return False
         return True
 
-    def claim(self, worker_id: str) -> Dict[str, Any]:
+    def _active_writer_locks(self, conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT r.run_id,r.task_id,r.state,r.heartbeat_at,t.project_id,t.writer_key "
+            "FROM runs r JOIN tasks t ON t.task_id=r.task_id "
+            "WHERE r.state IN (?,?,?,?,?) ORDER BY r.started_at",
+            tuple(ACTIVE_RUN_STATES),
+        ).fetchall()
+        return {row["writer_key"]: dict(row) for row in rows}
+
+    def claim(self, worker_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+        if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -299,44 +377,76 @@ class Orchestrator:
             if paused:
                 conn.execute("COMMIT")
                 return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
-            active = conn.execute("SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at LIMIT 1",
-                                  tuple(ACTIVE_RUN_STATES)).fetchone()
-            if active:
-                conn.execute("COMMIT")
-                return {"status": "BUSY", "active": dict(active)}
+            locks = self._active_writer_locks(conn)
+            blocked_locks: List[Dict[str, Any]] = []
             selected = None
-            for row in conn.execute("SELECT * FROM tasks ORDER BY ordinal,task_id").fetchall():
+            for row in conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall():
                 if row["status"] not in READY_TASK_STATES:
+                    continue
+                if project_id is not None and row["project_id"] != project_id:
                     continue
                 payload = self._task_payload(row)
                 if not self._dependencies_done(conn, payload):
                     continue
-                attempts = conn.execute("SELECT COUNT(*) AS n FROM runs WHERE task_id=?", (row["task_id"],)).fetchone()["n"]
+                attempts = conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE task_id=?", (row["task_id"],)
+                ).fetchone()["n"]
                 if attempts >= int(payload.get("max_attempts", 2)):
-                    conn.execute("UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?", (now, row["task_id"]))
-                    self._event(conn, "TASK_BLOCKED_MAX_ATTEMPTS", task_id=row["task_id"], payload={"attempts": attempts})
+                    conn.execute(
+                        "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
+                        (now, row["task_id"]),
+                    )
+                    self._event(
+                        conn, "TASK_BLOCKED_MAX_ATTEMPTS", task_id=row["task_id"],
+                        payload={"attempts": attempts},
+                    )
+                    continue
+                lock = locks.get(row["writer_key"])
+                if lock:
+                    blocked_locks.append(lock)
                     continue
                 selected = (row, payload, attempts + 1)
                 break
             if not selected:
                 conn.execute("COMMIT")
-                return {"status": "NO_WORK"}
+                if blocked_locks:
+                    unique = {item["run_id"]: item for item in blocked_locks}
+                    active = list(unique.values())
+                    return {"status": "BUSY", "active": active[0], "locks": active}
+                return {"status": "NO_WORK", "project_id": project_id}
             row, payload, attempt = selected
             run_id = f"{row['task_id']}-A{attempt}-{uuid.uuid4().hex[:10]}"
             lease = secrets.token_urlsafe(24)
-            conn.execute("INSERT INTO runs(run_id,task_id,attempt,worker_id,state,lease_token,started_at,heartbeat_at) VALUES(?,?,?,?,?,?,?,?)",
-                         (run_id, row["task_id"], attempt, worker_id, "RUNNING", lease, now, now))
-            conn.execute("UPDATE tasks SET status='IN_PROGRESS',updated_at=? WHERE task_id=?", (now, row["task_id"]))
-            self._event(conn, "RUN_CLAIMED", task_id=row["task_id"], run_id=run_id,
-                        payload={"attempt": attempt, "worker_id": worker_id})
+            conn.execute(
+                "INSERT INTO runs(run_id,task_id,attempt,worker_id,state,lease_token,started_at,heartbeat_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (run_id, row["task_id"], attempt, worker_id, "RUNNING", lease, now, now),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='IN_PROGRESS',updated_at=? WHERE task_id=?",
+                (now, row["task_id"]),
+            )
+            self._event(
+                conn, "RUN_CLAIMED", task_id=row["task_id"], run_id=run_id,
+                payload={
+                    "attempt": attempt, "worker_id": worker_id, "project_id": row["project_id"],
+                    "writer_key": row["writer_key"], "queue_seq": row["queue_seq"],
+                },
+            )
             conn.execute("COMMIT")
         claims = self.runtime / "claims"
         claims.mkdir(exist_ok=True)
         cap = self._capability_path(run_id)
-        cap.write_text(json.dumps({"run_id": run_id, "lease_token": lease}, separators=(",", ":")) + "\n", encoding="utf-8")
+        cap.write_text(
+            json.dumps({"run_id": run_id, "lease_token": lease}, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
         os.chmod(cap, 0o600)
-        return {"status": "CLAIMED", "run_id": run_id, "task_id": row["task_id"],
-                "attempt": attempt, "capability_file": str(cap), "context": self.context(run_id)}
+        return {
+            "status": "CLAIMED", "run_id": run_id, "task_id": row["task_id"],
+            "project_id": row["project_id"], "attempt": attempt,
+            "capability_file": str(cap), "context": self.context(run_id),
+        }
 
     def lease_from_capability(self, run_id: str, capability_file: Path) -> str:
         path = capability_file.resolve()
@@ -360,6 +470,7 @@ class Orchestrator:
             feedback = json.loads(previous["feedback_json"]) if previous and previous["feedback_json"] else None
             pack = {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "run_id": run_id,
                     "task_id": task["task_id"], "attempt": run["attempt"], "plan_revision": task["plan_revision"],
+                    "project_id": task["project_id"], "writer_key": task["writer_key"], "queue_seq": task["queue_seq"],
                     "goal": payload.get("goal"), "non_goals": payload.get("non_goals", []),
                     "workspace": payload["workspace"], "allowed_paths": payload.get("allowed_paths", []),
                     "protected_paths": payload.get("protected_paths", {}), "checks": payload.get("checks", []),
@@ -962,13 +1073,33 @@ class Orchestrator:
 
     def status(self) -> Dict[str, Any]:
         with self.connect() as conn:
-            tasks = [dict(row) for row in conn.execute("SELECT task_id,plan_revision,ordinal,status,updated_at FROM tasks ORDER BY ordinal,task_id")]
-            runs = [dict(row) for row in conn.execute("SELECT run_id,task_id,attempt,worker_id,state,started_at,heartbeat_at,snapshot_id,verify_status,review_status,completed_at,error FROM runs ORDER BY started_at")]
-            events = [dict(row) for row in conn.execute("SELECT seq,ts,kind,task_id,run_id,payload_json FROM events ORDER BY seq DESC LIMIT 30")]
+            tasks = [
+                dict(row) for row in conn.execute(
+                    "SELECT task_id,plan_revision,ordinal,project_id,writer_key,queue_seq,status,updated_at "
+                    "FROM tasks ORDER BY queue_seq,task_id"
+                )
+            ]
+            runs = [
+                dict(row) for row in conn.execute(
+                    "SELECT r.run_id,r.task_id,r.attempt,r.worker_id,r.state,r.started_at,r.heartbeat_at,"
+                    "r.snapshot_id,r.verify_status,r.review_status,r.completed_at,r.error,"
+                    "t.project_id,t.writer_key "
+                    "FROM runs r JOIN tasks t ON t.task_id=r.task_id ORDER BY r.started_at"
+                )
+            ]
+            events = [
+                dict(row) for row in conn.execute(
+                    "SELECT seq,ts,kind,task_id,run_id,payload_json FROM events ORDER BY seq DESC LIMIT 30"
+                )
+            ]
             paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
         for event in events:
             event["payload"] = json.loads(event.pop("payload_json"))
-        return {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "paused": json.loads(paused["value_json"]) if paused else None, "tasks": tasks, "runs": runs, "recent_events": events}
+        return {
+            "schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT",
+            "paused": json.loads(paused["value_json"]) if paused else None,
+            "tasks": tasks, "runs": runs, "recent_events": events,
+        }
 
     def pause(self, reason: str) -> Dict[str, Any]:
         details={"reason": reason[:500], "paused_at": utc_now()}
@@ -997,24 +1128,42 @@ class Orchestrator:
         self._revoke_capability(run_id)
         return {"status":"ABORTED", "run_id":run_id, "task_status":state}
 
-    def next_work(self) -> Dict[str, Any]:
+    def next_work(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
         with self.connect() as conn:
             paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
             if paused:
                 return {"status": "PAUSED", "details": json.loads(paused["value_json"])}
-            active = conn.execute("SELECT run_id,task_id,state FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at LIMIT 1", tuple(ACTIVE_RUN_STATES)).fetchone()
-            if active:
-                return {"status": "BUSY", "active": dict(active)}
-            for row in conn.execute("SELECT * FROM tasks ORDER BY ordinal,task_id").fetchall():
+            locks = self._active_writer_locks(conn)
+            blocked_locks: List[Dict[str, Any]] = []
+            for row in conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall():
                 if row["status"] not in READY_TASK_STATES:
+                    continue
+                if project_id is not None and row["project_id"] != project_id:
                     continue
                 payload = self._task_payload(row)
                 if not self._dependencies_done(conn, payload):
                     continue
-                attempts = conn.execute("SELECT COUNT(*) AS n FROM runs WHERE task_id=?", (row["task_id"],)).fetchone()["n"]
-                if attempts < int(payload.get("max_attempts", 2)):
-                    return {"status": "READY", "task_id": row["task_id"], "next_attempt": attempts + 1}
-            return {"status": "NO_WORK"}
+                attempts = conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE task_id=?", (row["task_id"],)
+                ).fetchone()["n"]
+                if attempts >= int(payload.get("max_attempts", 2)):
+                    continue
+                lock = locks.get(row["writer_key"])
+                if lock:
+                    blocked_locks.append(lock)
+                    continue
+                return {
+                    "status": "READY", "task_id": row["task_id"], "project_id": row["project_id"],
+                    "writer_key": row["writer_key"], "queue_seq": row["queue_seq"],
+                    "next_attempt": attempts + 1,
+                }
+            if blocked_locks:
+                unique = {item["run_id"]: item for item in blocked_locks}
+                active = list(unique.values())
+                return {"status": "BUSY", "active": active[0], "locks": active}
+            return {"status": "NO_WORK", "project_id": project_id}
 
     def reconcile(self) -> Dict[str, Any]:
         with self.connect() as conn:

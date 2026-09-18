@@ -54,6 +54,68 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(first['status'],'CLAIMED'); self.assertEqual(second['status'],'BUSY')
         self.assertEqual(second['active']['run_id'],first['run_id'])
 
+    def test_fifo_order_is_preserved_across_separately_loaded_plans(self):
+        self.load([self.task("Z-FIRST")], revision="fifo-p1")
+        path = self.root / "fifo-p2.json"
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "fifo-p2",
+            "tasks": [self.task("A-SECOND")],
+        }) + "\n")
+        self.orch.load_plan(path)
+        first = self.orch.claim("w1")
+        self.assertEqual(first["task_id"], "Z-FIRST")
+        status = self.orch.status()
+        queued = {item["task_id"]: item["queue_seq"] for item in status["tasks"]}
+        self.assertLess(queued["Z-FIRST"], queued["A-SECOND"])
+
+    def test_independent_workspaces_can_be_claimed_concurrently(self):
+        ws2 = Path(self.tmp.name) / "ws2"
+        ws2.mkdir()
+        first = self.task("P1-T1")
+        first["project_id"] = "project-one"
+        second = self.task("P2-T1")
+        second["project_id"] = "project-two"
+        second["workspace"] = str(ws2)
+        self.load([first, second], revision="multi-project")
+        c1 = self.orch.claim("w1")
+        c2 = self.orch.claim("w2")
+        self.assertEqual(c1["task_id"], "P1-T1")
+        self.assertEqual(c2["task_id"], "P2-T1")
+        self.assertNotEqual(c1["context"]["writer_key"], c2["context"]["writer_key"])
+        self.assertEqual(len(self.orch.reconcile()["active_runs"]), 2)
+
+    def test_shared_writer_key_blocks_concurrent_claim_across_workspaces(self):
+        ws2 = Path(self.tmp.name) / "ws2"
+        ws2.mkdir()
+        first = self.task("SHARED-1")
+        second = self.task("SHARED-2")
+        second["workspace"] = str(ws2)
+        first["writer_key"] = "git:shared-fixture"
+        second["writer_key"] = "git:shared-fixture"
+        self.load([first, second], revision="shared-writer")
+        c1 = self.orch.claim("w1")
+        c2 = self.orch.claim("w2")
+        self.assertEqual(c1["status"], "CLAIMED")
+        self.assertEqual(c2["status"], "BUSY")
+        self.assertEqual(c2["active"]["run_id"], c1["run_id"])
+
+    def test_project_scoped_claim_can_skip_earlier_other_project(self):
+        ws2 = Path(self.tmp.name) / "ws2"
+        ws2.mkdir()
+        first = self.task("P1-FIRST")
+        first["project_id"] = "project-one"
+        second = self.task("P2-ONLY")
+        second["project_id"] = "project-two"
+        second["workspace"] = str(ws2)
+        self.load([first, second], revision="scoped-claim")
+        selected = self.orch.claim("w2", project_id="project-two")
+        self.assertEqual(selected["task_id"], "P2-ONLY")
+        self.assertEqual(selected["project_id"], "project-two")
+        next_one = self.orch.next_work(project_id="project-one")
+        self.assertEqual(next_one["status"], "READY")
+        self.assertEqual(next_one["task_id"], "P1-FIRST")
+
     def test_scope_escape_rejected(self):
         self.load([self.task('T1')]); c=self.orch.claim('w')
         receipt=self.root/'bad.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')

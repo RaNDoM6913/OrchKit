@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.3 reliability hardening
+# Agent Workflow Orchestrator — v0.4 multi-project queue
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -35,7 +35,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.3 keeps the v0.2 install model and adds fail-closed recovery/state hardening. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.4 keeps the v0.3 recovery guarantees and adds a durable FIFO queue with project-aware writer isolation. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -157,4 +157,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current 42-test suite covers orchestration/recovery/review, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema migration/integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.

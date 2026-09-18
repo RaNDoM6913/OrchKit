@@ -109,6 +109,18 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(config["profile"], "standard")
         self.assertTrue(config["git"]["allow_commit"])
 
+    def test_registered_project_plan_carries_stable_writer_identity(self):
+        registry = ProjectRegistry(self.home)
+        config = registry.add(self.repo, profile="standard", review_mode="off")["project"]
+        plan = build_single_task_plan(
+            config, task_id="IDENTITY-1", goal="identity", allowed_paths=["identity.json"]
+        )
+        task = plan["tasks"][0]
+        self.assertEqual(task["project_id"], config["project_id"])
+        self.assertEqual(task["writer_key"], config["writer_key"])
+        self.assertTrue(task["writer_key"].startswith("git:"))
+        self.assertEqual(config["inventory_at_registration"]["writer_key"], config["writer_key"])
+
     def test_generated_plan_uses_git_local_when_commit_allowed_without_remote(self):
         config = ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="off")["project"]
         plan = build_single_task_plan(config, task_id="TASK-1", goal="create result", allowed_paths=["result.json"])

@@ -54,6 +54,8 @@ def build_single_task_plan(
     revision = plan_revision or f"{project['project_id']}-{task_id.lower()}-{uuid.uuid4().hex[:8]}"
     task = {
         "id": task_id,
+        "project_id": project["project_id"],
+        "writer_key": project.get("writer_key"),
         "goal": goal.strip(),
         "non_goals": [],
         "workspace": project["root"],

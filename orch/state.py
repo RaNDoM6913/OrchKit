@@ -9,9 +9,7 @@ import tempfile
 from typing import Any, Dict, List
 import zipfile
 
-from .core import ACTIVE_RUN_STATES, Orchestrator, utc_now
-
-STATE_SCHEMA_VERSION = 2
+from .core import ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, Orchestrator, utc_now
 
 
 def _sha256(path: Path) -> str:
@@ -47,7 +45,9 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
         journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         active = [dict(row) for row in conn.execute(
-            "SELECT run_id,task_id,state,heartbeat_at FROM runs WHERE state IN (?,?,?,?,?) ORDER BY started_at",
+            "SELECT r.run_id,r.task_id,r.state,r.heartbeat_at,t.project_id,t.writer_key "
+            "FROM runs r JOIN tasks t ON t.task_id=r.task_id "
+            "WHERE r.state IN (?,?,?,?,?) ORDER BY r.started_at",
             tuple(ACTIVE_RUN_STATES),
         )]
         pending_publications = [dict(row) for row in conn.execute(

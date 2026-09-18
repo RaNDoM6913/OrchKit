@@ -22,7 +22,7 @@ class StateMaintenanceTests(unittest.TestCase):
     def test_fresh_state_has_schema_version_and_integrity(self):
         result = check_state(self.orch)
         self.assertEqual(result["status"], "READY")
-        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["schema_version"], 3)
         self.assertEqual(result["quick_check"], ["ok"])
         self.assertEqual(result["foreign_key_violations"], [])
 
@@ -57,7 +57,7 @@ class StateMaintenanceTests(unittest.TestCase):
         conn = sqlite3.connect(str(extracted))
         try:
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
         finally:
             conn.close()
 
@@ -79,6 +79,44 @@ class StateMaintenanceTests(unittest.TestCase):
             backup_state(self.orch)
         with self.assertRaisesRegex(ValueError, "active_runs_present"):
             prune_capabilities(self.orch)
+
+    def test_schema_v2_tasks_are_migrated_to_project_queue_v3(self):
+        other = Path(self.tmp.name) / "legacy"
+        runtime = other / ".runtime"
+        runtime.mkdir(parents=True)
+        workspace = Path(self.tmp.name) / "legacy-workspace"
+        workspace.mkdir()
+        db = sqlite3.connect(str(runtime / "orch.sqlite3"))
+        try:
+            db.execute(
+                "CREATE TABLE tasks ("
+                "task_id TEXT PRIMARY KEY, plan_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,"
+                "status TEXT NOT NULL, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            payload = {
+                "id": "LEGACY-1", "project_id": "legacy-project", "goal": "legacy",
+                "workspace": str(workspace), "dependencies": [], "allowed_paths": ["out.json"],
+                "protected_paths": {}, "checks": [], "publication": {"kind": "none"},
+            }
+            db.execute(
+                "INSERT INTO tasks(task_id,plan_revision,ordinal,status,payload_json,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                ("LEGACY-1", "legacy-v2", 0, "PLANNED", json.dumps(payload), "2026-01-01T00:00:00Z"),
+            )
+            db.execute("PRAGMA user_version=2")
+            db.commit()
+        finally:
+            db.close()
+        migrated = Orchestrator(other)
+        result = check_state(migrated)
+        self.assertEqual(result["schema_version"], 3)
+        with migrated.connect() as conn:
+            row = conn.execute(
+                "SELECT project_id,writer_key,queue_seq FROM tasks WHERE task_id='LEGACY-1'"
+            ).fetchone()
+        self.assertEqual(row["project_id"], "legacy-project")
+        self.assertTrue(row["writer_key"].startswith("workspace:"))
+        self.assertEqual(row["queue_seq"], 1)
 
     def test_future_state_schema_is_rejected(self):
         other = Path(self.tmp.name) / "future"; runtime = other / ".runtime"

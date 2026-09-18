@@ -94,9 +94,18 @@ def inspect_project(path: Path) -> Dict[str, Any]:
     dirty = _safe_git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z")
     untracked = _safe_git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
     hooks = _safe_git(root, "config", "--get", "core.hooksPath")
+    common_probe = _safe_git(root, "rev-parse", "--git-common-dir")
+    if common_probe.returncode == 0 and common_probe.stdout.strip():
+        common_raw = Path(common_probe.stdout.strip())
+        common_dir = common_raw.resolve() if common_raw.is_absolute() else (root / common_raw).resolve()
+    else:
+        common_dir = (root / ".git").resolve()
+    writer_key = "git:" + hashlib.sha256(str(common_dir).encode("utf-8")).hexdigest()[:32]
     return {
         "requested_path": str(requested),
         "root": str(root),
+        "git_common_dir": str(common_dir),
+        "writer_key": writer_key,
         "branch": branch.stdout.strip() if branch.returncode == 0 else None,
         "head": head.stdout.strip() if head.returncode == 0 else None,
         "origin_url": remote.stdout.strip() if remote.returncode == 0 else None,
@@ -172,6 +181,7 @@ class ProjectRegistry:
             "project_id": project_id,
             "name": display_name,
             "root": str(root),
+            "writer_key": inventory["writer_key"],
             "profile": profile,
             "git": {
                 **defaults["git"],
@@ -205,7 +215,16 @@ class ProjectRegistry:
         path = self._path(project_id)
         if not path.is_file():
             raise ValueError("unknown_project")
-        return json.loads(path.read_text(encoding="utf-8"))
+        config = json.loads(path.read_text(encoding="utf-8"))
+        if not config.get("writer_key") and config.get("root"):
+            root = Path(config["root"]).expanduser().resolve()
+            try:
+                config["writer_key"] = inspect_project(root)["writer_key"]
+            except ValueError:
+                config["writer_key"] = "workspace:" + hashlib.sha256(
+                    str(root).encode("utf-8")
+                ).hexdigest()[:32]
+        return config
 
     def inspect(self, project_id: str) -> Dict[str, Any]:
         config = self.get(project_id)
