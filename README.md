@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.4 multi-project queue
+# Agent Workflow Orchestrator — v0.5 recovery productization
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -35,7 +35,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.4 keeps the v0.3 recovery guarantees and adds a durable FIFO queue with project-aware writer isolation. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.5 keeps the v0.4 multi-project queue/writer-isolation guarantees and adds production recovery around publication, project lifecycle, backup verification, fresh-home restore, crash-safe standalone-home replacement/rollback, and unified recovery inspection. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -43,7 +43,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current `agent_workflow_orchestrator-0.4.0-py3-none-any.whl` was built offline and installed into a clean temporary venv on 2026-09-18. The installed `orch` console command reported 0.4.0, initialized private schema-v3 state, registered a disposable Git project, durably enqueued and listed a task, and rendered the packaged dispatcher prompt.
+The current `agent_workflow_orchestrator-0.5.0-py3-none-any.whl` was built offline on 2026-09-18 and installed into a clean temporary Python 3.9 venv without network/package-index access. The installed console command reported `orch 0.5.0` and passed registration/ledger, durable queue, backup verification, fresh restore, dispatcher regeneration, crash-safe replacement inspection, rollback/finalization, and final state-health smoke checks. The exact wheel size and SHA-256 are recorded in `docs/42_V05_RECOVERY_PRODUCTIZATION.md` so the package long-description does not become self-referential.
 
 First-run flow for another user:
 
@@ -199,4 +199,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration, dirty-byte protection, Git policy, publication crash reconciliation, state-schema migration/integrity/backups, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **118-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
