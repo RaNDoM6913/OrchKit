@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.6 multi-project security
+# Agent Workflow Orchestrator — v0.7 readiness and ledger authority
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -35,7 +35,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.6 keeps the v0.5 recovery guarantees and adds sandboxed Git publication transport plus project-scoped Scheduled ChatGPT dispatchers for safe concurrent multi-project operation. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.7 keeps the v0.6 multi-project transport/dispatcher guarantees and adds read-only project readiness auditing plus fail-closed authoritative-ledger operation and task-admission guards. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -43,7 +43,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current agent_workflow_orchestrator-0.6.0-py3-none-any.whl was built offline on 2026-09-18 and installed into a fresh disposable Python 3.9 venv without network/package-index access. The installed console command reported orch 0.6.0 and passed project-scoped dispatcher rendering plus an end-to-end durable queue/claim/verify/sandboxed-publication smoke against a disposable local bare remote. Exact wheel size, SHA-256 and installed evidence are recorded in docs/45_V06_MULTI_PROJECT_SECURITY.md.
+The current agent_workflow_orchestrator-0.7.0-py3-none-any.whl was built offline on 2026-09-18 and installed into a fresh disposable Python 3.9 venv without network/package-index access. The installed console command reported orch 0.7.0 and passed project readiness auditing, readiness-gated task admission, project-scoped dispatch, and fail-closed authoritative-ledger loss handling. Exact wheel size, SHA-256 and installed evidence are recorded in docs/48_V07_READINESS_LEDGER_AUTHORITY.md.
 
 First-run flow for another user:
 
