@@ -183,32 +183,79 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+
+def _command_requires_existing_ledger(args: argparse.Namespace) -> bool:
+    if args.command in {
+        "setup", "doctor", "rdc", "dispatcher", "git",
+        "codex-preflight", "project", "init",
+    }:
+        return False
+    if (
+        args.command == "state"
+        and args.state_command in {
+            "verify-backup", "restore-backup",
+            "replace-backup", "replace-reconcile",
+        }
+    ):
+        return False
+    if (
+        args.command == "recovery"
+        and args.recovery_command == "inspect"
+        and args.replacement_home is not None
+        and args.run_id is None
+        and args.project is None
+    ):
+        return False
+    return True
+
+
+def _open_existing_orchestrator(root: Path) -> Orchestrator:
+    runtime = root / ".runtime"
+    db = runtime / "orch.sqlite3"
+    if (
+        runtime.is_symlink()
+        or not runtime.is_dir()
+        or db.is_symlink()
+        or not db.is_file()
+    ):
+        raise ValueError("state_ledger_missing_or_unsafe")
+    return Orchestrator(root)
+
+
+def _initialize_fresh_or_existing_orchestrator(root: Path) -> Orchestrator:
+    runtime = root / ".runtime"
+    db = runtime / "orch.sqlite3"
+    if runtime.exists():
+        if runtime.is_symlink() or not runtime.is_dir():
+            raise ValueError("state_ledger_missing_or_unsafe")
+        if db.exists():
+            if db.is_symlink() or not db.is_file():
+                raise ValueError("state_ledger_missing_or_unsafe")
+            return Orchestrator(root)
+        if any(runtime.iterdir()):
+            raise ValueError("state_ledger_missing_or_unsafe")
+
+    projects = root / "projects"
+    if projects.exists():
+        if projects.is_symlink() or not projects.is_dir():
+            raise ValueError("project_registry_missing_or_unsafe")
+        if any(projects.iterdir()):
+            raise ValueError("registered_project_authority_without_ledger")
+
+    return Orchestrator(root)
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     root = root_from_args(args)
-    state_independent = (
-        args.command in {
-            "setup", "doctor", "rdc", "dispatcher", "git", "codex-preflight",
-        }
-        or args.command == "project"
-        or (
-            args.command == "state"
-            and args.state_command in {
-                "verify-backup", "restore-backup",
-                "replace-backup", "replace-reconcile",
-            }
-        )
-        or (
-            args.command == "recovery"
-            and args.recovery_command == "inspect"
-            and args.replacement_home is not None
-            and args.run_id is None
-            and args.project is None
-        )
-    )
-    orch = None if state_independent else Orchestrator(root)
+    orch = None
     try:
+        if args.command == "init":
+            orch = _initialize_fresh_or_existing_orchestrator(root)
+        elif _command_requires_existing_ledger(args):
+            orch = _open_existing_orchestrator(root)
+
         if args.command == "setup":
             result = configure_home(root, profile=args.profile)
             result["status"] = "READY_FOR_PROJECT_REGISTRATION"
@@ -239,7 +286,7 @@ def main(argv=None) -> int:
             else:
                 registry = ProjectRegistry(root)
             if args.project_command == "add":
-                ledger = Orchestrator(root)
+                ledger = _initialize_fresh_or_existing_orchestrator(root)
                 result = registry.add(
                     Path(args.path), name=args.name, profile=args.profile,
                     review_mode=args.review_mode, reviewer=args.reviewer,
@@ -258,14 +305,24 @@ def main(argv=None) -> int:
             elif args.project_command == "audit":
                 pass
             elif args.project_command == "make-plan":
-                plan = build_single_task_plan(
-                    registry.get(args.project_id), task_id=args.task_id, goal=args.goal,
-                    allowed_paths=args.allowed_path, risk_tags=args.risk_tag,
-                    owner_acceptance=args.owner_approval, plan_revision=args.plan_revision,
-                    dependencies=args.depends, max_attempts=args.max_attempts,
-                )
-                result = write_plan(Path(args.output).expanduser(), plan)
-                result["plan"] = plan
+                readiness = audit_project(root, args.project_id)
+                if readiness["status"] == "BLOCKED":
+                    result = {
+                        "status": "BLOCKED",
+                        "reason": "project_readiness_blocked",
+                        "project_id": args.project_id,
+                        "audit": readiness,
+                    }
+                else:
+                    plan = build_single_task_plan(
+                        registry.get(args.project_id), task_id=args.task_id, goal=args.goal,
+                        allowed_paths=args.allowed_path, risk_tags=args.risk_tag,
+                        owner_acceptance=args.owner_approval, plan_revision=args.plan_revision,
+                        dependencies=args.depends, max_attempts=args.max_attempts,
+                    )
+                    result = write_plan(Path(args.output).expanduser(), plan)
+                    result["plan"] = plan
+                    result["audit_status"] = readiness["status"]
             elif args.project_command == "remove":
                 registry.get(args.project_id)
                 db_path = root / ".runtime" / "orch.sqlite3"
@@ -308,37 +365,47 @@ def main(argv=None) -> int:
             elif args.queue_command == "resume-project":
                 result = orch.resume_project(args.project_id)
             elif args.queue_command == "enqueue":
-                registry = ProjectRegistry(root)
-                plan = build_single_task_plan(
-                    registry.get(args.project_id),
-                    task_id=args.task_id,
-                    goal=args.goal,
-                    allowed_paths=args.allowed_path,
-                    risk_tags=args.risk_tag,
-                    owner_acceptance=args.owner_approval,
-                    plan_revision=args.plan_revision,
-                    dependencies=args.depends,
-                    max_attempts=args.max_attempts,
-                )
-                plans_dir = ensure_private_dir(root / "plans")
-                plan_path = plans_dir / f"{plan['plan_revision']}.json"
-                existed = plan_path.exists()
-                written = write_plan(plan_path, plan, replace=False)
-                try:
-                    loaded = orch.load_plan(plan_path)
-                except Exception:
-                    if not existed and written["status"] == "CREATED" and plan_path.is_file() and not plan_path.is_symlink():
-                        plan_path.unlink()
-                    raise
-                result = {
-                    "status": "ENQUEUED",
-                    "task_id": args.task_id,
-                    "project_id": args.project_id,
-                    "plan_revision": plan["plan_revision"],
-                    "plan_path": written["path"],
-                    "plan_artifact_status": written["status"],
-                    "load": loaded,
-                }
+                readiness = audit_project(root, args.project_id)
+                if readiness["status"] == "BLOCKED":
+                    result = {
+                        "status": "BLOCKED",
+                        "reason": "project_readiness_blocked",
+                        "project_id": args.project_id,
+                        "audit": readiness,
+                    }
+                else:
+                    registry = ProjectRegistry(root)
+                    plan = build_single_task_plan(
+                        registry.get(args.project_id),
+                        task_id=args.task_id,
+                        goal=args.goal,
+                        allowed_paths=args.allowed_path,
+                        risk_tags=args.risk_tag,
+                        owner_acceptance=args.owner_approval,
+                        plan_revision=args.plan_revision,
+                        dependencies=args.depends,
+                        max_attempts=args.max_attempts,
+                    )
+                    plans_dir = ensure_private_dir(root / "plans")
+                    plan_path = plans_dir / f"{plan['plan_revision']}.json"
+                    existed = plan_path.exists()
+                    written = write_plan(plan_path, plan, replace=False)
+                    try:
+                        loaded = orch.load_plan(plan_path)
+                    except Exception:
+                        if not existed and written["status"] == "CREATED" and plan_path.is_file() and not plan_path.is_symlink():
+                            plan_path.unlink()
+                        raise
+                    result = {
+                        "status": "ENQUEUED",
+                        "task_id": args.task_id,
+                        "project_id": args.project_id,
+                        "plan_revision": plan["plan_revision"],
+                        "plan_path": written["path"],
+                        "plan_artifact_status": written["status"],
+                        "audit_status": readiness["status"],
+                        "load": loaded,
+                    }
             else:
                 raise ValueError("unknown_queue_command")
         elif args.command == "git":

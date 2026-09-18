@@ -377,6 +377,7 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(config["inventory_at_registration"]["writer_key"], config["writer_key"])
 
     def test_queue_enqueue_compiles_registered_project_and_cross_plan_dependency(self):
+        Orchestrator(self.home)
         registry = ProjectRegistry(self.home)
         config = registry.add(self.repo, profile="standard", review_mode="off")["project"]
 
