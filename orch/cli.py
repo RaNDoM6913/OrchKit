@@ -14,6 +14,7 @@ from .dispatcher import bootstrap_prompt, read_rdc, record_rdc, render_dispatche
 from .git_policy import evaluate_project_git_policy
 from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
+from .readiness import audit_project
 from .review_policy import MODES, REVIEWERS
 from .state import (backup_state, check_state, inspect_home_replacement,
                     migration_history, prune_capabilities, prune_retention,
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     project_sub.add_parser("list")
     show = project_sub.add_parser("show"); show.add_argument("project_id")
     inspect = project_sub.add_parser("inspect"); inspect.add_argument("project_id")
+    audit = project_sub.add_parser("audit"); audit.add_argument("project_id"); audit.add_argument("--require-dispatcher", action="store_true")
     make_plan = project_sub.add_parser("make-plan")
     make_plan.add_argument("project_id")
     make_plan.add_argument("--task-id", required=True)
@@ -228,7 +230,14 @@ def main(argv=None) -> int:
             output = Path(args.output).expanduser().resolve() if args.output else None
             result = render_dispatcher(root, output=output, project_id=args.project)
         elif args.command == "project":
-            registry = ProjectRegistry(root)
+            if args.project_command == "audit":
+                result = audit_project(
+                    root, args.project_id,
+                    require_dispatcher=args.require_dispatcher,
+                )
+                registry = None
+            else:
+                registry = ProjectRegistry(root)
             if args.project_command == "add":
                 ledger = Orchestrator(root)
                 result = registry.add(
@@ -246,6 +255,8 @@ def main(argv=None) -> int:
                 result = {"status": "OK", "project": registry.get(args.project_id)}
             elif args.project_command == "inspect":
                 result = {"status": "OK", **registry.inspect(args.project_id)}
+            elif args.project_command == "audit":
+                pass
             elif args.project_command == "make-plan":
                 plan = build_single_task_plan(
                     registry.get(args.project_id), task_id=args.task_id, goal=args.goal,

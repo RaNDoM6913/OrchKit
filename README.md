@@ -55,6 +55,7 @@ orch rdc bootstrap-prompt
 orch rdc show
 orch project add /absolute/path/to/repo --profile standard --review-mode risk_based
 orch project list
+orch project audit PROJECT_ID
 orch git policy PROJECT_ID
 orch dispatcher render
 ```
@@ -98,6 +99,8 @@ A project pause affects only new dispatch. Existing active runs keep their expli
 `orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. CLI registration creates the authoritative SQLite ledger up front; deregistration refuses to manufacture an empty ledger if that state file is missing or unsafe. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
 
 The registry also enforces one project identity per exact resolved workspace root: the same root cannot be registered again under a different name. Distinct linked Git worktrees remain separate project roots but share the same Git writer isolation.
+
+The project audit command performs a read-only readiness/security census before new work is entrusted to a registered project. It validates registry/root/writer identity, durable ledger integrity, queue/recovery reservations, protected and newly foreign workspace bytes, Git/publication transport policy, RDC binding, and optional project-scoped dispatcher state. Use --require-dispatcher when autonomous Scheduled ChatGPT dispatch is part of the readiness contract. The audit never creates a missing ledger or edits the target repository.
 
 Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
 
@@ -201,4 +204,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current **125-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **138-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
