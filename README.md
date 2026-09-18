@@ -1,4 +1,4 @@
-# Agent Workflow Orchestrator — v0.8 batch admission and verifier authority
+# Agent Workflow Orchestrator — v0.9 claim boundary hardening
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
@@ -36,7 +36,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.8 keeps the v0.7 readiness/ledger guarantees and adds admission-bound verifier execution authority, atomic provenance-bound batch task admission, dynamic Git base binding behind unresolved project work, and readiness visibility for queued verifier-authority drift. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.9 keeps the v0.8 batch/verifier-authority guarantees and adds durable claim-time Git base binding (state schema v4) plus fail-closed pre-claim workspace/protected/check-authority validation before a writer capability is issued. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -44,7 +44,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current agent_workflow_orchestrator-0.8.0-py3-none-any.whl is built offline and validated from a clean disposable installation. The installed acceptance covers atomic batch DAG admission, sequential publication of pre-queued Git tasks across an advancing branch, and read-only detection of queued verifier-authority drift. Exact wheel size, SHA-256, commits and installed evidence are recorded in docs/52_V08_BATCH_VERIFIER_AUTHORITY.md.
+The current agent_workflow_orchestrator-0.9.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers schema-v4 state, advancing-base pre-queued Git work, claim-time HEAD persistence, foreign-commit rejection after claim, and pre-claim refusal without capability when foreign workspace bytes already exist. Exact wheel size, SHA-256 and evidence are recorded in docs/55_V09_CLAIM_BOUNDARY_RELEASE.md.
 
 First-run flow for another user:
 
