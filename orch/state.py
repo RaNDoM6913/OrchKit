@@ -1103,7 +1103,18 @@ def replace_home_from_backup(path: Path, destination: Path) -> Dict[str, Any]:
         "old_schema_version": health["schema_version"],
         "new_schema_version": restored["restored_schema_version"],
     }
-    _replacement_write(journal_path, data)
+    try:
+        _replacement_write(journal_path, data)
+    except Exception:
+        if (
+            prepared.is_dir()
+            and not prepared.is_symlink()
+            and _restored_home_matches(prepared, data["archive_sha256"])
+            and _old_home_identity_matches(dest, data)
+        ):
+            shutil.rmtree(prepared)
+            _fsync_directory(parent)
+        raise
     try:
         _replacement_rename(dest, rollback)
         _fsync_directory(parent)
@@ -1540,6 +1551,71 @@ def reconcile_home_replacement(
     }
 
 
+def _replacement_artifact_census(
+    destination: Path, *, referenced: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
+    dest = destination.expanduser().resolve()
+    parent = dest.parent
+    refs = {
+        str(item.expanduser().resolve())
+        for item in (referenced or [])
+    }
+    prefixes = (
+        f".{dest.name}.replacement-",
+        f".{dest.name}.rollback-",
+        f".{dest.name}.discard-",
+        f".{dest.name}.failed-",
+        f".{dest.name}.restore-",
+        f"..{dest.name}.replacement-",
+    )
+    artifacts: List[Dict[str, Any]] = []
+    if not parent.exists() or parent.is_symlink() or not parent.is_dir():
+        return {
+            "status": "BLOCKED",
+            "reason": "replacement_parent_unsafe",
+            "bytes": 0,
+            "artifacts": [],
+            "unmanaged": [],
+        }
+    for item in sorted(parent.iterdir(), key=lambda candidate: candidate.name):
+        if not any(item.name.startswith(prefix) for prefix in prefixes):
+            continue
+        record: Dict[str, Any] = {
+            "path": str(item),
+            "name": item.name,
+            "referenced": str(item.resolve()) in refs if not item.is_symlink() else False,
+        }
+        if item.is_symlink():
+            record["status"] = "UNSAFE_SYMLINK"
+            record["bytes"] = 0
+        elif item.is_dir():
+            size = _safe_tree_size(item)
+            if size is None:
+                record["status"] = "UNSAFE_TREE"
+                record["bytes"] = 0
+            else:
+                record["status"] = "REFERENCED" if record["referenced"] else "UNMANAGED"
+                record["bytes"] = size
+        elif item.is_file():
+            size = _regular_file_size(item)
+            record["status"] = "REFERENCED" if record["referenced"] else "UNMANAGED"
+            record["bytes"] = int(size or 0)
+        else:
+            record["status"] = "UNSAFE_NODE"
+            record["bytes"] = 0
+        artifacts.append(record)
+    unmanaged = [
+        item for item in artifacts
+        if item["status"] != "REFERENCED"
+    ]
+    return {
+        "status": "ATTENTION" if unmanaged else "READY",
+        "bytes": sum(int(item.get("bytes", 0)) for item in artifacts),
+        "artifacts": artifacts,
+        "unmanaged": unmanaged,
+    }
+
+
 def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
     dest = destination.expanduser().resolve()
     journal_path = _replacement_journal_path(dest)
@@ -1552,11 +1628,27 @@ def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
             "safe_next_steps": [],
         }
     if not journal_path.is_file():
+        census = _replacement_artifact_census(dest)
+        if census["status"] != "READY":
+            return {
+                "status": "ATTENTION" if census["status"] == "ATTENTION" else "BLOCKED",
+                "classification": "ORPHAN_REPLACEMENT_ARTIFACTS",
+                "destination": str(dest),
+                "journal": str(journal_path),
+                "artifact_census": census,
+                "safe_next_steps": [],
+                "operator_note": (
+                    "No authoritative replacement journal exists. "
+                    "Do not delete sibling artifacts automatically."
+                ),
+                "automatic_action": False,
+            }
         return {
             "status": "CLEAN",
             "classification": "NO_REPLACEMENT",
             "destination": str(dest),
             "journal": str(journal_path),
+            "artifact_census": census,
             "safe_next_steps": [],
         }
     try:
@@ -1575,6 +1667,9 @@ def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
     rollback_home = Path(data["rollback_home"])
     discard = Path(data["discard_home"])
     failed = Path(data["failed_home"])
+    census = _replacement_artifact_census(
+        dest, referenced=[prepared, rollback_home, discard, failed]
+    )
     archive_sha = data.get("archive_sha256")
     if not isinstance(archive_sha, str):
         return {
@@ -1776,6 +1871,7 @@ def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
             "journal_status": status,
             "operation_id": data.get("operation_id"),
             "observed": observed,
+            "artifact_census": census,
             "safe_next_steps": [],
         }
     return {
@@ -1786,6 +1882,7 @@ def inspect_home_replacement(destination: Path) -> Dict[str, Any]:
         "journal_status": status,
         "operation_id": data.get("operation_id"),
         "observed": observed,
+        "artifact_census": census,
         "safe_next_steps": actions,
         "automatic_action": False,
     }

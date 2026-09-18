@@ -734,6 +734,60 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertIn("--finalize", inspected["safe_next_steps"][0])
         reconcile_home_replacement(live, finalize=True)
 
+    def test_replacement_initial_journal_failure_cleans_prepared_home(self):
+        live, _source, archive = self._replacement_fixture("initial-journal-fail")
+        with mock.patch.object(
+            state_module, "_replacement_write",
+            side_effect=OSError("synthetic initial journal failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic initial journal failure"):
+                replace_home_from_backup(archive, live)
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(inspected["status"], "CLEAN")
+        self.assertEqual(inspected["classification"], "NO_REPLACEMENT")
+        self.assertEqual(inspected["artifact_census"]["artifacts"], [])
+        self.assertTrue((live / ".runtime" / "logs" / "old.json").is_file())
+
+    def test_replacement_inspect_reports_orphan_sibling_without_journal(self):
+        live, _source, _archive = self._replacement_fixture("orphan-census")
+        orphan = live.parent / f".{live.name}.rollback-orphan"
+        orphan.mkdir()
+        (orphan / "state.bin").write_bytes(b"x" * 37)
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(inspected["status"], "ATTENTION")
+        self.assertEqual(
+            inspected["classification"], "ORPHAN_REPLACEMENT_ARTIFACTS"
+        )
+        self.assertTrue(orphan.exists())
+        census = inspected["artifact_census"]
+        self.assertEqual(census["status"], "ATTENTION")
+        self.assertGreaterEqual(census["bytes"], 37)
+        self.assertEqual(
+            Path(census["unmanaged"][0]["path"]).resolve(), orphan.resolve()
+        )
+        self.assertEqual(inspected["safe_next_steps"], [])
+
+    def test_replacement_inspect_exposes_unmanaged_sibling_with_active_journal(self):
+        live, _source, archive = self._replacement_fixture("active-extra-census")
+        result = replace_home_from_backup(archive, live)
+        extra = live.parent / f".{live.name}.failed-orphan"
+        extra.mkdir()
+        (extra / "extra.bin").write_bytes(b"extra")
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(
+            inspected["classification"], "REPLACEMENT_ROLLBACK_AVAILABLE"
+        )
+        census = inspected["artifact_census"]
+        self.assertEqual(census["status"], "ATTENTION")
+        unmanaged_paths = {item["path"] for item in census["unmanaged"]}
+        self.assertIn(str(extra.resolve()), unmanaged_paths)
+        referenced_paths = {
+            item["path"] for item in census["artifacts"]
+            if item["status"] == "REFERENCED"
+        }
+        self.assertIn(result["rollback_home"], referenced_paths)
+        reconcile_home_replacement(live, finalize=True)
+
     def test_backup_refuses_active_writer(self):
         workspace = Path(self.tmp.name) / "ws"; workspace.mkdir()
         plan = {
