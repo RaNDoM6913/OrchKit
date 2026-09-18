@@ -1022,16 +1022,20 @@ def _replacement_load(destination: Path) -> Tuple[Path, Dict[str, Any]]:
     prepared = Path(data.get("prepared_home", "")).expanduser().resolve()
     rollback = Path(data.get("rollback_home", "")).expanduser().resolve()
     discard = Path(data.get("discard_home", "")).expanduser().resolve()
+    failed = Path(data.get("failed_home", "")).expanduser().resolve()
     prefix_prepared = f".{dest.name}.replacement-"
     prefix_rollback = f".{dest.name}.rollback-"
     prefix_discard = f".{dest.name}.discard-"
+    prefix_failed = f".{dest.name}.failed-"
     if (
         prepared.parent != parent
         or rollback.parent != parent
         or discard.parent != parent
+        or failed.parent != parent
         or not prepared.name.startswith(prefix_prepared)
         or not rollback.name.startswith(prefix_rollback)
         or not discard.name.startswith(prefix_discard)
+        or not failed.name.startswith(prefix_failed)
     ):
         raise ValueError("replacement_journal_path_unsafe")
     return journal, data
@@ -1075,9 +1079,11 @@ def replace_home_from_backup(path: Path, destination: Path) -> Dict[str, Any]:
 
     operation_id = uuid.uuid4().hex
     parent = dest.parent
+    old_stat = dest.stat()
     prepared = parent / f".{dest.name}.replacement-{operation_id}"
     rollback = parent / f".{dest.name}.rollback-{operation_id}"
     discard = parent / f".{dest.name}.discard-{operation_id}"
+    failed = parent / f".{dest.name}.failed-{operation_id}"
     restored = restore_backup_archive(path, prepared)
     data = {
         "schema_version": 1,
@@ -1088,6 +1094,9 @@ def replace_home_from_backup(path: Path, destination: Path) -> Dict[str, Any]:
         "prepared_home": str(prepared),
         "rollback_home": str(rollback),
         "discard_home": str(discard),
+        "failed_home": str(failed),
+        "old_root_device": int(old_stat.st_dev),
+        "old_root_inode": int(old_stat.st_ino),
         "archive": str(path.expanduser().resolve()),
         "archive_sha256": restored["archive_sha256"],
         "old_schema_version": health["schema_version"],
@@ -1123,16 +1132,30 @@ def replace_home_from_backup(path: Path, destination: Path) -> Dict[str, Any]:
     }
 
 
+def _old_home_identity_matches(path: Path, data: Dict[str, Any]) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        stat = path.stat()
+        expected_dev = int(data["old_root_device"])
+        expected_ino = int(data["old_root_inode"])
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return int(stat.st_dev) == expected_dev and int(stat.st_ino) == expected_ino
+
+
 def reconcile_home_replacement(
     destination: Path, *, resume: bool = False, finalize: bool = False,
+    rollback: bool = False,
 ) -> Dict[str, Any]:
-    if resume and finalize:
+    if sum(bool(item) for item in (resume, finalize, rollback)) > 1:
         raise ValueError("replacement_action_conflict")
     dest = destination.expanduser().resolve()
     journal, data = _replacement_load(dest)
     prepared = Path(data["prepared_home"])
-    rollback = Path(data["rollback_home"])
+    rollback_home = Path(data["rollback_home"])
     discard = Path(data["discard_home"])
+    failed = Path(data["failed_home"])
     parent = dest.parent
     status = data.get("status")
     archive_sha = data.get("archive_sha256")
@@ -1141,8 +1164,9 @@ def reconcile_home_replacement(
 
     dest_exists = dest.is_dir() and not dest.is_symlink()
     prepared_exists = prepared.is_dir() and not prepared.is_symlink()
-    rollback_exists = rollback.is_dir() and not rollback.is_symlink()
+    rollback_exists = rollback_home.is_dir() and not rollback_home.is_symlink()
     discard_exists = discard.is_dir() and not discard.is_symlink()
+    failed_exists = failed.is_dir() and not failed.is_symlink()
     dest_is_new = dest_exists and _restored_home_matches(dest, archive_sha)
 
     if status == "PREPARED":
@@ -1170,7 +1194,7 @@ def reconcile_home_replacement(
                 "prepared_home": str(prepared),
                 "journal": str(journal),
             }
-        _replacement_rename(dest, rollback)
+        _replacement_rename(dest, rollback_home)
         _fsync_directory(parent)
         status = "OLD_MOVED"
         data["status"] = status
@@ -1189,7 +1213,7 @@ def reconcile_home_replacement(
                 return {
                     "status": "OLD_MOVED",
                     "resume_available": True,
-                    "rollback_home": str(rollback),
+                    "rollback_home": str(rollback_home),
                     "prepared_home": str(prepared),
                     "journal": str(journal),
                 }
@@ -1211,14 +1235,14 @@ def reconcile_home_replacement(
     if status == "NEW_ACTIVE":
         if (
             dest_is_new and not prepared.exists()
-            and not rollback.exists() and discard_exists
+            and not rollback_home.exists() and discard_exists
         ):
             status = "FINALIZE_PENDING_DELETE"
             data["status"] = status
             _replacement_write(journal, data)
         elif not (
             dest.is_dir() and not dest.is_symlink()
-            and rollback.is_dir() and not rollback.is_symlink()
+            and rollback_home.is_dir() and not rollback_home.is_symlink()
             and not prepared.exists()
             and not discard.exists()
             and _restored_home_matches(dest, archive_sha)
@@ -1228,32 +1252,234 @@ def reconcile_home_replacement(
                 "reason": "replacement_new_active_not_proven",
                 "journal_status": status,
             }
+        elif rollback:
+            rollback_inventory = _standalone_home_inventory(rollback_home)
+            if (
+                rollback_inventory["status"] != "SAFE"
+                or not _old_home_identity_matches(rollback_home, data)
+                or failed.exists()
+                or discard.exists()
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_rollback_home_not_proven",
+                }
+            status = "ROLLBACK_PREPARED"
+            data["status"] = status
+            _replacement_write(journal, data)
         elif not finalize:
             return {
                 "status": "REPLACED_ROLLBACK_AVAILABLE",
                 "destination": str(dest),
-                "rollback_home": str(rollback),
+                "rollback_home": str(rollback_home),
                 "journal": str(journal),
                 "finalize_available": True,
+                "rollback_available": True,
             }
         else:
-            rollback_inventory = _standalone_home_inventory(rollback)
+            rollback_inventory = _standalone_home_inventory(rollback_home)
             if rollback_inventory["status"] != "SAFE":
                 return {
                     "status": "BLOCKED",
                     "reason": "replacement_rollback_home_not_standalone",
                 }
-            _replacement_rename(rollback, discard)
+            _replacement_rename(rollback_home, discard)
             _fsync_directory(parent)
             status = "FINALIZE_PENDING_DELETE"
             data["status"] = status
             _replacement_write(journal, data)
 
+    if status == "ROLLBACK_PREPARED":
+        dest_is_new = (
+            dest.is_dir() and not dest.is_symlink()
+            and _restored_home_matches(dest, archive_sha)
+        )
+        rollback_is_old = _old_home_identity_matches(rollback_home, data)
+        failed_is_new = (
+            failed.is_dir() and not failed.is_symlink()
+            and _restored_home_matches(failed, archive_sha)
+        )
+        if not dest.exists() and rollback_is_old and failed_is_new:
+            status = "ROLLBACK_NEW_MOVED"
+            data["status"] = status
+            _replacement_write(journal, data)
+        elif (
+            _old_home_identity_matches(dest, data)
+            and not rollback_home.exists()
+            and failed_is_new
+        ):
+            status = "ROLLED_BACK"
+            data["status"] = status
+            _replacement_write(journal, data)
+        elif not (
+            dest_is_new
+            and rollback_is_old
+            and not failed.exists()
+            and not discard.exists()
+            and not prepared.exists()
+        ):
+            return {
+                "status": "BLOCKED",
+                "reason": "replacement_rollback_state_ambiguous",
+                "journal_status": status,
+            }
+        if status == "ROLLBACK_PREPARED":
+            if not rollback:
+                return {
+                    "status": "ROLLBACK_PREPARED",
+                    "rollback_resume_available": True,
+                    "journal": str(journal),
+                }
+            _replacement_rename(dest, failed)
+            _fsync_directory(parent)
+            status = "ROLLBACK_NEW_MOVED"
+            data["status"] = status
+            _replacement_write(journal, data)
+
+    if status == "ROLLBACK_NEW_MOVED":
+        rollback_is_old = _old_home_identity_matches(rollback_home, data)
+        failed_is_new = (
+            failed.is_dir() and not failed.is_symlink()
+            and _restored_home_matches(failed, archive_sha)
+        )
+        if (
+            _old_home_identity_matches(dest, data)
+            and not rollback_home.exists()
+            and failed_is_new
+        ):
+            status = "ROLLED_BACK"
+            data["status"] = status
+            _replacement_write(journal, data)
+        elif not (
+            not dest.exists()
+            and rollback_is_old
+            and failed_is_new
+            and not discard.exists()
+        ):
+            return {
+                "status": "BLOCKED",
+                "reason": "replacement_rollback_state_ambiguous",
+                "journal_status": status,
+            }
+        if status == "ROLLBACK_NEW_MOVED":
+            if not rollback:
+                return {
+                    "status": "ROLLBACK_NEW_MOVED",
+                    "rollback_resume_available": True,
+                    "rollback_home": str(rollback_home),
+                    "failed_home": str(failed),
+                    "journal": str(journal),
+                }
+            _replacement_rename(rollback_home, dest)
+            _fsync_directory(parent)
+            status = "ROLLED_BACK"
+            data["status"] = status
+            _replacement_write(journal, data)
+
+    if status == "ROLLED_BACK":
+        failed_is_new = (
+            failed.is_dir() and not failed.is_symlink()
+            and _restored_home_matches(failed, archive_sha)
+        )
+        if (
+            _old_home_identity_matches(dest, data)
+            and not rollback_home.exists()
+            and not failed.exists()
+            and discard.is_dir()
+            and not discard.is_symlink()
+        ):
+            status = "ROLLBACK_FINALIZE_PENDING_DELETE"
+            data["status"] = status
+            _replacement_write(journal, data)
+        elif not (
+            _old_home_identity_matches(dest, data)
+            and not rollback_home.exists()
+            and failed_is_new
+            and not discard.exists()
+            and not prepared.exists()
+        ):
+            return {
+                "status": "BLOCKED",
+                "reason": "replacement_rolled_back_not_proven",
+                "journal_status": status,
+            }
+        if status == "ROLLED_BACK":
+            if not finalize:
+                return {
+                    "status": "ROLLED_BACK_FORWARD_COPY_AVAILABLE",
+                    "destination": str(dest),
+                    "failed_home": str(failed),
+                    "journal": str(journal),
+                    "finalize_available": True,
+                }
+            _replacement_rename(failed, discard)
+            _fsync_directory(parent)
+            status = "ROLLBACK_FINALIZE_PENDING_DELETE"
+            data["status"] = status
+            _replacement_write(journal, data)
+
+    if status == "ROLLBACK_FINALIZE_PENDING_DELETE":
+        if not (
+            _old_home_identity_matches(dest, data)
+            and not rollback_home.exists()
+            and not failed.exists()
+            and not prepared.exists()
+        ):
+            return {
+                "status": "BLOCKED",
+                "reason": "replacement_rollback_finalize_state_ambiguous",
+                "journal_status": status,
+            }
+        if discard.exists():
+            if discard.is_symlink() or not discard.is_dir():
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_home_unsafe",
+                }
+            if not finalize:
+                return {
+                    "status": "ROLLBACK_FINALIZE_PENDING_DELETE",
+                    "finalize_available": True,
+                    "discard_home": str(discard),
+                    "journal": str(journal),
+                }
+            shutil.rmtree(discard)
+            _fsync_directory(parent)
+        elif not finalize:
+            return {
+                "status": "ROLLBACK_FINALIZE_PENDING_DELETE",
+                "finalize_available": True,
+                "discard_home": str(discard),
+                "journal": str(journal),
+            }
+        receipt = {
+            "schema_version": 1,
+            "operation_id": data["operation_id"],
+            "finalized_at": utc_now(),
+            "archive_sha256": archive_sha,
+            "outcome": "ROLLED_BACK",
+            "failed_new_home_discarded": str(failed),
+        }
+        receipt_path = dest / "replacement-receipt.json"
+        atomic_write_json(receipt_path, receipt, mode=0o600)
+        data["status"] = "COMPLETE"
+        data["outcome"] = "ROLLED_BACK"
+        _replacement_write(journal, data)
+        journal.unlink()
+        _fsync_directory(parent)
+        return {
+            "status": "COMPLETE",
+            "outcome": "ROLLED_BACK",
+            "destination": str(dest),
+            "receipt": str(receipt_path),
+            "failed_new_home_removed": True,
+        }
+
     if status == "FINALIZE_PENDING_DELETE":
         if not (
             dest.is_dir() and not dest.is_symlink()
             and not prepared.exists()
-            and not rollback.exists()
+            and not rollback_home.exists()
             and _restored_home_matches(dest, archive_sha)
         ):
             return {
@@ -1288,7 +1514,7 @@ def reconcile_home_replacement(
             "operation_id": data["operation_id"],
             "finalized_at": utc_now(),
             "archive_sha256": archive_sha,
-            "rollback_discarded": str(rollback),
+            "rollback_discarded": str(rollback_home),
         }
         receipt_path = dest / "replacement-receipt.json"
         atomic_write_json(receipt_path, receipt, mode=0o600)

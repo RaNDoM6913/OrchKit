@@ -131,6 +131,12 @@ cd <orchkit-root>
   --destination /absolute/path/to/existing-standalone-orch-home
 ./bin/orch state replace-reconcile \
   --destination /absolute/path/to/existing-standalone-orch-home
+# while rollback is retained:
+./bin/orch state replace-reconcile \
+  --destination /absolute/path/to/existing-standalone-orch-home --rollback
+# discard retained rollback/forward-copy only after explicit decision:
+./bin/orch state replace-reconcile \
+  --destination /absolute/path/to/existing-standalone-orch-home --finalize
 ```
 
 A scheduled ChatGPT worker claims exactly one attempt:

@@ -564,6 +564,106 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(finished["status"], "COMPLETE")
         self.assertTrue((live / "replacement-receipt.json").is_file())
 
+    def test_replace_rollback_restores_old_home_and_retains_new_copy(self):
+        live, _source, archive = self._replacement_fixture("rollback-happy")
+        replaced = replace_home_from_backup(archive, live)
+        journal = Path(replaced["journal"])
+        result = reconcile_home_replacement(live, rollback=True)
+        self.assertEqual(result["status"], "ROLLED_BACK_FORWARD_COPY_AVAILABLE")
+        failed = Path(result["failed_home"])
+        self.assertTrue((live / ".runtime" / "logs" / "old.json").is_file())
+        self.assertFalse((live / ".runtime" / "logs" / "new.json").exists())
+        self.assertTrue((failed / ".runtime" / "logs" / "new.json").is_file())
+        self.assertTrue(journal.is_file())
+
+        finished = reconcile_home_replacement(live, finalize=True)
+        self.assertEqual(finished["status"], "COMPLETE")
+        self.assertEqual(finished["outcome"], "ROLLED_BACK")
+        self.assertFalse(failed.exists())
+        self.assertFalse(journal.exists())
+        receipt = json.loads((live / "replacement-receipt.json").read_text())
+        self.assertEqual(receipt["outcome"], "ROLLED_BACK")
+        self.assertEqual(check_state(Orchestrator(live))["status"], "READY")
+
+    def test_replace_rollback_adopts_new_moved_after_journal_gap(self):
+        live, _source, archive = self._replacement_fixture("rollback-gap")
+        replace_home_from_backup(archive, live)
+        original_write = state_module._replacement_write
+        calls = {"count": 0}
+
+        def flaky(path, data):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("synthetic rollback journal gap")
+            return original_write(path, data)
+
+        with mock.patch.object(state_module, "_replacement_write", side_effect=flaky):
+            with self.assertRaisesRegex(OSError, "synthetic rollback journal gap"):
+                reconcile_home_replacement(live, rollback=True)
+
+        self.assertFalse(live.exists())
+        adopted = reconcile_home_replacement(live)
+        self.assertEqual(adopted["status"], "ROLLBACK_NEW_MOVED")
+        self.assertTrue(adopted["rollback_resume_available"])
+        resumed = reconcile_home_replacement(live, rollback=True)
+        self.assertEqual(resumed["status"], "ROLLED_BACK_FORWARD_COPY_AVAILABLE")
+        self.assertTrue((live / ".runtime" / "logs" / "old.json").is_file())
+        self.assertEqual(
+            reconcile_home_replacement(live, finalize=True)["status"],
+            "COMPLETE",
+        )
+
+    def test_replace_rollback_resumes_after_old_restore_rename_failure(self):
+        live, _source, archive = self._replacement_fixture("rollback-resume")
+        replace_home_from_backup(archive, live)
+        original = state_module._replacement_rename
+        calls = {"count": 0}
+
+        def flaky(source, destination):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("synthetic old-home restore failure")
+            return original(source, destination)
+
+        with mock.patch.object(state_module, "_replacement_rename", side_effect=flaky):
+            with self.assertRaisesRegex(OSError, "synthetic old-home restore failure"):
+                reconcile_home_replacement(live, rollback=True)
+
+        self.assertFalse(live.exists())
+        observed = reconcile_home_replacement(live)
+        self.assertEqual(observed["status"], "ROLLBACK_NEW_MOVED")
+        resumed = reconcile_home_replacement(live, rollback=True)
+        self.assertEqual(resumed["status"], "ROLLED_BACK_FORWARD_COPY_AVAILABLE")
+        self.assertTrue((live / ".runtime" / "logs" / "old.json").is_file())
+        self.assertEqual(
+            reconcile_home_replacement(live, finalize=True)["status"],
+            "COMPLETE",
+        )
+
+    def test_replace_rollback_finalize_recovers_discard_journal_gap(self):
+        live, _source, archive = self._replacement_fixture("rollback-finalize-gap")
+        replace_home_from_backup(archive, live)
+        reconcile_home_replacement(live, rollback=True)
+        original_write = state_module._replacement_write
+        calls = {"count": 0}
+
+        def flaky(path, data):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OSError("synthetic rollback finalize gap")
+            return original_write(path, data)
+
+        with mock.patch.object(state_module, "_replacement_write", side_effect=flaky):
+            with self.assertRaisesRegex(OSError, "synthetic rollback finalize gap"):
+                reconcile_home_replacement(live, finalize=True)
+
+        observed = reconcile_home_replacement(live)
+        self.assertEqual(observed["status"], "ROLLBACK_FINALIZE_PENDING_DELETE")
+        self.assertTrue(observed["finalize_available"])
+        finished = reconcile_home_replacement(live, finalize=True)
+        self.assertEqual(finished["status"], "COMPLETE")
+        self.assertEqual(finished["outcome"], "ROLLED_BACK")
+
     def test_backup_refuses_active_writer(self):
         workspace = Path(self.tmp.name) / "ws"; workspace.mkdir()
         plan = {

@@ -140,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     state_replace_reconcile.add_argument("--destination", required=True)
     replace_action = state_replace_reconcile.add_mutually_exclusive_group()
     replace_action.add_argument("--resume", action="store_true")
+    replace_action.add_argument("--rollback", action="store_true")
     replace_action.add_argument("--finalize", action="store_true")
     state_sub.add_parser("prune-capabilities")
     retention = state_sub.add_parser("retention")
@@ -326,6 +327,7 @@ def main(argv=None) -> int:
                     Path(args.destination).expanduser(),
                     resume=args.resume,
                     finalize=args.finalize,
+                    rollback=args.rollback,
                 )
             elif args.state_command == "prune-capabilities":
                 result = prune_capabilities(orch)
