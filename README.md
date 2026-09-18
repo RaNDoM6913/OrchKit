@@ -43,7 +43,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The produced `agent_workflow_orchestrator-0.3.0-py3-none-any.whl` was installed into a clean temporary venv and verified to expose the `orch` console command, initialize a fresh ORCH home, register a new Git project, protect pre-existing dirty bytes, and render the packaged dispatcher prompt.
+The current `agent_workflow_orchestrator-0.4.0-py3-none-any.whl` was built offline and installed into a clean temporary venv on 2026-09-18. The installed `orch` console command reported 0.4.0, initialized private schema-v3 state, registered a disposable Git project, durably enqueued and listed a task, and rendered the packaged dispatcher prompt.
 
 First-run flow for another user:
 
