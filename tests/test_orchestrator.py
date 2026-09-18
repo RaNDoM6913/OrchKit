@@ -47,6 +47,34 @@ class OrchestratorTests(unittest.TestCase):
         self.write_result(c2,'T2'); self.orch.complete(c2['run_id'])
         self.assertEqual(self.orch.claim('w3')['status'],'NO_WORK')
 
+    def test_dependency_can_reference_task_from_earlier_plan(self):
+        self.load([self.task("CROSS-1")], revision="cross-p1")
+        path = self.root / "cross-p2.json"
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "cross-p2",
+            "tasks": [self.task("CROSS-2", deps=["CROSS-1"])],
+        }) + "\n")
+        loaded = self.orch.load_plan(path)
+        self.assertEqual(loaded["queued_count"], 1)
+        first = self.orch.claim("w1")
+        self.assertEqual(first["task_id"], "CROSS-1")
+        self.write_result(first, "CROSS-1")
+        self.orch.complete(first["run_id"])
+        second = self.orch.claim("w2")
+        self.assertEqual(second["task_id"], "CROSS-2")
+
+    def test_cross_plan_unknown_dependency_is_rejected_atomically(self):
+        path = self.root / "missing-dep.json"
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "missing-dep",
+            "tasks": [self.task("CROSS-MISSING", deps=["NO-SUCH-TASK"])],
+        }) + "\n")
+        with self.assertRaisesRegex(ValueError, "invalid_dependency:NO-SUCH-TASK"):
+            self.orch.load_plan(path)
+        self.assertEqual(self.orch.status()["tasks"], [])
+
     def test_single_writer_busy(self):
         self.load([self.task('T1'),self.task('T2')])
         first=self.orch.claim('w1')

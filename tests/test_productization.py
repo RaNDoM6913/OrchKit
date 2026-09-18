@@ -1,4 +1,6 @@
 import hashlib
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from orch.cli import main as cli_main
 from orch.config import configure_home
 from orch.doctor import run_doctor
 from orch.dispatcher import render_dispatcher
@@ -120,6 +123,64 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(task["writer_key"], config["writer_key"])
         self.assertTrue(task["writer_key"].startswith("git:"))
         self.assertEqual(config["inventory_at_registration"]["writer_key"], config["writer_key"])
+
+    def test_queue_enqueue_compiles_registered_project_and_cross_plan_dependency(self):
+        registry = ProjectRegistry(self.home)
+        config = registry.add(self.repo, profile="standard", review_mode="off")["project"]
+
+        def enqueue(*extra):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = cli_main([
+                    "--root", str(self.home), "queue", "enqueue", config["project_id"],
+                    *extra,
+                ])
+            return rc, json.loads(output.getvalue())
+
+        rc1, first = enqueue(
+            "--task-id", "ENQ-1", "--goal", "first",
+            "--allowed-path", "one.json", "--plan-revision", "enqueue-one",
+        )
+        self.assertEqual(rc1, 0)
+        self.assertEqual(first["status"], "ENQUEUED")
+        self.assertEqual(first["load"]["queued_count"], 1)
+        plan1 = Path(first["plan_path"])
+        self.assertEqual(plan1.stat().st_mode & 0o777, 0o600)
+
+        rc2, second = enqueue(
+            "--task-id", "ENQ-2", "--goal", "second",
+            "--allowed-path", "two.json", "--depends", "ENQ-1",
+            "--max-attempts", "3", "--plan-revision", "enqueue-two",
+        )
+        self.assertEqual(rc2, 0)
+        self.assertEqual(second["load"]["queued_count"], 1)
+        compiled = json.loads(Path(second["plan_path"]).read_text())
+        task = compiled["tasks"][0]
+        self.assertEqual(task["dependencies"], ["ENQ-1"])
+        self.assertEqual(task["max_attempts"], 3)
+        self.assertNotIn("expected_base", task["publication"])
+
+        view = Orchestrator(self.home).queue_view()
+        by_id = {item["task_id"]: item for item in view["tasks"]}
+        self.assertEqual(by_id["ENQ-1"]["queue_state"], "READY")
+        self.assertEqual(by_id["ENQ-2"]["queue_state"], "WAITING_DEPENDENCY")
+
+        rc3, repeated = enqueue(
+            "--task-id", "ENQ-1", "--goal", "first",
+            "--allowed-path", "one.json", "--plan-revision", "enqueue-one",
+        )
+        self.assertEqual(rc3, 0)
+        self.assertEqual(repeated["plan_artifact_status"], "EXISTS")
+        self.assertEqual(repeated["load"]["queued_count"], 0)
+
+        original = plan1.read_text()
+        rc4, conflict = enqueue(
+            "--task-id", "ENQ-1", "--goal", "changed goal",
+            "--allowed-path", "one.json", "--plan-revision", "enqueue-one",
+        )
+        self.assertEqual(rc4, 1)
+        self.assertEqual(conflict["error"], "plan_artifact_conflict")
+        self.assertEqual(plan1.read_text(), original)
 
     def test_generated_plan_uses_git_local_when_commit_allowed_without_remote(self):
         config = ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="off")["project"]

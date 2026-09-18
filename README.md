@@ -74,6 +74,18 @@ orch project make-plan PROJECT_ID \
 orch load-plan ~/task-001.json
 ```
 
+For routine durable work, enqueue directly from the registered project without hand-writing a plan:
+
+```sh
+orch queue enqueue PROJECT_ID \
+  --task-id TASK-002 \
+  --goal "Implement the next bounded change" \
+  --allowed-path src/next.py \
+  --depends TASK-001
+```
+
+The compiled plan is retained under the ORCH home with mode `0600`. Dependencies may refer to tasks loaded by earlier plan revisions; dependent Git tasks bind their exact publication base during verification after predecessors finish.
+
 Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
 
 ## Optional Review Policy Engine

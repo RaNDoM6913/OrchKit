@@ -160,7 +160,8 @@ def validate_dependency_graph(tasks: List[Dict[str, Any]]) -> None:
             return
         state[task_id] = 1
         for dep in graph[task_id]:
-            visit(dep)
+            if dep in graph:
+                visit(dep)
         state[task_id] = 2
     for task_id in graph:
         visit(task_id)
@@ -326,7 +327,9 @@ class Orchestrator:
         known = set(ids)
         for item in tasks:
             deps = item.get("dependencies", [])
-            if not isinstance(deps, list) or any(dep not in known or dep == item["id"] for dep in deps):
+            if not isinstance(deps, list) or any(
+                not isinstance(dep, str) or not dep or dep == item["id"] for dep in deps
+            ):
                 raise ValueError("invalid_dependency")
             validate_task_definition(item)
         validate_dependency_graph(tasks)
@@ -340,6 +343,17 @@ class Orchestrator:
             if existing and existing["source_digest"] != digest:
                 conn.execute("ROLLBACK")
                 raise ValueError("plan_revision_digest_conflict")
+            durable_task_ids = {
+                row["task_id"] for row in conn.execute("SELECT task_id FROM tasks").fetchall()
+            }
+            for item in tasks:
+                missing = [
+                    dep for dep in item.get("dependencies", [])
+                    if dep not in known and dep not in durable_task_ids
+                ]
+                if missing:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("invalid_dependency:" + missing[0])
             existing_task_ids = set()
             for item in tasks:
                 task_existing = conn.execute(

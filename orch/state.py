@@ -366,7 +366,10 @@ def _backup_members(orch: Orchestrator) -> List[Path]:
         path = orch.root / relative
         if path.is_file() and not path.is_symlink():
             members.append(path)
-    for base in (orch.root / "projects", orch.runtime / "logs", orch.runtime / "worker_receipts"):
+    for base in (
+        orch.root / "projects", orch.root / "plans",
+        orch.runtime / "logs", orch.runtime / "worker_receipts",
+    ):
         if base.is_dir():
             members.extend(path for path in base.rglob("*") if path.is_file() and not path.is_symlink())
     review_root = orch.runtime / "review_exports"

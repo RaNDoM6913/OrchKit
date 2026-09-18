@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     make_plan.add_argument("--allowed-path", action="append", required=True)
     make_plan.add_argument("--risk-tag", action="append", default=[])
     make_plan.add_argument("--owner-approval", action="store_true")
+    make_plan.add_argument("--depends", action="append", default=[])
+    make_plan.add_argument("--max-attempts", type=int, default=2)
     make_plan.add_argument("--plan-revision")
     make_plan.add_argument("--output", required=True)
     remove = project_sub.add_parser("remove"); remove.add_argument("project_id")
@@ -92,6 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
     queue_cancel = queue_sub.add_parser("cancel")
     queue_cancel.add_argument("task_id")
     queue_cancel.add_argument("--reason", required=True)
+    queue_enqueue = queue_sub.add_parser("enqueue")
+    queue_enqueue.add_argument("project_id")
+    queue_enqueue.add_argument("--task-id", required=True)
+    queue_enqueue.add_argument("--goal", required=True)
+    queue_enqueue.add_argument("--allowed-path", action="append", required=True)
+    queue_enqueue.add_argument("--depends", action="append", default=[])
+    queue_enqueue.add_argument("--risk-tag", action="append", default=[])
+    queue_enqueue.add_argument("--owner-approval", action="store_true")
+    queue_enqueue.add_argument("--max-attempts", type=int, default=2)
+    queue_enqueue.add_argument("--plan-revision")
 
     git = sub.add_parser("git", help="read-only Git inspection through a registered project")
     git_sub = git.add_subparsers(dest="git_command", required=True)
@@ -185,6 +197,7 @@ def main(argv=None) -> int:
                     registry.get(args.project_id), task_id=args.task_id, goal=args.goal,
                     allowed_paths=args.allowed_path, risk_tags=args.risk_tag,
                     owner_acceptance=args.owner_approval, plan_revision=args.plan_revision,
+                    dependencies=args.depends, max_attempts=args.max_attempts,
                 )
                 result = write_plan(Path(args.output).expanduser(), plan)
                 result["plan"] = plan
@@ -197,6 +210,39 @@ def main(argv=None) -> int:
                 result = orch.queue_view(project_id=args.project, limit=args.limit)
             elif args.queue_command == "cancel":
                 result = orch.cancel_task(args.task_id, args.reason)
+            elif args.queue_command == "enqueue":
+                registry = ProjectRegistry(root)
+                plan = build_single_task_plan(
+                    registry.get(args.project_id),
+                    task_id=args.task_id,
+                    goal=args.goal,
+                    allowed_paths=args.allowed_path,
+                    risk_tags=args.risk_tag,
+                    owner_acceptance=args.owner_approval,
+                    plan_revision=args.plan_revision,
+                    dependencies=args.depends,
+                    max_attempts=args.max_attempts,
+                )
+                plans_dir = root / "plans"
+                plans_dir.mkdir(parents=True, exist_ok=True)
+                plan_path = plans_dir / f"{plan['plan_revision']}.json"
+                existed = plan_path.exists()
+                written = write_plan(plan_path, plan, replace=False)
+                try:
+                    loaded = orch.load_plan(plan_path)
+                except Exception:
+                    if not existed and written["status"] == "CREATED" and plan_path.is_file() and not plan_path.is_symlink():
+                        plan_path.unlink()
+                    raise
+                result = {
+                    "status": "ENQUEUED",
+                    "task_id": args.task_id,
+                    "project_id": args.project_id,
+                    "plan_revision": plan["plan_revision"],
+                    "plan_path": written["path"],
+                    "plan_artifact_status": written["status"],
+                    "load": loaded,
+                }
             else:
                 raise ValueError("unknown_queue_command")
         elif args.command == "git":
