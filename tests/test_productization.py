@@ -239,6 +239,125 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
         self.assertEqual(orch.publish(claim["run_id"])["status"], "COMPLETE")
 
+    def test_verifier_neutralizes_clean_filter_and_publication_blocks_filtered_path(self):
+        attributes = self.repo / ".gitattributes"
+        filtered = self.repo / "filtered.txt"
+        attributes.write_text("filtered.txt filter=evil\n")
+        filtered.write_text("base\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", ".gitattributes", "filtered.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "add filtered fixture"],
+            check=True, capture_output=True,
+        )
+        sentinel = self.base / "filter-fired"
+        command = f"sh -c 'echo fired > {sentinel}; cat'"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "filter.evil.clean", command],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "filter.evil.smudge", "cat"],
+            check=True,
+        )
+        registry = ProjectRegistry(self.home)
+        config = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        self.assertFalse(sentinel.exists())
+
+        plan = build_single_task_plan(
+            config, task_id="FILTER-1", goal="filtered path",
+            allowed_paths=["filtered.txt"],
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "filter-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        filtered.write_text("changed\n")
+        policy_after_change = evaluate_project_git_policy(config)
+        self.assertEqual(policy_after_change["status"], "READY")
+        self.assertIn(
+            "filtered.txt",
+            policy_after_change["current"]["dirty_tracked_paths"],
+        )
+        self.assertFalse(sentinel.exists())
+        receipt = self.home / "filter-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "FILTER-1",
+            "changed_paths": ["filtered.txt"],
+        }))
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        verified = orch.verify(claim["run_id"])
+        self.assertEqual(verified["status"], "VERIFIED")
+        self.assertIn(
+            "evil",
+            verified["scope_evidence"]["neutralized_filter_drivers"],
+        )
+        self.assertFalse(sentinel.exists())
+        with self.assertRaisesRegex(
+            ValueError, "publication_filtered_path_not_supported:filtered.txt:evil"
+        ):
+            orch.publish(claim["run_id"])
+        self.assertFalse(sentinel.exists())
+
+    def test_git_publication_disables_repository_pre_push_hook(self):
+        remote = self.base / "remote.git"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", str(remote)],
+            check=True,
+        )
+        sentinel = self.base / "pre-push-fired"
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        hook.write_text(
+            "#!/bin/sh\n"
+            f"echo fired > {sentinel}\n"
+            "exit 97\n"
+        )
+        os.chmod(hook, 0o755)
+
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="HOOK-1", goal="publish without hooks",
+            allowed_paths=["hook-safe.json"],
+        )
+        self.assertEqual(plan["tasks"][0]["publication"]["kind"], "git")
+        orch = Orchestrator(self.home)
+        plan_path = self.home / "hook-plan.json"
+        plan_path.write_text(json.dumps(plan))
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        (self.repo / "hook-safe.json").write_text('{"ok":true}\n')
+        receipt = self.home / "hook-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"], "task_id": "HOOK-1",
+            "changed_paths": ["hook-safe.json"],
+        }))
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+        published = orch.publish(claim["run_id"])
+        self.assertEqual(published["status"], "COMPLETE")
+        self.assertFalse(sentinel.exists())
+        remote_head = subprocess.run(
+            ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(remote_head, published["commit"])
+
     def test_git_local_publication_supports_tracked_deletion(self):
         legacy=self.repo/'legacy.txt'; legacy.write_text('remove me\n',encoding='utf-8')
         subprocess.run(['git','-C',str(self.repo),'add','legacy.txt'],check=True)

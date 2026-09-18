@@ -177,6 +177,7 @@ class Orchestrator:
         ensure_private_dir(self.runtime / "worker_receipts")
         ensure_private_dir(self.runtime / "claims")
         ensure_private_dir(self.runtime / "review_exports")
+        ensure_private_dir(self.runtime / "git-hooks-disabled")
         for optional_state_dir in ("projects", "plans", "backups"):
             candidate = self.root / optional_state_dir
             if candidate.exists():
@@ -628,30 +629,149 @@ class Orchestrator:
         self._revoke_capability(run_id)
         return {"status": "BLOCKED", "reason": reason, "feedback": feedback}
 
+    def _disabled_git_hooks_path(self) -> Path:
+        hooks = ensure_private_dir(self.runtime / "git-hooks-disabled")
+        contents = list(hooks.iterdir())
+        if contents:
+            raise ValueError("git_hooks_guard_not_empty")
+        return hooks
+
+    def _git_filter_attributes(self, workspace: Path, paths: List[str]) -> Dict[str, str]:
+        if not paths:
+            return {}
+        env = {
+            key: os.environ[key]
+            for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
+        env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+        prefix = [
+            "git", "--no-pager",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "diff.external=",
+            "-c", f"core.hooksPath={self._disabled_git_hooks_path()}",
+            "-C", str(workspace),
+        ]
+        result: Dict[str, str] = {}
+        normalized = sorted(set(normalize_relative_path(path) for path in paths))
+        for offset in range(0, len(normalized), 200):
+            batch = normalized[offset:offset + 200]
+            probe = subprocess.run(
+                prefix + ["check-attr", "-z", "filter", "--", *batch],
+                env=env, capture_output=True, text=False, timeout=15, check=False,
+            )
+            if probe.returncode != 0:
+                raise RuntimeError("git_filter_attribute_probe_failed")
+            fields = probe.stdout.split(b"\0")
+            if fields and fields[-1] == b"":
+                fields.pop()
+            if len(fields) % 3:
+                raise RuntimeError("git_filter_attribute_probe_malformed")
+            for index in range(0, len(fields), 3):
+                relative = normalize_relative_path(os.fsdecode(fields[index]))
+                value = os.fsdecode(fields[index + 2])
+                result[relative] = value
+        return result
+
+    def _git_filter_overrides(self, workspace: Path) -> Tuple[List[str], List[str]]:
+        env = {
+            key: os.environ[key]
+            for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
+        env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
+        prefix = [
+            "git", "--no-pager",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "diff.external=",
+            "-c", f"core.hooksPath={self._disabled_git_hooks_path()}",
+            "-C", str(workspace),
+        ]
+        listed = subprocess.run(
+            prefix + ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            env=env, capture_output=True, text=False, timeout=20, check=False,
+        )
+        if listed.returncode != 0:
+            return [], []
+        paths = [
+            normalize_relative_path(os.fsdecode(item))
+            for item in listed.stdout.split(b"\0") if item
+        ]
+        attributes = self._git_filter_attributes(workspace, paths)
+        drivers = sorted({
+            value for value in attributes.values()
+            if value not in {"unspecified", "unset"}
+        })
+        cat_binary = "/bin/cat" if Path("/bin/cat").is_file() else "/usr/bin/cat"
+        if not Path(cat_binary).is_file():
+            raise ValueError("trusted_cat_binary_missing")
+        overrides: List[str] = []
+        for driver in drivers:
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", driver) is None:
+                raise ValueError("unsafe_git_filter_driver")
+            overrides.extend([
+                "-c", f"filter.{driver}.process=",
+                "-c", f"filter.{driver}.clean={cat_binary}",
+                "-c", f"filter.{driver}.smudge={cat_binary}",
+                "-c", f"filter.{driver}.required=false",
+            ])
+        return overrides, drivers
+
     def _workspace_scope_evidence(self, payload: Dict[str, Any], declared_paths: List[str]) -> Dict[str, Any]:
         workspace = Path(payload["workspace"]).resolve()
-        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        env = {
+            key: os.environ[key]
+            for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
         env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
-        prefix = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-                  "-c", "diff.external=", "-C", str(workspace)]
-        probe = subprocess.run(prefix + ["rev-parse", "--is-inside-work-tree"], env=env,
-                               capture_output=True, text=True, timeout=10, check=False)
+        base_prefix = [
+            "git", "--no-pager",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "diff.external=",
+            "-c", f"core.hooksPath={self._disabled_git_hooks_path()}",
+            "-C", str(workspace),
+        ]
+        probe = subprocess.run(
+            base_prefix + ["rev-parse", "--is-inside-work-tree"],
+            env=env, capture_output=True, text=True, timeout=10, check=False,
+        )
         declared = sorted(set(normalize_relative_path(path) for path in declared_paths))
         if probe.returncode != 0 or probe.stdout.strip() != "true":
-            return {"status": "NON_GIT_UNAVAILABLE", "declared_paths": declared, "git_head": None,
-                    "limitation": "independent_scope_census_requires_git_workspace"}
+            return {
+                "status": "NON_GIT_UNAVAILABLE", "declared_paths": declared, "git_head": None,
+                "limitation": "independent_scope_census_requires_git_workspace",
+            }
+        filter_overrides, neutralized_drivers = self._git_filter_overrides(workspace)
+        prefix = base_prefix[:-2] + filter_overrides + base_prefix[-2:]
+
         def paths(*args: str) -> List[str]:
-            result = subprocess.run(prefix + list(args), env=env, capture_output=True, text=False, timeout=15, check=False)
+            result = subprocess.run(
+                prefix + list(args), env=env, capture_output=True, text=False,
+                timeout=15, check=False,
+            )
             if result.returncode != 0:
                 raise RuntimeError("git_scope_probe_failed:" + " ".join(args))
-            return [normalize_relative_path(os.fsdecode(item)) for item in result.stdout.split(b"\0") if item]
+            return [
+                normalize_relative_path(os.fsdecode(item))
+                for item in result.stdout.split(b"\0") if item
+            ]
+
         tracked = paths("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z")
         staged = paths("diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z")
         untracked = paths("ls-files", "--others", "--exclude-standard", "-z")
         observed_all = sorted(set(tracked + staged + untracked))
-        protected = set(normalize_relative_path(path) for path in payload.get("protected_paths", {}))
+        protected = set(
+            normalize_relative_path(path) for path in payload.get("protected_paths", {})
+        )
         observed = sorted(path for path in observed_all if path not in protected)
-        outside_allowlist = sorted(path for path in observed if not path_allowed(path, payload.get("allowed_paths", [])))
+        outside_allowlist = sorted(
+            path for path in observed
+            if not path_allowed(path, payload.get("allowed_paths", []))
+        )
         omitted_from_receipt = sorted(set(observed) - set(declared))
         declared_but_unobserved = sorted(set(declared) - set(observed))
         head_probe = subprocess.run(
@@ -660,7 +780,11 @@ class Orchestrator:
         )
         git_head = head_probe.stdout.strip() if head_probe.returncode == 0 else None
         return {
-            "status": "PASS" if not outside_allowlist and not omitted_from_receipt and not declared_but_unobserved else "BLOCKED",
+            "status": (
+                "PASS"
+                if not outside_allowlist and not omitted_from_receipt and not declared_but_unobserved
+                else "BLOCKED"
+            ),
             "declared_paths": declared,
             "git_head": git_head,
             "observed_paths": observed,
@@ -669,6 +793,7 @@ class Orchestrator:
             "omitted_from_receipt": omitted_from_receipt,
             "declared_but_unobserved": declared_but_unobserved,
             "ignored_files_observed": False,
+            "neutralized_filter_drivers": neutralized_drivers,
         }
 
     def _snapshot(self, payload: Dict[str, Any], changed_paths: List[str],
@@ -939,12 +1064,40 @@ class Orchestrator:
                 )
 
     def _publication_git(self, workspace: Path, *, binary: bool = False):
-        env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+        env = {
+            key: os.environ[key]
+            for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
         env.update({"GIT_PAGER": "cat", "PAGER": "cat"})
+        filter_overrides, _drivers = self._git_filter_overrides(workspace)
+        prefix = [
+            "git", "--no-pager",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "diff.external=",
+            "-c", f"core.hooksPath={self._disabled_git_hooks_path()}",
+            *filter_overrides,
+            "-C", str(workspace),
+        ]
+
         def run(*args: str) -> subprocess.CompletedProcess:
-            return subprocess.run(["git", "-C", str(workspace), *args], env=env,
-                                  capture_output=True, text=not binary, timeout=30, check=False)
+            return subprocess.run(
+                prefix + list(args), env=env, capture_output=True,
+                text=not binary, timeout=30, check=False,
+            )
         return run
+
+    def _assert_publication_paths_unfiltered(self, workspace: Path, paths: List[str]) -> None:
+        attributes = self._git_filter_attributes(workspace, paths)
+        filtered = sorted(
+            (relative, value)
+            for relative, value in attributes.items()
+            if value not in {"unspecified", "unset"}
+        )
+        if filtered:
+            relative, driver = filtered[0]
+            raise ValueError(f"publication_filtered_path_not_supported:{relative}:{driver}")
 
     def _staged_matches_snapshot(self, workspace: Path, manifest: Dict[str, Any]) -> bool:
         gitb = self._publication_git(workspace, binary=True)
@@ -1056,6 +1209,7 @@ class Orchestrator:
         changed = sorted(manifest.get("files", {}).keys())
         if not changed:
             raise ValueError("nothing_to_publish")
+        self._assert_publication_paths_unfiltered(workspace, changed)
         gitt = self._publication_git(workspace, binary=False)
         gitb = self._publication_git(workspace, binary=True)
         branch = gitt("branch", "--show-current")

@@ -41,6 +41,7 @@ class StateMaintenanceTests(unittest.TestCase):
             self.orch.runtime / "worker_receipts",
             self.orch.runtime / "claims",
             self.orch.runtime / "review_exports",
+            self.orch.runtime / "git-hooks-disabled",
         ]
         for path in private_dirs:
             self.assertEqual(path.stat().st_mode & 0o777, 0o700)

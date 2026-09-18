@@ -32,25 +32,88 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _safe_git(repo: Path, *args: str, timeout: int = 15) -> subprocess.CompletedProcess:
-    env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
+def _git_env() -> Dict[str, str]:
+    env = {
+        key: os.environ[key]
+        for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+        if key in os.environ
+    }
     env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
-    cmd = [
-        "git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-        "-c", "diff.external=", "-C", str(repo), *args,
-    ]
-    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+    return env
 
+
+def _git_base(repo: Path) -> List[str]:
+    return [
+        "git", "--no-pager",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false",
+        "-c", "diff.external=",
+        "-c", "core.hooksPath=/dev/null",
+        "-C", str(repo),
+    ]
+
+
+def _git_filter_overrides(repo: Path) -> List[str]:
+    env = _git_env()
+    prefix = _git_base(repo)
+    listed = subprocess.run(
+        prefix + ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        env=env, capture_output=True, text=False, timeout=20, check=False,
+    )
+    if listed.returncode != 0:
+        return []
+    paths = [os.fsdecode(item) for item in listed.stdout.split(b"\0") if item]
+    drivers = set()
+    for offset in range(0, len(paths), 200):
+        batch = paths[offset:offset + 200]
+        probe = subprocess.run(
+            prefix + ["check-attr", "-z", "filter", "--", *batch],
+            env=env, capture_output=True, text=False, timeout=15, check=False,
+        )
+        if probe.returncode != 0:
+            raise ValueError("git_filter_attribute_probe_failed")
+        fields = probe.stdout.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        if len(fields) % 3:
+            raise ValueError("git_filter_attribute_probe_malformed")
+        for index in range(0, len(fields), 3):
+            value = os.fsdecode(fields[index + 2])
+            if value not in {"unspecified", "unset"}:
+                drivers.add(value)
+    cat_binary = "/bin/cat" if Path("/bin/cat").is_file() else "/usr/bin/cat"
+    if not Path(cat_binary).is_file():
+        raise ValueError("trusted_cat_binary_missing")
+    overrides: List[str] = []
+    for driver in sorted(drivers):
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", driver) is None:
+            raise ValueError("unsafe_git_filter_driver")
+        overrides.extend([
+            "-c", f"filter.{driver}.process=",
+            "-c", f"filter.{driver}.clean={cat_binary}",
+            "-c", f"filter.{driver}.smudge={cat_binary}",
+            "-c", f"filter.{driver}.required=false",
+        ])
+    return overrides
+
+
+def _safe_git(repo: Path, *args: str, timeout: int = 15) -> subprocess.CompletedProcess:
+    env = _git_env()
+    base = _git_base(repo)
+    cmd = base[:-2] + _git_filter_overrides(repo) + base[-2:] + list(args)
+    return subprocess.run(
+        cmd, env=env, capture_output=True, text=True, timeout=timeout, check=False
+    )
 
 
 def _safe_git_bytes(repo: Path, *args: str, timeout: int = 15) -> subprocess.CompletedProcess:
-    env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
-    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat"})
-    cmd = [
-        "git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-        "-c", "diff.external=", "-C", str(repo), *args,
-    ]
-    return subprocess.run(cmd, env=env, capture_output=True, text=False, timeout=timeout, check=False)
+    env = _git_env()
+    base = _git_base(repo)
+    cmd = base[:-2] + _git_filter_overrides(repo) + base[-2:] + list(args)
+    return subprocess.run(
+        cmd, env=env, capture_output=True, text=False, timeout=timeout, check=False
+    )
+
 
 def _slug(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-._")

@@ -65,6 +65,7 @@ def permission_health(orch: Orchestrator) -> Dict[str, Any]:
         (orch.runtime / "worker_receipts", 0o700, True),
         (orch.runtime / "claims", 0o700, True),
         (orch.runtime / "review_exports", 0o700, True),
+        (orch.runtime / "git-hooks-disabled", 0o700, True),
         (orch.db_path, 0o600, True),
         (orch.db_path.with_name(orch.db_path.name + "-wal"), 0o600, False),
         (orch.db_path.with_name(orch.db_path.name + "-shm"), 0o600, False),
