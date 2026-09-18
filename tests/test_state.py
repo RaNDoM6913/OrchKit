@@ -3,10 +3,11 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 from orch.core import Orchestrator
-from orch.state import backup_state, check_state, prune_capabilities
+from orch.state import backup_state, check_state, migration_history, prune_capabilities
 
 
 class StateMaintenanceTests(unittest.TestCase):
@@ -25,6 +26,10 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], 3)
         self.assertEqual(result["quick_check"], ["ok"])
         self.assertEqual(result["foreign_key_violations"], [])
+        self.assertEqual(result["migration_history"][-1]["version"], 3)
+        self.assertIn(result["migration_history"][-1]["details"]["kind"], {
+            "transactional_upgrade", "observed_existing_schema",
+        })
 
     def test_orphan_capability_is_reported_and_pruned(self):
         claims = self.orch.runtime / "claims"
@@ -117,6 +122,51 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(row["project_id"], "legacy-project")
         self.assertTrue(row["writer_key"].startswith("workspace:"))
         self.assertEqual(row["queue_seq"], 1)
+        history = migration_history(migrated)
+        self.assertEqual(history["migrations"][-1]["from_version"], 2)
+        self.assertEqual(history["migrations"][-1]["details"]["kind"], "transactional_upgrade")
+
+    def test_failed_schema_upgrade_rolls_back_all_task_ddl(self):
+        other = Path(self.tmp.name) / "broken-upgrade"
+        runtime = other / ".runtime"
+        runtime.mkdir(parents=True)
+        workspace = Path(self.tmp.name) / "broken-workspace"
+        workspace.mkdir()
+        db_path = runtime / "orch.sqlite3"
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute(
+                "CREATE TABLE tasks ("
+                "task_id TEXT PRIMARY KEY, plan_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,"
+                "status TEXT NOT NULL, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            payload = {
+                "id": "BROKEN-1", "goal": "broken", "workspace": str(workspace),
+                "writer_key": "invalid writer key!", "dependencies": [],
+                "allowed_paths": ["out.json"], "protected_paths": {}, "checks": [],
+                "publication": {"kind": "none"},
+            }
+            db.execute(
+                "INSERT INTO tasks(task_id,plan_revision,ordinal,status,payload_json,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                ("BROKEN-1", "legacy-v2", 0, "PLANNED", json.dumps(payload), "2026-01-01T00:00:00Z"),
+            )
+            db.execute("PRAGMA user_version=2")
+            db.commit()
+        finally:
+            db.close()
+        with self.assertRaisesRegex(ValueError, "invalid_writer_key"):
+            Orchestrator(other)
+        db = sqlite3.connect(str(db_path))
+        try:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)").fetchall()}
+            self.assertNotIn("project_id", columns)
+            self.assertNotIn("writer_key", columns)
+            self.assertNotIn("queue_seq", columns)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 0)
+        finally:
+            db.close()
 
     def test_future_state_schema_is_rejected(self):
         other = Path(self.tmp.name) / "future"; runtime = other / ".runtime"

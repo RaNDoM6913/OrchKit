@@ -20,6 +20,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+
+
+def migration_history(orch: Orchestrator) -> Dict[str, Any]:
+    with orch.connect() as conn:
+        rows = conn.execute(
+            "SELECT version,from_version,applied_at,details_json FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    migrations = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item.pop("details_json"))
+        migrations.append(item)
+    return {
+        "status": "OK",
+        "current_version": STATE_SCHEMA_VERSION,
+        "migrations": migrations,
+    }
+
 def capability_health(orch: Orchestrator) -> Dict[str, Any]:
     claims = orch.runtime / "claims"
     claims.mkdir(parents=True, exist_ok=True)
@@ -58,10 +76,12 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
     caps = capability_health(orch)
     blocked = quick_values != ["ok"] or bool(foreign)
     attention = bool(active) or caps["status"] != "READY" or bool(pending_publications)
+    history = migration_history(orch)["migrations"]
     return {
         "status": "BLOCKED" if blocked else "ATTENTION" if attention else "READY",
         "schema_version": user_version,
         "expected_schema_version": STATE_SCHEMA_VERSION,
+        "migration_history": history,
         "quick_check": quick_values,
         "foreign_key_violations": [list(row) for row in foreign],
         "journal_mode": journal_mode,

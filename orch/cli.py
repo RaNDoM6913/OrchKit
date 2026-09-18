@@ -15,7 +15,7 @@ from .git_policy import evaluate_project_git_policy
 from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
-from .state import backup_state, check_state, prune_capabilities
+from .state import backup_state, check_state, migration_history, prune_capabilities
 
 
 def root_from_args(args: argparse.Namespace) -> Path:
@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     state = sub.add_parser("state", help="inspect and maintain durable ORCH state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
     state_sub.add_parser("check")
+    state_sub.add_parser("migrations")
     state_backup = state_sub.add_parser("backup"); state_backup.add_argument("--output")
     state_sub.add_parser("prune-capabilities")
     load = sub.add_parser("load-plan"); load.add_argument("plan")
@@ -184,6 +185,8 @@ def main(argv=None) -> int:
         elif args.command == "state":
             if args.state_command == "check":
                 result = check_state(orch)
+            elif args.state_command == "migrations":
+                result = migration_history(orch)
             elif args.state_command == "backup":
                 output = Path(args.output).expanduser().resolve() if args.output else None
                 result = backup_state(orch, output)

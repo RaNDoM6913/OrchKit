@@ -237,6 +237,10 @@ class Orchestrator:
           error TEXT, updated_at TEXT NOT NULL,
           FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY, from_version INTEGER NOT NULL,
+          applied_at TEXT NOT NULL, details_json TEXT NOT NULL
+        );
         """
         with self.connect() as conn:
             conn.executescript(schema)
@@ -244,32 +248,65 @@ class Orchestrator:
             if version not in (0, 1, 2, 3):
                 raise ValueError(f"unsupported_state_schema:{version}")
             if version < 3:
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-                if "project_id" not in columns:
-                    conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
-                if "writer_key" not in columns:
-                    conn.execute("ALTER TABLE tasks ADD COLUMN writer_key TEXT")
-                if "queue_seq" not in columns:
-                    conn.execute("ALTER TABLE tasks ADD COLUMN queue_seq INTEGER")
-                rows = conn.execute(
-                    "SELECT rowid,task_id,payload_json,project_id,writer_key,queue_seq FROM tasks ORDER BY rowid"
-                ).fetchall()
-                next_seq = 0
-                for row in rows:
-                    payload = json.loads(row["payload_json"])
-                    next_seq = max(next_seq + 1, int(row["queue_seq"] or 0))
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+                    if "project_id" not in columns:
+                        conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
+                    if "writer_key" not in columns:
+                        conn.execute("ALTER TABLE tasks ADD COLUMN writer_key TEXT")
+                    if "queue_seq" not in columns:
+                        conn.execute("ALTER TABLE tasks ADD COLUMN queue_seq INTEGER")
+                    rows = conn.execute(
+                        "SELECT rowid,task_id,payload_json,project_id,writer_key,queue_seq "
+                        "FROM tasks ORDER BY rowid"
+                    ).fetchall()
+                    next_seq = 0
+                    for row in rows:
+                        payload = json.loads(row["payload_json"])
+                        next_seq = max(next_seq + 1, int(row["queue_seq"] or 0))
+                        conn.execute(
+                            "UPDATE tasks SET project_id=?,writer_key=?,queue_seq=? WHERE task_id=?",
+                            (
+                                row["project_id"] if row["project_id"] is not None else payload.get("project_id"),
+                                row["writer_key"] or task_writer_key(payload),
+                                next_seq,
+                                row["task_id"],
+                            ),
+                        )
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
                     conn.execute(
-                        "UPDATE tasks SET project_id=?,writer_key=?,queue_seq=? WHERE task_id=?",
+                        "INSERT OR REPLACE INTO schema_migrations(version,from_version,applied_at,details_json) "
+                        "VALUES(?,?,?,?)",
                         (
-                            row["project_id"] if row["project_id"] is not None else payload.get("project_id"),
-                            row["writer_key"] or task_writer_key(payload),
-                            next_seq,
-                            row["task_id"],
+                            STATE_SCHEMA_VERSION, version, utc_now(),
+                            canonical_json({
+                                "kind": "transactional_upgrade",
+                                "tasks_migrated": len(rows),
+                                "target_version": STATE_SCHEMA_VERSION,
+                            }),
                         ),
                     )
-                conn.execute(f"PRAGMA user_version={STATE_SCHEMA_VERSION}")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
+                    conn.execute(f"PRAGMA user_version={STATE_SCHEMA_VERSION}")
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            else:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version,from_version,applied_at,details_json) "
+                    "VALUES(?,?,?,?)",
+                    (
+                        STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION, utc_now(),
+                        canonical_json({
+                            "kind": "observed_existing_schema",
+                            "target_version": STATE_SCHEMA_VERSION,
+                        }),
+                    ),
+                )
 
     def _event(self, conn: sqlite3.Connection, kind: str, *, task_id: str = None,
                run_id: str = None, payload: Dict[str, Any] = None) -> None:
