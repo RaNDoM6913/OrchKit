@@ -586,7 +586,10 @@ def prune_retention(
 
 def _backup_members(orch: Orchestrator) -> List[Path]:
     members: List[Path] = []
-    for relative in ("config.json", "rdc-bootstrap.json", "dispatcher-prompt.txt"):
+    for relative in (
+        "config.json", "rdc-bootstrap.json", "dispatcher-prompt.txt",
+        "restore-receipt.json",
+    ):
         path = orch.root / relative
         if path.is_file() and not path.is_symlink():
             members.append(path)
@@ -772,6 +775,171 @@ def verify_backup_archive(
     except (OSError, zipfile.BadZipFile):
         base["errors"].append("backup_zip_invalid")
         return base
+
+
+def _restorable_backup_member(name: str) -> bool:
+    if name in {
+        "state/orch.sqlite3",
+        "state/manifest.json",
+        "files/config.json",
+        "files/rdc-bootstrap.json",
+        "files/dispatcher-prompt.txt",
+        "files/restore-receipt.json",
+    }:
+        return True
+    return any(
+        name.startswith(prefix)
+        for prefix in (
+            "files/projects/",
+            "files/plans/",
+            "files/.runtime/logs/",
+            "files/.runtime/worker_receipts/",
+            "files/.runtime/review_exports/",
+        )
+    )
+
+
+def _write_streamed_member(
+    archive: zipfile.ZipFile, member: str, target: Path,
+    *, max_bytes: int,
+) -> int:
+    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    written = 0
+    with archive.open(member, "r") as source, target.open("wb") as dest:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            written += len(block)
+            if written > max_bytes:
+                raise ValueError("backup_restore_member_limit_exceeded")
+            dest.write(block)
+        dest.flush()
+        os.fsync(dest.fileno())
+    os.chmod(target, 0o600)
+    return written
+
+
+def restore_backup_archive(
+    path: Path, destination: Path, *,
+    max_uncompressed_bytes: int = 1024 * 1024 * 1024,
+) -> Dict[str, Any]:
+    verified = verify_backup_archive(
+        path, max_uncompressed_bytes=max_uncompressed_bytes
+    )
+    if verified["status"] != "VERIFIED":
+        errors = ",".join(verified.get("errors") or ["unknown"])
+        raise ValueError("backup_not_verified:" + errors)
+
+    dest = destination.expanduser().resolve()
+    if destination.is_symlink() or dest.exists():
+        raise ValueError("restore_destination_exists")
+    parent = dest.parent
+    if parent.is_symlink():
+        raise ValueError("restore_parent_unsafe")
+    parent.mkdir(parents=True, exist_ok=True)
+    if not parent.is_dir():
+        raise ValueError("restore_parent_not_directory")
+
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{dest.name}.restore-", dir=str(parent)
+    ))
+    os.chmod(staging, 0o700)
+    published = False
+    try:
+        runtime = staging / ".runtime"
+        runtime.mkdir(mode=0o700)
+        with zipfile.ZipFile(path.expanduser().resolve(), "r") as archive:
+            for info in archive.infolist():
+                name = info.filename
+                if not _restorable_backup_member(name):
+                    raise ValueError(f"restore_member_not_allowed:{name}")
+                if name == "state/manifest.json":
+                    continue
+                if name == "files/dispatcher-prompt.txt":
+                    continue
+                if name == "state/orch.sqlite3":
+                    target = runtime / "orch.sqlite3"
+                elif name.startswith("files/"):
+                    relative = Path(*Path(name).parts[1:])
+                    target = staging / relative
+                else:
+                    raise ValueError(f"restore_member_not_allowed:{name}")
+                _write_streamed_member(
+                    archive, name, target,
+                    max_bytes=max_uncompressed_bytes,
+                )
+
+        for directory in [staging, *sorted(
+            (item for item in staging.rglob("*") if item.is_dir()),
+            key=lambda item: len(item.parts),
+        )]:
+            if directory.is_symlink():
+                raise ValueError("restored_directory_symlink")
+            os.chmod(directory, 0o700)
+
+        restored = Orchestrator(staging)
+        health = check_state(restored)
+        if health["status"] == "BLOCKED":
+            raise ValueError("restored_state_blocked")
+        if health["active_runs"]:
+            raise ValueError("restored_active_runs_present")
+        if health["capabilities"]["missing_capabilities"]:
+            raise ValueError("restored_capability_missing")
+
+        receipt = {
+            "schema_version": 1,
+            "restored_at": utc_now(),
+            "source_archive": str(path.expanduser().resolve()),
+            "source_archive_sha256": _sha256(path.expanduser().resolve()),
+            "source_manifest": verified["manifest"],
+            "source_schema_version": verified["schema_version"],
+            "restored_schema_version": health["schema_version"],
+            "compatibility_before_restore": verified["compatibility"],
+            "destination": str(dest),
+            "dispatcher_prompt_restored": False,
+            "dispatcher_prompt_action": "regenerate_with_orch_dispatcher_render",
+            "health_status": health["status"],
+            "active_runs": len(health["active_runs"]),
+            "writer_locks": len(health["writer_locks"]),
+            "pending_publications": len(health["pending_publications"]),
+        }
+        receipt_path = staging / "restore-receipt.json"
+        receipt_path.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with receipt_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.chmod(receipt_path, 0o600)
+
+        os.replace(staging, dest)
+        published = True
+        try:
+            fd = os.open(str(parent), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+        final_orch = Orchestrator(dest)
+        final_health = check_state(final_orch)
+        return {
+            "status": "RESTORED",
+            "destination": str(dest),
+            "archive": str(path.expanduser().resolve()),
+            "archive_sha256": receipt["source_archive_sha256"],
+            "source_schema_version": verified["schema_version"],
+            "restored_schema_version": final_health["schema_version"],
+            "health": final_health,
+            "receipt": str(dest / "restore-receipt.json"),
+            "dispatcher_prompt_restored": False,
+        }
+    finally:
+        if not published and staging.exists():
+            shutil.rmtree(staging)
 
 
 def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, Any]:

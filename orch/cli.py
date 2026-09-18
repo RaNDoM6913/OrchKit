@@ -16,8 +16,8 @@ from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
 from .state import (backup_state, check_state, migration_history, prune_capabilities,
-                    prune_retention, recovery_inspect, retention_status,
-                    verify_backup_archive)
+                    prune_retention, recovery_inspect, restore_backup_archive,
+                    retention_status, verify_backup_archive)
 
 
 def root_from_args(args: argparse.Namespace) -> Path:
@@ -129,6 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
     state_backup = state_sub.add_parser("backup"); state_backup.add_argument("--output")
     state_verify_backup = state_sub.add_parser("verify-backup")
     state_verify_backup.add_argument("path")
+    state_restore_backup = state_sub.add_parser("restore-backup")
+    state_restore_backup.add_argument("path")
+    state_restore_backup.add_argument("--destination", required=True)
     state_sub.add_parser("prune-capabilities")
     retention = state_sub.add_parser("retention")
     retention.add_argument("--max-evidence-mb", type=int, default=256)
@@ -299,6 +302,11 @@ def main(argv=None) -> int:
                 result = backup_state(orch, output)
             elif args.state_command == "verify-backup":
                 result = verify_backup_archive(Path(args.path).expanduser())
+            elif args.state_command == "restore-backup":
+                result = restore_backup_archive(
+                    Path(args.path).expanduser(),
+                    Path(args.destination).expanduser(),
+                )
             elif args.state_command == "prune-capabilities":
                 result = prune_capabilities(orch)
             elif args.state_command == "retention":

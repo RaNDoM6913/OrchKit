@@ -1,5 +1,5 @@
-import json
 from pathlib import Path
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,8 +10,8 @@ import zipfile
 
 from orch.core import Orchestrator
 from orch.state import (backup_state, check_state, migration_history, prune_capabilities,
-                        prune_retention, recovery_inspect, retention_status,
-                        verify_backup_archive)
+                        prune_retention, recovery_inspect, restore_backup_archive,
+                        retention_status, verify_backup_archive)
 
 
 class StateMaintenanceTests(unittest.TestCase):
@@ -287,6 +287,133 @@ class StateMaintenanceTests(unittest.TestCase):
         checked = verify_backup_archive(invalid)
         self.assertEqual(checked["status"], "BLOCKED")
         self.assertEqual(checked["errors"], ["backup_zip_invalid"])
+
+    def test_restore_backup_publishes_fresh_home_atomically(self):
+        (self.root / "config.json").write_text('{"schema_version":1}\n')
+        (self.root / "dispatcher-prompt.txt").write_text("stale derived prompt\n")
+        evidence = self.orch.runtime / "logs" / "restore-fixture.json"
+        evidence.write_text('{"restored":true}\n')
+        archive = Path(backup_state(self.orch)["path"])
+        destination = Path(self.tmp.name) / "restored-home"
+        parent = destination.parent
+        os.chmod(parent, 0o755)
+        parent_mode = parent.stat().st_mode & 0o777
+
+        result = restore_backup_archive(archive, destination)
+        self.assertEqual(result["status"], "RESTORED")
+        self.assertEqual(result["health"]["status"], "READY")
+        self.assertEqual(result["source_schema_version"], 3)
+        self.assertEqual(result["restored_schema_version"], 3)
+        self.assertEqual(parent.stat().st_mode & 0o777, parent_mode)
+        self.assertTrue((destination / ".runtime" / "orch.sqlite3").is_file())
+        self.assertEqual(
+            (destination / ".runtime" / "logs" / "restore-fixture.json").read_text(),
+            '{"restored":true}\n',
+        )
+        self.assertTrue((destination / "config.json").is_file())
+        self.assertFalse((destination / "dispatcher-prompt.txt").exists())
+        claims = destination / ".runtime" / "claims"
+        self.assertTrue(claims.is_dir())
+        self.assertEqual(list(claims.iterdir()), [])
+        receipt = destination / "restore-receipt.json"
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        receipt_data = json.loads(receipt.read_text())
+        self.assertFalse(receipt_data["dispatcher_prompt_restored"])
+        self.assertEqual(
+            receipt_data["dispatcher_prompt_action"],
+            "regenerate_with_orch_dispatcher_render",
+        )
+        leftovers = list(parent.glob(f".{destination.name}.restore-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_restore_backup_refuses_existing_destination(self):
+        archive = Path(backup_state(self.orch)["path"])
+        destination = Path(self.tmp.name) / "existing-home"
+        destination.mkdir()
+        marker = destination / "owner.txt"
+        marker.write_text("keep\n")
+        with self.assertRaisesRegex(ValueError, "restore_destination_exists"):
+            restore_backup_archive(archive, destination)
+        self.assertEqual(marker.read_text(), "keep\n")
+
+    def test_restore_backup_cleans_staging_if_atomic_publish_fails(self):
+        archive = Path(backup_state(self.orch)["path"])
+        destination = Path(self.tmp.name) / "failed-restore"
+        with mock.patch("orch.state.os.replace", side_effect=OSError("synthetic rename failure")):
+            with self.assertRaisesRegex(OSError, "synthetic rename failure"):
+                restore_backup_archive(archive, destination)
+        self.assertFalse(destination.exists())
+        leftovers = list(destination.parent.glob(f".{destination.name}.restore-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_restore_backup_migrates_verified_schema_v2_archive(self):
+        workspace = Path(self.tmp.name) / "legacy-restore-workspace"
+        workspace.mkdir()
+        legacy_db = Path(self.tmp.name) / "legacy-v2.sqlite3"
+        db = sqlite3.connect(str(legacy_db))
+        try:
+            db.execute(
+                "CREATE TABLE tasks ("
+                "task_id TEXT PRIMARY KEY, plan_revision TEXT NOT NULL, ordinal INTEGER NOT NULL,"
+                "status TEXT NOT NULL, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            payload = {
+                "id": "LEGACY-RESTORE",
+                "project_id": "legacy-project",
+                "goal": "legacy restore",
+                "workspace": str(workspace),
+                "dependencies": [],
+                "allowed_paths": ["out.json"],
+                "protected_paths": {},
+                "checks": [],
+                "publication": {"kind": "none"},
+                "max_attempts": 2,
+            }
+            db.execute(
+                "INSERT INTO tasks(task_id,plan_revision,ordinal,status,payload_json,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    "LEGACY-RESTORE", "legacy-v2", 0, "PLANNED",
+                    json.dumps(payload), "2026-01-01T00:00:00Z",
+                ),
+            )
+            db.execute("PRAGMA user_version=2")
+            db.commit()
+        finally:
+            db.close()
+        digest = hashlib.sha256(legacy_db.read_bytes()).hexdigest()
+        archive = Path(self.tmp.name) / "legacy-v2.zip"
+        manifest = {
+            "schema_version": 2,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "source_root": "/legacy/orch",
+            "database_sha256": digest,
+            "excluded_secret_classes": [
+                "claims", "capability_files", "provider_credentials",
+            ],
+        }
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            bundle.write(legacy_db, "state/orch.sqlite3")
+            bundle.writestr(
+                "state/manifest.json",
+                json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            )
+        checked = verify_backup_archive(archive)
+        self.assertEqual(checked["status"], "VERIFIED")
+        self.assertEqual(checked["compatibility"], "UPGRADE_REQUIRED")
+
+        destination = Path(self.tmp.name) / "restored-v3"
+        restored = restore_backup_archive(archive, destination)
+        self.assertEqual(restored["status"], "RESTORED")
+        self.assertEqual(restored["source_schema_version"], 2)
+        self.assertEqual(restored["restored_schema_version"], 3)
+        migrated = Orchestrator(destination)
+        self.assertEqual(check_state(migrated)["schema_version"], 3)
+        history = migration_history(migrated)["migrations"]
+        self.assertEqual(history[-1]["from_version"], 2)
+        self.assertEqual(
+            migrated.status()["tasks"][0]["task_id"], "LEGACY-RESTORE"
+        )
 
     def test_backup_refuses_active_writer(self):
         workspace = Path(self.tmp.name) / "ws"; workspace.mkdir()
