@@ -95,6 +95,8 @@ orch queue resume-project PROJECT_ID
 
 A project pause affects only new dispatch. Existing active runs keep their explicit recovery semantics, and resumed tasks keep their original durable FIFO position.
 
+`orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
+
 Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
 
 ## Optional Review Policy Engine

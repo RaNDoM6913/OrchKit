@@ -243,6 +243,100 @@ class ProductizationTests(unittest.TestCase):
             "READY",
         )
 
+    def test_project_remove_blocks_durable_work_then_allows_after_cancel(self):
+        registry = ProjectRegistry(self.home)
+        config = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="REMOVE-QUEUED", goal="queued",
+            allowed_paths=["remove.json"],
+        )
+        path = self.home / "remove-plan.json"
+        path.write_text(json.dumps(plan))
+        orch = Orchestrator(self.home)
+        orch.load_plan(path)
+
+        def remove():
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = cli_main([
+                    "--root", str(self.home), "project", "remove",
+                    config["project_id"],
+                ])
+            return rc, json.loads(output.getvalue())
+
+        rc1, blocked = remove()
+        self.assertEqual(rc1, 0)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(blocked["reason"], "durable_project_work_present")
+        self.assertEqual(
+            blocked["blocking_tasks"][0]["task_id"], "REMOVE-QUEUED"
+        )
+        self.assertEqual(
+            registry.get(config["project_id"])["project_id"],
+            config["project_id"],
+        )
+
+        orch.pause_project(config["project_id"], "retiring project")
+        orch.cancel_task("REMOVE-QUEUED", "owner retired project")
+        rc2, removed = remove()
+        self.assertEqual(rc2, 0)
+        self.assertEqual(removed["status"], "REMOVED")
+        self.assertEqual(removed["queue_guard"]["status"], "SAFE")
+        self.assertTrue(removed["ledger"]["cleared_pause"])
+        with self.assertRaisesRegex(ValueError, "unknown_project"):
+            registry.get(config["project_id"])
+        self.assertNotIn(
+            config["project_id"], Orchestrator(self.home).status()["project_pauses"]
+        )
+
+    def test_project_remove_blocks_verified_snapshot_reservation(self):
+        registry = ProjectRegistry(self.home)
+        config = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id="REMOVE-VERIFIED", goal="verified",
+            allowed_paths=["verified.json"],
+        )
+        path = self.home / "verified-remove-plan.json"
+        path.write_text(json.dumps(plan))
+        orch = Orchestrator(self.home)
+        orch.load_plan(path)
+        claim = orch.claim("fixture")
+        (self.repo / "verified.json").write_text('{"ok":true}\n')
+        receipt = self.home / "verified-remove-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": "REMOVE-VERIFIED",
+            "changed_paths": ["verified.json"],
+        }))
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home), "project", "remove",
+                config["project_id"],
+            ])
+        blocked = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["blocking_tasks"][0]["status"], "READY_TO_PUBLISH"
+        )
+        self.assertEqual(blocked["writer_locks"][0]["state"], "VERIFIED")
+        self.assertEqual(
+            registry.get(config["project_id"])["project_id"],
+            config["project_id"],
+        )
+
     def test_generated_plan_uses_git_local_when_commit_allowed_without_remote(self):
         config = ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="off")["project"]
         plan = build_single_task_plan(config, task_id="TASK-1", goal="create result", allowed_paths=["result.json"])

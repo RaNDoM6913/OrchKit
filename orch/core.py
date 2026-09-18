@@ -1623,6 +1623,76 @@ class Orchestrator:
             "truncated": total > limit,
         }
 
+    def project_removal_guard(self, project_id: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        terminal = {"DONE", "CANCELLED"}
+        with self.connect() as conn:
+            tasks = [
+                dict(row) for row in conn.execute(
+                    "SELECT task_id,status,queue_seq,updated_at FROM tasks "
+                    "WHERE project_id=? ORDER BY queue_seq,task_id",
+                    (project_id,),
+                ).fetchall()
+            ]
+            blocking_tasks = [
+                item for item in tasks if item["status"] not in terminal
+            ]
+            writer_locks = [
+                item for item in self._active_writer_locks(conn).values()
+                if item.get("project_id") == project_id
+            ]
+            pending_publications = [
+                dict(row) for row in conn.execute(
+                    "SELECT p.run_id,p.status,p.commit_id,p.remote_commit,p.error,p.updated_at "
+                    "FROM publications p JOIN runs r ON r.run_id=p.run_id "
+                    "JOIN tasks t ON t.task_id=r.task_id "
+                    "WHERE t.project_id=? AND p.status NOT IN ('COMPLETE','ABANDONED') "
+                    "ORDER BY p.updated_at",
+                    (project_id,),
+                ).fetchall()
+            ]
+            pause = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (f"project_paused:{project_id}",),
+            ).fetchone()
+        blocked = bool(blocking_tasks or writer_locks or pending_publications)
+        return {
+            "status": "BLOCKED" if blocked else "SAFE",
+            "project_id": project_id,
+            "reason": "durable_project_work_present" if blocked else None,
+            "blocking_tasks": blocking_tasks,
+            "writer_locks": writer_locks,
+            "pending_publications": pending_publications,
+            "historical_task_count": len(tasks),
+            "project_pause": json.loads(pause["value_json"]) if pause else None,
+            "terminal_task_states": sorted(terminal),
+        }
+
+    def record_project_removed(self, project_id: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            key = f"project_paused:{project_id}"
+            pause = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?", (key,)
+            ).fetchone()
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+            self._event(
+                conn, "PROJECT_DEREGISTERED",
+                payload={
+                    "project_id": project_id,
+                    "cleared_pause": bool(pause),
+                },
+            )
+            conn.execute("COMMIT")
+        return {
+            "status": "RECORDED",
+            "project_id": project_id,
+            "cleared_pause": bool(pause),
+        }
+
     def pause_project(self, project_id: str, reason: str) -> Dict[str, Any]:
         if re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")

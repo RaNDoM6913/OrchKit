@@ -207,7 +207,18 @@ def main(argv=None) -> int:
                 result = write_plan(Path(args.output).expanduser(), plan)
                 result["plan"] = plan
             elif args.project_command == "remove":
-                result = registry.remove(args.project_id)
+                registry.get(args.project_id)
+                guard = orch.project_removal_guard(args.project_id)
+                if guard["status"] != "SAFE":
+                    result = guard
+                else:
+                    removed = registry.remove(args.project_id)
+                    recorded = orch.record_project_removed(args.project_id)
+                    result = {
+                        **removed,
+                        "queue_guard": guard,
+                        "ledger": recorded,
+                    }
             else:
                 raise ValueError("unknown_project_command")
         elif args.command == "queue":
