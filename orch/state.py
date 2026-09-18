@@ -147,6 +147,173 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
     }
 
 
+def recovery_inspect(
+    orch: Orchestrator, *, run_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    import re
+    import time
+
+    if run_id is not None and re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
+        raise ValueError("invalid_run_id")
+    if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+        raise ValueError("invalid_project_id")
+
+    with orch.connect() as conn:
+        query = (
+            "SELECT r.run_id,r.task_id,r.attempt,r.worker_id,r.state,r.started_at,"
+            "r.heartbeat_at,r.submitted_at,r.snapshot_id,r.verify_status,r.review_status,"
+            "r.completed_at,r.error,t.status AS task_status,t.project_id,t.writer_key,"
+            "t.payload_json FROM runs r JOIN tasks t ON t.task_id=r.task_id"
+        )
+        clauses: List[str] = []
+        params: List[str] = []
+        if run_id is not None:
+            clauses.append("r.run_id=?")
+            params.append(run_id)
+        if project_id is not None:
+            clauses.append("t.project_id=?")
+            params.append(project_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY r.started_at"
+        rows = conn.execute(query, tuple(params)).fetchall()
+        if run_id is not None and not rows:
+            raise ValueError("unknown_run")
+        publications = {
+            row["run_id"]: dict(row)
+            for row in conn.execute(
+                "SELECT run_id,status,kind,expected_base,commit_id,remote_commit,error,updated_at "
+                "FROM publications ORDER BY updated_at"
+            ).fetchall()
+        }
+        approvals = {
+            row["run_id"]: row["snapshot_id"]
+            for row in conn.execute("SELECT run_id,snapshot_id FROM approvals").fetchall()
+        }
+
+    now = time.time()
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        publication = publications.get(row["run_id"])
+        unresolved_publication = (
+            publication is not None
+            and publication["status"] not in {"COMPLETE", "ABANDONED"}
+        )
+        if (
+            run_id is None
+            and row["state"] not in WRITER_LOCK_RUN_STATES
+            and not unresolved_publication
+        ):
+            continue
+
+        payload = json.loads(row["payload_json"])
+        capability = orch.runtime / "claims" / f"{row['run_id']}.json"
+        capability_present = (
+            capability.exists() and capability.is_file() and not capability.is_symlink()
+        )
+        heartbeat_ts = _parse_utc(row["heartbeat_at"])
+        heartbeat_age = (
+            max(0, int(now - heartbeat_ts)) if heartbeat_ts is not None else None
+        )
+        commands: List[str] = []
+        classification = "TERMINAL"
+
+        if unresolved_publication:
+            classification = "PUBLICATION_RECONCILIATION_REQUIRED"
+            commands = [
+                f"orch publish-reconcile --run-id {row['run_id']}",
+                "Use --resume only when reconciliation reports resume_available=true.",
+            ]
+        elif row["state"] == "RUNNING":
+            if capability_present:
+                classification = "WORKER_MAY_STILL_BE_ACTIVE"
+                commands = [
+                    "Verify the external ChatGPT/RDC worker state; heartbeat age is informational only.",
+                    f"orch abort --run-id {row['run_id']} --reason <reason> --retry",
+                ]
+            else:
+                classification = "CAPABILITY_MISSING"
+                commands = [
+                    "Do not recreate a lease/capability file.",
+                    f"orch abort --run-id {row['run_id']} --reason <reason> --retry",
+                ]
+        elif row["state"] == "RESULT_SUBMITTED":
+            if capability_present:
+                classification = "RESULT_AWAITING_QUIESCE"
+                commands = [
+                    f"orch quiesce --run-id {row['run_id']} --cap <capability_file>",
+                    f"orch verify --run-id {row['run_id']}",
+                ]
+            else:
+                classification = "CAPABILITY_MISSING"
+                commands = [
+                    "Do not recreate a lease/capability file.",
+                    f"orch abort --run-id {row['run_id']} --reason <reason> --retry",
+                ]
+        elif row["state"] == "VERIFYING":
+            classification = "VERIFY_RESUMABLE"
+            commands = [f"orch verify --run-id {row['run_id']}"]
+        elif row["state"] == "REVIEWING":
+            classification = "REVIEW_DECISION_REQUIRED"
+            commands = [
+                f"orch review-decision --run-id {row['run_id']}",
+                "Run the configured reviewer only when policy/billing preflight permits it.",
+            ]
+        elif row["state"] == "VERIFIED":
+            approved = approvals.get(row["run_id"]) == row["snapshot_id"]
+            if payload.get("owner_acceptance") and not approved:
+                classification = "OWNER_DECISION_REQUIRED"
+                commands = [
+                    f"orch approve --run-id {row['run_id']} --note <note>",
+                    "Do not release the verified writer reservation without an explicit disposition.",
+                ]
+            elif payload.get("publication", {}).get("kind", "none") in {"git", "git_local"}:
+                classification = "PUBLICATION_READY"
+                commands = [f"orch publish --run-id {row['run_id']}"]
+            else:
+                classification = "COMPLETION_READY"
+                commands = [f"orch complete --run-id {row['run_id']}"]
+
+        item = {
+            "run_id": row["run_id"],
+            "task_id": row["task_id"],
+            "project_id": row["project_id"],
+            "attempt": row["attempt"],
+            "worker_id": row["worker_id"],
+            "run_state": row["state"],
+            "task_status": row["task_status"],
+            "writer_key": row["writer_key"],
+            "started_at": row["started_at"],
+            "heartbeat_at": row["heartbeat_at"],
+            "heartbeat_age_seconds": heartbeat_age,
+            "capability_expected": row["state"] in {"RUNNING", "RESULT_SUBMITTED"},
+            "capability_present": capability_present,
+            "snapshot_id": row["snapshot_id"],
+            "classification": classification,
+            "publication": publication,
+            "safe_next_steps": commands,
+        }
+        items.append(item)
+
+    caps = capability_health(orch)
+    attention = any(
+        item["classification"] != "TERMINAL" for item in items
+    ) or caps["status"] != "READY"
+    return {
+        "status": "ATTENTION" if attention else "CLEAN",
+        "run_id": run_id,
+        "project_id": project_id,
+        "automatic_expiry": False,
+        "rule": (
+            "Heartbeat age never expires a writer automatically. Observe durable state and "
+            "use only the explicit next step that matches it."
+        ),
+        "items": items,
+        "capabilities": caps,
+    }
+
+
 def prune_capabilities(orch: Orchestrator) -> Dict[str, Any]:
     health = check_state(orch)
     if health["active_runs"]:

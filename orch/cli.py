@@ -16,7 +16,7 @@ from .plan import build_single_task_plan, write_plan
 from .project import PROFILE_DEFAULTS, ProjectRegistry
 from .review_policy import MODES, REVIEWERS
 from .state import (backup_state, check_state, migration_history, prune_capabilities,
-                    prune_retention, retention_status)
+                    prune_retention, recovery_inspect, retention_status)
 
 
 def root_from_args(args: argparse.Namespace) -> Path:
@@ -116,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
     git_policy = git_sub.add_parser("policy"); git_policy.add_argument("project_id")
 
     sub.add_parser("init")
+    recovery = sub.add_parser("recovery", help="inspect durable restart/recovery state")
+    recovery_sub = recovery.add_subparsers(dest="recovery_command", required=True)
+    recovery_inspect_cmd = recovery_sub.add_parser("inspect")
+    recovery_inspect_cmd.add_argument("--run-id")
+    recovery_inspect_cmd.add_argument("--project")
     state = sub.add_parser("state", help="inspect and maintain durable ORCH state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
     state_sub.add_parser("check")
@@ -274,6 +279,13 @@ def main(argv=None) -> int:
                 raise ValueError("unknown_git_command")
         elif args.command == "init":
             result = {"status": "OK", "root": str(root), "db": str(orch.db_path)}
+        elif args.command == "recovery":
+            if args.recovery_command == "inspect":
+                result = recovery_inspect(
+                    orch, run_id=args.run_id, project_id=args.project
+                )
+            else:
+                raise ValueError("unknown_recovery_command")
         elif args.command == "state":
             if args.state_command == "check":
                 result = check_state(orch)

@@ -10,7 +10,7 @@ import zipfile
 
 from orch.core import Orchestrator
 from orch.state import (backup_state, check_state, migration_history, prune_capabilities,
-                        prune_retention, retention_status)
+                        prune_retention, recovery_inspect, retention_status)
 
 
 class StateMaintenanceTests(unittest.TestCase):
@@ -33,6 +33,118 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertIn(result["migration_history"][-1]["details"]["kind"], {
             "transactional_upgrade", "observed_existing_schema",
         })
+
+    def _load_recovery_task(self, task_id="RECOVERY-1", publication=None):
+        workspace = Path(self.tmp.name) / f"ws-{task_id.lower()}"
+        workspace.mkdir()
+        plan = {
+            "schema_version": 1,
+            "plan_revision": f"{task_id.lower()}-v1",
+            "tasks": [{
+                "id": task_id,
+                "project_id": "recovery-project",
+                "goal": "recovery fixture",
+                "workspace": str(workspace),
+                "dependencies": [],
+                "allowed_paths": ["result.json"],
+                "protected_paths": {},
+                "checks": [],
+                "review": {"mode": "off", "reviewer": "none", "placement": "pre_publish"},
+                "owner_acceptance": False,
+                "publication": publication or {"kind": "none"},
+                "max_attempts": 2,
+            }],
+        }
+        path = self.root / f"{task_id}.json"
+        path.write_text(json.dumps(plan))
+        self.orch.load_plan(path)
+        return workspace
+
+    def test_recovery_inspect_running_is_read_only_and_secret_free(self):
+        self._load_recovery_task()
+        claim = self.orch.claim("scheduled-worker")
+        capability = Path(claim["capability_file"])
+
+        result = recovery_inspect(self.orch)
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["automatic_expiry"])
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertEqual(item["classification"], "WORKER_MAY_STILL_BE_ACTIVE")
+        self.assertTrue(item["capability_present"])
+        self.assertTrue(item["capability_expected"])
+        self.assertIn("abort --run-id", " ".join(item["safe_next_steps"]))
+        self.assertNotIn("lease_token", json.dumps(result))
+        self.assertTrue(capability.exists())
+
+    def test_recovery_inspect_tracks_submit_quiesce_and_verify_stages(self):
+        workspace = self._load_recovery_task("RECOVERY-STAGES")
+        claim = self.orch.claim("worker")
+        (workspace / "result.json").write_text('{"ok":true}\n')
+        receipt = self.root / "recovery-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": "RECOVERY-STAGES",
+            "changed_paths": ["result.json"],
+        }))
+        cap = Path(claim["capability_file"])
+        lease = self.orch.lease_from_capability(claim["run_id"], cap)
+        self.orch.submit(claim["run_id"], lease, receipt)
+
+        submitted = recovery_inspect(self.orch, run_id=claim["run_id"])
+        self.assertEqual(
+            submitted["items"][0]["classification"], "RESULT_AWAITING_QUIESCE"
+        )
+        self.assertTrue(submitted["items"][0]["capability_present"])
+
+        self.orch.quiesce(claim["run_id"], lease)
+        verifying = recovery_inspect(self.orch, run_id=claim["run_id"])
+        self.assertEqual(
+            verifying["items"][0]["classification"], "VERIFY_RESUMABLE"
+        )
+        self.assertFalse(verifying["items"][0]["capability_present"])
+
+        verified = self.orch.verify(claim["run_id"])
+        self.assertEqual(verified["status"], "VERIFIED")
+        ready = recovery_inspect(self.orch, run_id=claim["run_id"])
+        self.assertEqual(
+            ready["items"][0]["classification"], "COMPLETION_READY"
+        )
+        self.assertIn(
+            f"orch complete --run-id {claim['run_id']}",
+            ready["items"][0]["safe_next_steps"],
+        )
+
+    def test_recovery_inspect_missing_capability_never_recreates_it(self):
+        self._load_recovery_task("RECOVERY-MISSING")
+        claim = self.orch.claim("worker")
+        cap = Path(claim["capability_file"])
+        cap.unlink()
+
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        item = result["items"][0]
+        self.assertEqual(item["classification"], "CAPABILITY_MISSING")
+        self.assertFalse(item["capability_present"])
+        self.assertIn("Do not recreate", item["safe_next_steps"][0])
+        self.assertFalse(cap.exists())
+
+    def test_recovery_inspect_prioritizes_publication_reconciliation(self):
+        self._load_recovery_task("RECOVERY-PUB")
+        claim = self.orch.claim("worker")
+        self.orch._publication_update(
+            claim["run_id"], status="INTENT", operation_id="recovery-fixture",
+            kind="git_local", expected_base="a" * 40,
+        )
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        item = result["items"][0]
+        self.assertEqual(
+            item["classification"], "PUBLICATION_RECONCILIATION_REQUIRED"
+        )
+        self.assertEqual(item["publication"]["status"], "INTENT")
+        self.assertIn(
+            f"orch publish-reconcile --run-id {claim['run_id']}",
+            item["safe_next_steps"][0],
+        )
 
     def test_runtime_permissions_are_private_and_existing_modes_are_repaired(self):
         private_dirs = [
