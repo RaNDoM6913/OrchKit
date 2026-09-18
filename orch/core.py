@@ -25,6 +25,9 @@ STATE_SCHEMA_VERSION = 4
 WORKER_RECEIPT_MAX_BYTES = 64 * 1024
 WORKER_RECEIPT_MAX_CHANGED_PATHS = 256
 WORKER_RECEIPT_MAX_SUMMARY_BYTES = 4096
+REVIEW_REPORT_MAX_BYTES = 256 * 1024
+REVIEW_REPORT_MAX_FINDINGS = 100
+REVIEW_REPORT_MAX_UNCERTAINTY = 100
 
 
 def utc_now() -> str:
@@ -406,15 +409,21 @@ class Orchestrator:
         receipts = ensure_private_dir(self.runtime / "worker_receipts")
         return receipts / f"{run_id}.json"
 
-    def _load_worker_receipt(
-        self, run_id: str, receipt_path: Path
-    ) -> Tuple[Dict[str, Any], str, int]:
-        expected = self._receipt_path(run_id)
+    def _read_bounded_ingest_file(
+        self,
+        expected: Path,
+        supplied_path: Path,
+        *,
+        max_bytes: int,
+        invalid_path_error: str,
+        unsafe_error: str,
+        too_large_error: str,
+    ) -> bytes:
         supplied = Path(
-            os.path.abspath(os.path.expanduser(str(receipt_path)))
+            os.path.abspath(os.path.expanduser(str(supplied_path)))
         )
         if supplied != expected:
-            raise ValueError("invalid_receipt_path")
+            raise ValueError(invalid_path_error)
         flags = os.O_RDONLY
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -423,21 +432,41 @@ class Orchestrator:
         try:
             fd = os.open(str(expected), flags)
         except OSError as exc:
-            raise ValueError("receipt_file_missing_or_unsafe") from exc
+            raise ValueError(unsafe_error) from exc
         try:
             info = os.fstat(fd)
             if not statmod.S_ISREG(info.st_mode):
-                raise ValueError("receipt_file_missing_or_unsafe")
-            if info.st_size > WORKER_RECEIPT_MAX_BYTES:
-                raise ValueError("receipt_too_large")
+                raise ValueError(unsafe_error)
+            if info.st_size > max_bytes:
+                raise ValueError(too_large_error)
             with os.fdopen(fd, "rb", closefd=True) as handle:
                 fd = -1
-                raw = handle.read(WORKER_RECEIPT_MAX_BYTES + 1)
+                raw = handle.read(max_bytes + 1)
         finally:
             if fd >= 0:
                 os.close(fd)
-        if len(raw) > WORKER_RECEIPT_MAX_BYTES:
-            raise ValueError("receipt_too_large")
+        if len(raw) > max_bytes:
+            raise ValueError(too_large_error)
+        return raw
+
+    def _review_report_path(self, run_id: str) -> Path:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
+            raise ValueError("invalid_run_id")
+        review_root = ensure_private_dir(self.runtime / "review_exports")
+        return review_root / run_id / "review.json"
+
+    def _load_worker_receipt(
+        self, run_id: str, receipt_path: Path
+    ) -> Tuple[Dict[str, Any], str, int]:
+        expected = self._receipt_path(run_id)
+        raw = self._read_bounded_ingest_file(
+            expected,
+            receipt_path,
+            max_bytes=WORKER_RECEIPT_MAX_BYTES,
+            invalid_path_error="invalid_receipt_path",
+            unsafe_error="receipt_file_missing_or_unsafe",
+            too_large_error="receipt_too_large",
+        )
         try:
             receipt = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1712,8 +1741,83 @@ class Orchestrator:
             manifest = json.loads(snap["manifest_json"])
             return decide_review(payload, manifest, attempt=int(run["attempt"]))
 
+    def _load_review_report(
+        self, run_id: str, report_path: Path
+    ) -> Tuple[Dict[str, Any], str, int]:
+        expected = self._review_report_path(run_id)
+        raw = self._read_bounded_ingest_file(
+            expected,
+            report_path,
+            max_bytes=REVIEW_REPORT_MAX_BYTES,
+            invalid_path_error="invalid_review_report_path",
+            unsafe_error="review_report_missing_or_unsafe",
+            too_large_error="review_report_too_large",
+        )
+        try:
+            report = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_review_report_json") from exc
+        if not isinstance(report, dict):
+            raise ValueError("invalid_review_report")
+        allowed = {"run_id", "snapshot_id", "verdict", "findings", "uncertainty"}
+        unknown = sorted(set(report) - allowed)
+        if unknown:
+            raise ValueError("review_report_unknown_field:" + unknown[0])
+        if not isinstance(report.get("run_id"), str):
+            raise ValueError("invalid_review_run_id")
+        snapshot_id = report.get("snapshot_id")
+        if (
+            not isinstance(snapshot_id, str)
+            or not snapshot_id.startswith("sha256:")
+            or len(snapshot_id) != len("sha256:") + 64
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_id) is None
+        ):
+            raise ValueError("invalid_review_snapshot_id")
+        verdict = report.get("verdict")
+        if verdict not in {"PASS", "NEEDS_FIX", "BLOCKED"}:
+            raise ValueError("invalid_review_verdict")
+        findings = report.get("findings")
+        if not isinstance(findings, list):
+            raise ValueError("invalid_review_findings")
+        if len(findings) > REVIEW_REPORT_MAX_FINDINGS:
+            raise ValueError("review_findings_too_many")
+        normalized_findings: List[Dict[str, str]] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                raise ValueError("invalid_review_finding")
+            required = {"severity", "path", "evidence", "impact"}
+            if set(finding) != required:
+                raise ValueError("invalid_review_finding_fields")
+            normalized: Dict[str, str] = {}
+            for key in ("severity", "path", "evidence", "impact"):
+                value = finding.get(key)
+                if not isinstance(value, str):
+                    raise ValueError(f"invalid_review_finding_{key}")
+                limit = 1024 if key in {"severity", "path"} else 4096
+                if len(value.encode("utf-8")) > limit:
+                    raise ValueError(f"review_finding_{key}_too_large")
+                normalized[key] = value
+            normalized_findings.append(normalized)
+        uncertainty = report.get("uncertainty")
+        if not isinstance(uncertainty, list):
+            raise ValueError("invalid_review_uncertainty")
+        if len(uncertainty) > REVIEW_REPORT_MAX_UNCERTAINTY:
+            raise ValueError("review_uncertainty_too_many")
+        normalized_uncertainty: List[str] = []
+        for item in uncertainty:
+            if not isinstance(item, str):
+                raise ValueError("invalid_review_uncertainty_item")
+            if len(item.encode("utf-8")) > 2048:
+                raise ValueError("review_uncertainty_item_too_large")
+            normalized_uncertainty.append(item)
+        report["findings"] = normalized_findings
+        report["uncertainty"] = normalized_uncertainty
+        return report, sha256_bytes(raw), len(raw)
+
     def import_review(self, run_id: str, report_path: Path) -> Dict[str, Any]:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report, report_sha256, report_bytes = self._load_review_report(
+            run_id, report_path
+        )
         verdict = report.get("verdict")
         if verdict not in {"PASS", "NEEDS_FIX", "BLOCKED"}:
             raise ValueError("invalid_review_verdict")
@@ -1737,10 +1841,23 @@ class Orchestrator:
                              (verdict, canonical_json(feedback), run_id))
                 conn.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
                              ("NEEDS_FIX" if verdict == "NEEDS_FIX" else "BLOCKED", now, run["task_id"]))
-            self._event(conn, "REVIEW_IMPORTED", task_id=run["task_id"], run_id=run_id,
-                        payload={"verdict": verdict, "snapshot_id": run["snapshot_id"]})
+            self._event(
+                conn, "REVIEW_IMPORTED",
+                task_id=run["task_id"], run_id=run_id,
+                payload={
+                    "verdict": verdict,
+                    "snapshot_id": run["snapshot_id"],
+                    "report_sha256": report_sha256,
+                    "report_bytes": report_bytes,
+                },
+            )
             conn.execute("COMMIT")
-        return {"status": verdict, "run_id": run_id}
+        return {
+            "status": verdict,
+            "run_id": run_id,
+            "report_sha256": report_sha256,
+            "report_bytes": report_bytes,
+        }
 
     def _assert_manifest_current(self, payload: Dict[str, Any],
                                  manifest: Dict[str, Any]) -> None:

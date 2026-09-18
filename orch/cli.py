@@ -611,7 +611,7 @@ def main(argv=None) -> int:
         elif args.command == "review-decision":
             result = orch.review_decision(args.run_id)
         elif args.command == "review-import":
-            result = orch.import_review(args.run_id, Path(args.report).expanduser().resolve())
+            result = orch.import_review(args.run_id, Path(args.report).expanduser())
         elif args.command == "complete":
             result = orch.complete(args.run_id)
         elif args.command == "approve":

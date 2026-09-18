@@ -763,14 +763,84 @@ class OrchestratorTests(unittest.TestCase):
         self.load([self.task('T1',review=True)])
         c1=self.orch.claim('w1'); verified=self.write_result(c1,'T1')
         self.assertEqual(verified['status'],'REVIEWING')
-        wrong=self.root/'wrong.json'; wrong.write_text(json.dumps({'run_id':c1['run_id'],'snapshot_id':'sha256:wrong','verdict':'PASS','findings':[],'uncertainty':[]})+'\n')
+        prepared=prepare_review(self.orch,c1['run_id'])
+        report=Path(prepared['report'])
+        report.write_text(json.dumps({
+            'run_id':c1['run_id'],
+            'snapshot_id':'sha256:' + ('0' * 64),
+            'verdict':'PASS','findings':[],'uncertainty':[]
+        })+'\n')
         with self.assertRaisesRegex(ValueError,'stale_review'):
-            self.orch.import_review(c1['run_id'],wrong)
-        report=self.root/'review.json'; report.write_text(json.dumps({'run_id':c1['run_id'],'snapshot_id':verified['snapshot_id'],'verdict':'NEEDS_FIX','findings':[{'severity':'important','path':'T1.json','evidence':'fixture','impact':'repair'}],'uncertainty':[]})+'\n')
-        self.orch.import_review(c1['run_id'],report)
+            self.orch.import_review(c1['run_id'],report)
+        raw=(json.dumps({
+            'run_id':c1['run_id'],'snapshot_id':verified['snapshot_id'],
+            'verdict':'NEEDS_FIX',
+            'findings':[{
+                'severity':'important','path':'T1.json',
+                'evidence':'fixture','impact':'repair'
+            }],
+            'uncertainty':[]
+        })+'\n').encode('utf-8')
+        report.write_bytes(raw)
+        imported=self.orch.import_review(c1['run_id'],report)
+        self.assertEqual(imported['report_sha256'],hashlib.sha256(raw).hexdigest())
+        self.assertEqual(imported['report_bytes'],len(raw))
         c2=self.orch.claim('w2')
         self.assertEqual(c2['context']['feedback']['kind'],'review')
         self.assertEqual(c2['context']['feedback']['findings'][0]['path'],'T1.json')
+
+    def _review_fixture(self, task_id):
+        self.load([self.task(task_id,review=True)],revision=f'{task_id}-plan')
+        claim=self.orch.claim('review-worker')
+        verified=self.write_result(claim,task_id)
+        self.assertEqual(verified['status'],'REVIEWING')
+        prepared=prepare_review(self.orch,claim['run_id'])
+        return claim,verified,Path(prepared['report'])
+
+    def test_review_import_rejects_alternate_report_path(self):
+        claim,verified,expected=self._review_fixture('REVIEW-PATH')
+        alternate=self.root/'alternate-review.json'
+        alternate.write_text(json.dumps({
+            'run_id':claim['run_id'],'snapshot_id':verified['snapshot_id'],
+            'verdict':'PASS','findings':[],'uncertainty':[]
+        }))
+        with self.assertRaisesRegex(ValueError,'invalid_review_report_path'):
+            self.orch.import_review(claim['run_id'],alternate)
+        self.assertFalse(expected.exists())
+
+    def test_review_import_rejects_symlinked_and_oversized_report(self):
+        claim,verified,report=self._review_fixture('REVIEW-FILE')
+        external=self.root/'external-review.json'
+        external.write_text(json.dumps({
+            'run_id':claim['run_id'],'snapshot_id':verified['snapshot_id'],
+            'verdict':'PASS','findings':[],'uncertainty':[]
+        }))
+        report.symlink_to(external)
+        with self.assertRaisesRegex(ValueError,'review_report_missing_or_unsafe'):
+            self.orch.import_review(claim['run_id'],report)
+        report.unlink()
+        report.write_bytes(b'{' + (b'x' * (256 * 1024 + 1)))
+        with self.assertRaisesRegex(ValueError,'review_report_too_large'):
+            self.orch.import_review(claim['run_id'],report)
+
+    def test_review_import_bounds_structure(self):
+        claim,verified,report=self._review_fixture('REVIEW-STRUCT')
+        base={
+            'run_id':claim['run_id'],'snapshot_id':verified['snapshot_id'],
+            'verdict':'PASS','findings':[],'uncertainty':[]
+        }
+        unknown=dict(base); unknown['extra']=True
+        report.write_text(json.dumps(unknown))
+        with self.assertRaisesRegex(ValueError,'review_report_unknown_field:extra'):
+            self.orch.import_review(claim['run_id'],report)
+        many=dict(base)
+        many['findings']=[
+            {'severity':'info','path':'x','evidence':'e','impact':'i'}
+            for _ in range(101)
+        ]
+        report.write_text(json.dumps(many))
+        with self.assertRaisesRegex(ValueError,'review_findings_too_many'):
+            self.orch.import_review(claim['run_id'],report)
 
     def test_owner_approval_is_snapshot_bound(self):
         task=self.task('T1'); task['owner_acceptance']=True

@@ -137,7 +137,7 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
                             'Only rerun an approved check when necessary; never expand beyond the exported workspace.',
                             'Report only concrete findings.','PASS only when the stated goal/checklist is met.']}
     prompt_path=export/'review_prompt.json'; prompt_path.write_text(json.dumps(prompt,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-    return {'export':str(export),'workspace':str(work),'schema':str(schema_path),'prompt':str(prompt_path),'snapshot_id':run['snapshot_id']}
+    return {'export':str(export),'workspace':str(work),'schema':str(schema_path),'prompt':str(prompt_path),'report':str(export/'review.json'),'snapshot_id':run['snapshot_id']}
 
 
 def run_review(orch: Orchestrator, run_id: str, *, execute: bool=False) -> Dict[str, Any]:
