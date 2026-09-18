@@ -28,6 +28,14 @@ WORKER_RECEIPT_MAX_SUMMARY_BYTES = 4096
 REVIEW_REPORT_MAX_BYTES = 256 * 1024
 REVIEW_REPORT_MAX_FINDINGS = 100
 REVIEW_REPORT_MAX_UNCERTAINTY = 100
+PLAN_MAX_BYTES = 1024 * 1024
+PLAN_MAX_TASKS = 512
+PLAN_MAX_ALLOWED_PATHS = 512
+PLAN_MAX_PROTECTED_PATHS = 512
+PLAN_MAX_DEPENDENCIES = 128
+PLAN_MAX_CHECKS = 64
+PLAN_MAX_ARGV = 64
+PLAN_MAX_NON_GOALS = 128
 
 
 def utc_now() -> str:
@@ -291,57 +299,281 @@ def prepare_task_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def read_plan_document(plan_path: Path) -> Tuple[Dict[str, Any], str, int]:
+    supplied = Path(os.path.abspath(os.path.expanduser(str(plan_path))))
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif supplied.is_symlink():
+        raise ValueError("plan_file_missing_or_unsafe")
+    try:
+        fd = os.open(str(supplied), flags)
+    except OSError as exc:
+        raise ValueError("plan_file_missing_or_unsafe") from exc
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode):
+            raise ValueError("plan_file_missing_or_unsafe")
+        if info.st_size > PLAN_MAX_BYTES:
+            raise ValueError("plan_too_large")
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            raw = handle.read(PLAN_MAX_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > PLAN_MAX_BYTES:
+        raise ValueError("plan_too_large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_plan_json") from exc
+    if not isinstance(data, dict):
+        raise ValueError("invalid_plan")
+    return data, sha256_bytes(raw), len(raw)
+
+
+def _bounded_text(
+    value: Any, error: str, *, max_bytes: int, allow_empty: bool = False
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(error)
+    if not allow_empty and not value.strip():
+        raise ValueError(error)
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(error + "_too_large")
+    if "\x00" in value or "\r" in value or "\n" in value:
+        raise ValueError(error + "_control_character")
+    return value
+
+
 def validate_task_definition(item: Dict[str, Any]) -> None:
-    workspace = Path(item.get("workspace", ""))
+    if not isinstance(item, dict):
+        raise ValueError("invalid_task")
+    allowed_fields = {
+        "id", "project_id", "writer_key", "goal", "non_goals", "workspace",
+        "dependencies", "allowed_paths", "protected_paths", "checks",
+        "required_review", "review", "owner_acceptance", "publication",
+        "max_attempts",
+    }
+    unknown = sorted(set(item) - allowed_fields)
+    if unknown:
+        raise ValueError("unknown_task_field:" + unknown[0])
+
+    task_id = item.get("id")
+    if (
+        not isinstance(task_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", task_id) is None
+    ):
+        raise ValueError("invalid_task_id")
+    _bounded_text(item.get("goal"), "invalid_goal", max_bytes=16 * 1024)
+
+    non_goals = item.get("non_goals", [])
+    if not isinstance(non_goals, list) or len(non_goals) > PLAN_MAX_NON_GOALS:
+        raise ValueError("invalid_non_goals")
+    for value in non_goals:
+        _bounded_text(value, "invalid_non_goal", max_bytes=4096)
+
+    workspace_value = _bounded_text(
+        item.get("workspace"), "invalid_workspace", max_bytes=4096
+    )
+    workspace = Path(workspace_value)
     if not workspace.is_absolute():
         raise ValueError("workspace_must_be_absolute")
+    if workspace.is_symlink() or not workspace.is_dir():
+        raise ValueError("workspace_missing_or_unsafe")
+
     project_id = item.get("project_id")
     if project_id is not None and (
-        not isinstance(project_id, str) or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None
+        not isinstance(project_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None
     ):
         raise ValueError("invalid_project_id")
     task_writer_key(item)
+
+    dependencies = item.get("dependencies", [])
+    if (
+        not isinstance(dependencies, list)
+        or len(dependencies) > PLAN_MAX_DEPENDENCIES
+    ):
+        raise ValueError("invalid_dependency")
+    if len(dependencies) != len(set(dependencies)):
+        raise ValueError("duplicate_dependency")
+    for dep in dependencies:
+        if (
+            not isinstance(dep, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", dep) is None
+            or dep == task_id
+        ):
+            raise ValueError("invalid_dependency")
+
     allowed = item.get("allowed_paths", [])
-    if not isinstance(allowed, list) or not allowed:
+    if (
+        not isinstance(allowed, list)
+        or not allowed
+        or len(allowed) > PLAN_MAX_ALLOWED_PATHS
+    ):
         raise ValueError("allowed_paths_required")
+    normalized_allowed: List[str] = []
     for relative in allowed:
-        if not isinstance(relative, str) or not relative:
-            raise ValueError("invalid_allowed_path")
-        normalize_relative_path(relative.rstrip("/"))
+        _bounded_text(relative, "invalid_allowed_path", max_bytes=1024)
+        normalized_allowed.append(normalize_relative_path(relative.rstrip("/")))
+    if len(normalized_allowed) != len(set(normalized_allowed)):
+        raise ValueError("duplicate_allowed_path")
+
     protected = item.get("protected_paths", {})
-    if not isinstance(protected, dict):
+    if (
+        not isinstance(protected, dict)
+        or len(protected) > PLAN_MAX_PROTECTED_PATHS
+    ):
         raise ValueError("invalid_protected_paths")
     for relative, digest in protected.items():
+        _bounded_text(relative, "invalid_protected_path", max_bytes=1024)
         normalize_relative_path(relative)
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
             raise ValueError("invalid_protected_hash")
+
     checks = item.get("checks", [])
-    if not isinstance(checks, list):
+    if not isinstance(checks, list) or len(checks) > PLAN_MAX_CHECKS:
         raise ValueError("invalid_checks")
+    check_fields = {
+        "id", "argv", "cwd", "timeout_sec",
+        "authority_paths", "authority_absent_paths",
+    }
     for check in checks:
         if not isinstance(check, dict):
             raise ValueError("invalid_check")
+        extra = sorted(set(check) - check_fields)
+        if extra:
+            raise ValueError("unknown_check_field:" + extra[0])
+        check_id = check.get("id", "unnamed")
+        _bounded_text(check_id, "invalid_check_id", max_bytes=128)
         argv = check.get("argv")
-        if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg for arg in argv):
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or len(argv) > PLAN_MAX_ARGV
+        ):
             raise ValueError("invalid_check_argv")
+        for arg in argv:
+            _bounded_text(arg, "invalid_check_argv", max_bytes=4096)
         cwd = check.get("cwd", ".")
-        if not isinstance(cwd, str) or not cwd:
-            raise ValueError("invalid_check_cwd")
+        _bounded_text(cwd, "invalid_check_cwd", max_bytes=1024)
         if cwd != ".":
             normalize_relative_path(cwd)
         timeout = check.get("timeout_sec", 30)
-        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120:
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 1 <= timeout <= 120
+        ):
             raise ValueError("invalid_check_timeout")
         for field in ("authority_paths", "authority_absent_paths"):
             values = check.get(field, [])
-            if not isinstance(values, list):
+            if not isinstance(values, list) or len(values) > 128:
                 raise ValueError(f"invalid_{field}")
+            if len(values) != len(set(values)):
+                raise ValueError(f"duplicate_{field}")
             for relative in values:
-                if not isinstance(relative, str) or not relative:
-                    raise ValueError(f"invalid_{field}")
+                _bounded_text(
+                    relative, f"invalid_{field}", max_bytes=1024
+                )
                 normalize_relative_path(relative)
+
+    required_review = item.get("required_review", False)
+    if not isinstance(required_review, bool):
+        raise ValueError("invalid_required_review")
+    owner_acceptance = item.get("owner_acceptance", False)
+    if not isinstance(owner_acceptance, bool):
+        raise ValueError("invalid_owner_acceptance")
+
+    review = item.get("review")
+    if review is not None:
+        if not isinstance(review, dict):
+            raise ValueError("invalid_review_policy")
+        review_fields = {
+            "mode", "reviewer", "placement", "risk_tags", "trigger_tags",
+            "sensitive_patterns", "large_diff_files", "large_diff_bytes",
+            "review_on_retry",
+        }
+        extra = sorted(set(review) - review_fields)
+        if extra:
+            raise ValueError("unknown_review_field:" + extra[0])
+    normalized_review = normalize_review_policy(item)
+    for field, limit in (
+        ("risk_tags", 128),
+        ("trigger_tags", 128),
+        ("sensitive_patterns", 256),
+    ):
+        values = normalized_review[field]
+        if not isinstance(values, list) or len(values) > limit:
+            raise ValueError("invalid_review_" + field)
+        for value in values:
+            _bounded_text(
+                value, "invalid_review_" + field, max_bytes=512
+            )
+    if (
+        normalized_review["large_diff_files"] < 1
+        or normalized_review["large_diff_files"] > 10000
+        or normalized_review["large_diff_bytes"] < 1
+        or normalized_review["large_diff_bytes"] > 100 * 1024 * 1024
+    ):
+        raise ValueError("invalid_review_threshold")
+
+    publication = item.get("publication", {"kind": "none"})
+    if not isinstance(publication, dict):
+        raise ValueError("invalid_publication")
+    publication_fields = {
+        "kind", "branch", "remote", "remote_url", "transport_kind",
+        "ref", "expected_base", "commit_message",
+    }
+    extra = sorted(set(publication) - publication_fields)
+    if extra:
+        raise ValueError("unknown_publication_field:" + extra[0])
+    kind = publication.get("kind", "none")
+    if kind not in {"none", "git", "git_local"}:
+        raise ValueError("invalid_publication_kind")
+    for field in ("branch", "remote", "ref"):
+        value = publication.get(field)
+        if value is not None:
+            _bounded_text(
+                value, "invalid_publication_" + field, max_bytes=512
+            )
+    remote_url = publication.get("remote_url")
+    if remote_url is not None:
+        _bounded_text(
+            remote_url, "invalid_publication_remote_url", max_bytes=4096
+        )
+    transport_kind = publication.get("transport_kind")
+    if transport_kind is not None and transport_kind not in {
+        "file", "https", "ssh"
+    }:
+        raise ValueError("invalid_publication_transport")
+    expected_base = publication.get("expected_base")
+    if expected_base is not None and (
+        not isinstance(expected_base, str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_base)
+        is None
+    ):
+        raise ValueError("invalid_publication_expected_base")
+    message = publication.get("commit_message")
+    if message is not None:
+        _bounded_text(
+            message, "invalid_publication_commit_message",
+            max_bytes=4096, allow_empty=False,
+        )
+
     attempts = item.get("max_attempts", 2)
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or not 1 <= attempts <= 20:
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or not 1 <= attempts <= 20
+    ):
         raise ValueError("invalid_max_attempts")
 
 
@@ -667,14 +899,35 @@ class Orchestrator:
                      (utc_now(), kind, task_id, run_id, canonical_json(payload or {})))
 
     def load_plan(self, plan_path: Path) -> Dict[str, Any]:
-        data = json.loads(plan_path.read_text(encoding="utf-8"))
-        if data.get("schema_version") != 1 or not data.get("plan_revision"):
+        data, digest, plan_bytes = read_plan_document(plan_path)
+        allowed_top = {"schema_version", "plan_revision", "tasks", "adapter"}
+        unknown_top = sorted(set(data) - allowed_top)
+        if unknown_top:
+            raise ValueError("unknown_plan_field:" + unknown_top[0])
+        revision = data.get("plan_revision")
+        if (
+            data.get("schema_version") != 1
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", revision) is None
+        ):
             raise ValueError("invalid_plan")
+        adapter = data.get("adapter")
+        if adapter is not None and not isinstance(adapter, dict):
+            raise ValueError("invalid_plan_adapter")
         tasks = data.get("tasks")
         if not isinstance(tasks, list) or not tasks:
             raise ValueError("empty_plan")
-        ids = [item.get("id") for item in tasks]
-        if any(not isinstance(item, str) or not item for item in ids) or len(ids) != len(set(ids)):
+        if len(tasks) > PLAN_MAX_TASKS:
+            raise ValueError("plan_too_many_tasks")
+        ids = [item.get("id") if isinstance(item, dict) else None for item in tasks]
+        if (
+            any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", item) is None
+                for item in ids
+            )
+            or len(ids) != len(set(ids))
+        ):
             raise ValueError("invalid_task_ids")
         known = set(ids)
         for item in tasks:
@@ -688,7 +941,6 @@ class Orchestrator:
         prepared_payloads = {
             item["id"]: prepare_task_payload(item) for item in tasks
         }
-        digest = sha256_file(plan_path)
         now = utc_now()
         queued_count = 0
         with self.connect() as conn:
@@ -744,6 +996,7 @@ class Orchestrator:
         return {
             "status": "OK", "plan_revision": data["plan_revision"], "digest": digest,
             "task_count": len(tasks), "queued_count": queued_count,
+            "plan_bytes": plan_bytes,
         }
 
     def _task_payload(self, row: sqlite3.Row) -> Dict[str, Any]:

@@ -545,7 +545,10 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_oversized_context_blocks_without_run_or_capability(self):
         task = self.task("CONTEXT-LARGE")
-        task["goal"] = "x" * 40000
+        task["allowed_paths"] = [
+            f"context/{index:03d}-" + ("x" * 80) + ".json"
+            for index in range(400)
+        ]
         self.load([task], revision="context-large")
 
         result = self.orch.claim("worker")
