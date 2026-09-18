@@ -30,10 +30,10 @@ class StateMaintenanceTests(unittest.TestCase):
     def test_fresh_state_has_schema_version_and_integrity(self):
         result = check_state(self.orch)
         self.assertEqual(result["status"], "READY")
-        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["schema_version"], 4)
         self.assertEqual(result["quick_check"], ["ok"])
         self.assertEqual(result["foreign_key_violations"], [])
-        self.assertEqual(result["migration_history"][-1]["version"], 3)
+        self.assertEqual(result["migration_history"][-1]["version"], 4)
         self.assertIn(result["migration_history"][-1]["details"]["kind"], {
             "transactional_upgrade", "observed_existing_schema",
         })
@@ -227,7 +227,7 @@ class StateMaintenanceTests(unittest.TestCase):
         conn = sqlite3.connect(str(extracted))
         try:
             self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
         finally:
             conn.close()
 
@@ -235,7 +235,7 @@ class StateMaintenanceTests(unittest.TestCase):
         result = backup_state(self.orch)
         verified = verify_backup_archive(Path(result["path"]))
         self.assertEqual(verified["status"], "VERIFIED")
-        self.assertEqual(verified["schema_version"], 3)
+        self.assertEqual(verified["schema_version"], 4)
         self.assertEqual(verified["compatibility"], "CURRENT")
         self.assertEqual(verified["quick_check"], ["ok"])
         self.assertEqual(verified["foreign_key_violations"], [])
@@ -319,8 +319,8 @@ class StateMaintenanceTests(unittest.TestCase):
         result = restore_backup_archive(archive, destination)
         self.assertEqual(result["status"], "RESTORED")
         self.assertEqual(result["health"]["status"], "READY")
-        self.assertEqual(result["source_schema_version"], 3)
-        self.assertEqual(result["restored_schema_version"], 3)
+        self.assertEqual(result["source_schema_version"], 4)
+        self.assertEqual(result["restored_schema_version"], 4)
         self.assertEqual(parent.stat().st_mode & 0o777, parent_mode)
         self.assertTrue((destination / ".runtime" / "orch.sqlite3").is_file())
         self.assertEqual(
@@ -419,13 +419,13 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(checked["status"], "VERIFIED")
         self.assertEqual(checked["compatibility"], "UPGRADE_REQUIRED")
 
-        destination = Path(self.tmp.name) / "restored-v3"
+        destination = Path(self.tmp.name) / "restored-v4"
         restored = restore_backup_archive(archive, destination)
         self.assertEqual(restored["status"], "RESTORED")
         self.assertEqual(restored["source_schema_version"], 2)
-        self.assertEqual(restored["restored_schema_version"], 3)
+        self.assertEqual(restored["restored_schema_version"], 4)
         migrated = Orchestrator(destination)
-        self.assertEqual(check_state(migrated)["schema_version"], 3)
+        self.assertEqual(check_state(migrated)["schema_version"], 4)
         history = migration_history(migrated)["migrations"]
         self.assertEqual(history[-1]["from_version"], 2)
         self.assertEqual(
@@ -879,7 +879,7 @@ class StateMaintenanceTests(unittest.TestCase):
             db.close()
         migrated = Orchestrator(other)
         result = check_state(migrated)
-        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["schema_version"], 4)
         with migrated.connect() as conn:
             row = conn.execute(
                 "SELECT project_id,writer_key,queue_seq FROM tasks WHERE task_id='LEGACY-1'"
@@ -890,6 +890,41 @@ class StateMaintenanceTests(unittest.TestCase):
         history = migration_history(migrated)
         self.assertEqual(history["migrations"][-1]["from_version"], 2)
         self.assertEqual(history["migrations"][-1]["details"]["kind"], "transactional_upgrade")
+
+    def test_schema_v3_adds_durable_claim_git_head_column(self):
+        other = Path(self.tmp.name) / "legacy-v3"
+        runtime = other / ".runtime"
+        runtime.mkdir(parents=True)
+        db_path = runtime / "orch.sqlite3"
+        db = sqlite3.connect(str(db_path))
+        try:
+            db.execute(
+                "CREATE TABLE runs ("
+                "run_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, "
+                "attempt INTEGER NOT NULL, worker_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, lease_token TEXT NOT NULL, "
+                "started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, "
+                "submitted_at TEXT, snapshot_id TEXT, receipt_json TEXT, "
+                "verify_status TEXT, review_status TEXT, feedback_json TEXT, "
+                "completed_at TEXT, error TEXT)"
+            )
+            db.execute("PRAGMA user_version=3")
+            db.commit()
+        finally:
+            db.close()
+
+        migrated = Orchestrator(other)
+        self.assertEqual(check_state(migrated)["schema_version"], 4)
+        with migrated.connect() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+            }
+        self.assertIn("claim_git_head", columns)
+        history = migration_history(migrated)["migrations"]
+        self.assertEqual(history[-1]["version"], 4)
+        self.assertEqual(history[-1]["from_version"], 3)
+        self.assertTrue(history[-1]["details"]["claim_git_head_added"])
 
     def test_failed_schema_upgrade_rolls_back_all_task_ddl(self):
         other = Path(self.tmp.name) / "broken-upgrade"

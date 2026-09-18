@@ -20,7 +20,7 @@ from .review_policy import decide_review, normalize_review_policy
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
 WRITER_LOCK_RUN_STATES = ACTIVE_RUN_STATES | {"VERIFIED"}
 READY_TASK_STATES = {"PLANNED", "READY", "NEEDS_FIX"}
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -418,8 +418,9 @@ class Orchestrator:
         CREATE TABLE IF NOT EXISTS runs (
           run_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt INTEGER NOT NULL,
           worker_id TEXT NOT NULL, state TEXT NOT NULL, lease_token TEXT NOT NULL,
-          started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, submitted_at TEXT,
-          snapshot_id TEXT, receipt_json TEXT, verify_status TEXT, review_status TEXT,
+          started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, claim_git_head TEXT,
+          submitted_at TEXT, snapshot_id TEXT, receipt_json TEXT,
+          verify_status TEXT, review_status TEXT,
           feedback_json TEXT, completed_at TEXT, error TEXT,
           FOREIGN KEY(task_id) REFERENCES tasks(task_id)
         );
@@ -452,45 +453,70 @@ class Orchestrator:
         with self.connect() as conn:
             conn.executescript(schema)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise ValueError(f"unsupported_state_schema:{version}")
-            if version < 3:
+            if version < STATE_SCHEMA_VERSION:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
-                    if "project_id" not in columns:
-                        conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
-                    if "writer_key" not in columns:
-                        conn.execute("ALTER TABLE tasks ADD COLUMN writer_key TEXT")
-                    if "queue_seq" not in columns:
-                        conn.execute("ALTER TABLE tasks ADD COLUMN queue_seq INTEGER")
-                    rows = conn.execute(
-                        "SELECT rowid,task_id,payload_json,project_id,writer_key,queue_seq "
-                        "FROM tasks ORDER BY rowid"
-                    ).fetchall()
-                    next_seq = 0
-                    for row in rows:
-                        payload = json.loads(row["payload_json"])
-                        next_seq = max(next_seq + 1, int(row["queue_seq"] or 0))
+                    migrated_tasks = 0
+                    if version < 3:
+                        columns = {
+                            row["name"]
+                            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+                        }
+                        if "project_id" not in columns:
+                            conn.execute("ALTER TABLE tasks ADD COLUMN project_id TEXT")
+                        if "writer_key" not in columns:
+                            conn.execute("ALTER TABLE tasks ADD COLUMN writer_key TEXT")
+                        if "queue_seq" not in columns:
+                            conn.execute("ALTER TABLE tasks ADD COLUMN queue_seq INTEGER")
+                        rows = conn.execute(
+                            "SELECT rowid,task_id,payload_json,project_id,writer_key,queue_seq "
+                            "FROM tasks ORDER BY rowid"
+                        ).fetchall()
+                        next_seq = 0
+                        for row in rows:
+                            payload = json.loads(row["payload_json"])
+                            next_seq = max(next_seq + 1, int(row["queue_seq"] or 0))
+                            conn.execute(
+                                "UPDATE tasks SET project_id=?,writer_key=?,queue_seq=? "
+                                "WHERE task_id=?",
+                                (
+                                    row["project_id"]
+                                    if row["project_id"] is not None
+                                    else payload.get("project_id"),
+                                    row["writer_key"] or task_writer_key(payload),
+                                    next_seq,
+                                    row["task_id"],
+                                ),
+                            )
+                        migrated_tasks = len(rows)
+                    run_columns = {
+                        row["name"]
+                        for row in conn.execute("PRAGMA table_info(runs)").fetchall()
+                    }
+                    if "claim_git_head" not in run_columns:
                         conn.execute(
-                            "UPDATE tasks SET project_id=?,writer_key=?,queue_seq=? WHERE task_id=?",
-                            (
-                                row["project_id"] if row["project_id"] is not None else payload.get("project_id"),
-                                row["writer_key"] or task_writer_key(payload),
-                                next_seq,
-                                row["task_id"],
-                            ),
+                            "ALTER TABLE runs ADD COLUMN claim_git_head TEXT"
                         )
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
                     conn.execute(
-                        "INSERT OR REPLACE INTO schema_migrations(version,from_version,applied_at,details_json) "
+                        "CREATE INDEX IF NOT EXISTS idx_tasks_queue "
+                        "ON tasks(queue_seq,task_id)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_runs_state_task "
+                        "ON runs(state,task_id)"
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO schema_migrations"
+                        "(version,from_version,applied_at,details_json) "
                         "VALUES(?,?,?,?)",
                         (
                             STATE_SCHEMA_VERSION, version, utc_now(),
                             canonical_json({
                                 "kind": "transactional_upgrade",
-                                "tasks_migrated": len(rows),
+                                "tasks_migrated": migrated_tasks,
+                                "claim_git_head_added": True,
                                 "target_version": STATE_SCHEMA_VERSION,
                             }),
                         ),
@@ -501,10 +527,17 @@ class Orchestrator:
                     conn.execute("ROLLBACK")
                     raise
             else:
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_seq,task_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_state_task ON runs(state,task_id)")
                 conn.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version,from_version,applied_at,details_json) "
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_queue "
+                    "ON tasks(queue_seq,task_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_runs_state_task "
+                    "ON runs(state,task_id)"
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations"
+                    "(version,from_version,applied_at,details_json) "
                     "VALUES(?,?,?,?)",
                     (
                         STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION, utc_now(),
@@ -633,6 +666,60 @@ class Orchestrator:
             result[project_id] = json.loads(row["value_json"])
         return result
 
+    def _claim_git_state(
+        self, payload: Dict[str, Any]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        publication = payload.get("publication") or {}
+        if publication.get("kind") not in {"git", "git_local"}:
+            return None, None
+        workspace = Path(payload["workspace"]).resolve()
+        git_binary = Path("/usr/bin/git")
+        if not git_binary.is_file() or not os.access(str(git_binary), os.X_OK):
+            found = shutil.which("git")
+            if not found:
+                raise ValueError("claim_git_binary_missing")
+            git_binary = Path(found).resolve()
+        env = {
+            key: os.environ[key]
+            for key in ("HOME", "LANG", "LC_ALL", "TMPDIR")
+            if key in os.environ
+        }
+        env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        })
+        prefix = [
+            str(git_binary), "--no-pager",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-C", str(workspace),
+        ]
+        head = subprocess.run(
+            prefix + ["rev-parse", "HEAD"],
+            env=env, capture_output=True, text=True, timeout=15, check=False,
+        )
+        if head.returncode or not head.stdout.strip():
+            raise ValueError("claim_git_head_unavailable")
+        claim_head = head.stdout.strip()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", claim_head) is None:
+            raise ValueError("claim_git_head_invalid")
+        branch = subprocess.run(
+            prefix + ["branch", "--show-current"],
+            env=env, capture_output=True, text=True, timeout=15, check=False,
+        )
+        branch_name = branch.stdout.strip() if branch.returncode == 0 else ""
+        expected_branch = publication.get("branch")
+        if expected_branch and branch_name != expected_branch:
+            raise ValueError("claim_branch_mismatch")
+        expected_base = publication.get("expected_base")
+        if expected_base and claim_head != expected_base:
+            raise ValueError("claim_expected_base_changed")
+        return claim_head, branch_name or None
+
     def claim(self, worker_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
         if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")
@@ -699,12 +786,36 @@ class Orchestrator:
                     }
                 return {"status": "NO_WORK", "project_id": project_id}
             row, payload, attempt = selected
+            try:
+                claim_git_head, claim_branch = self._claim_git_state(payload)
+            except ValueError as exc:
+                reason = str(exc)
+                conn.execute(
+                    "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
+                    (now, row["task_id"]),
+                )
+                self._event(
+                    conn, "TASK_BLOCKED_AT_CLAIM", task_id=row["task_id"],
+                    payload={"reason": reason, "project_id": row["project_id"]},
+                )
+                conn.execute("COMMIT")
+                return {
+                    "status": "BLOCKED",
+                    "task_id": row["task_id"],
+                    "project_id": row["project_id"],
+                    "reason": reason,
+                }
             run_id = f"{row['task_id']}-A{attempt}-{uuid.uuid4().hex[:10]}"
             lease = secrets.token_urlsafe(24)
             conn.execute(
-                "INSERT INTO runs(run_id,task_id,attempt,worker_id,state,lease_token,started_at,heartbeat_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (run_id, row["task_id"], attempt, worker_id, "RUNNING", lease, now, now),
+                "INSERT INTO runs("
+                "run_id,task_id,attempt,worker_id,state,lease_token,"
+                "started_at,heartbeat_at,claim_git_head"
+                ") VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id, row["task_id"], attempt, worker_id, "RUNNING",
+                    lease, now, now, claim_git_head,
+                ),
             )
             conn.execute(
                 "UPDATE tasks SET status='IN_PROGRESS',updated_at=? WHERE task_id=?",
@@ -713,8 +824,12 @@ class Orchestrator:
             self._event(
                 conn, "RUN_CLAIMED", task_id=row["task_id"], run_id=run_id,
                 payload={
-                    "attempt": attempt, "worker_id": worker_id, "project_id": row["project_id"],
-                    "writer_key": row["writer_key"], "queue_seq": row["queue_seq"],
+                    "attempt": attempt, "worker_id": worker_id,
+                    "project_id": row["project_id"],
+                    "writer_key": row["writer_key"],
+                    "queue_seq": row["queue_seq"],
+                    "claim_git_head": claim_git_head,
+                    "claim_branch": claim_branch,
                 },
             )
             conn.execute("COMMIT")
@@ -753,7 +868,9 @@ class Orchestrator:
             feedback = json.loads(previous["feedback_json"]) if previous and previous["feedback_json"] else None
             pack = {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "run_id": run_id,
                     "task_id": task["task_id"], "attempt": run["attempt"], "plan_revision": task["plan_revision"],
-                    "project_id": task["project_id"], "writer_key": task["writer_key"], "queue_seq": task["queue_seq"],
+                    "project_id": task["project_id"], "writer_key": task["writer_key"],
+                    "queue_seq": task["queue_seq"],
+                    "claim_git_head": run["claim_git_head"],
                     "goal": payload.get("goal"), "non_goals": payload.get("non_goals", []),
                     "workspace": payload["workspace"], "allowed_paths": payload.get("allowed_paths", []),
                     "protected_paths": payload.get("protected_paths", {}), "checks": payload.get("checks", []),
@@ -1188,9 +1305,11 @@ class Orchestrator:
                 return self._block_verification(
                     run_id, "workspace_git_unavailable", evidence=scope_evidence
                 )
-            expected_base = publication.get("expected_base")
+            claim_base = run["claim_git_head"]
+            expected_base = claim_base or publication.get("expected_base")
             if expected_base and observed_base != expected_base:
                 scope_evidence["expected_base"] = expected_base
+                scope_evidence["claim_git_head"] = claim_base
                 return self._block_verification(
                     run_id, "workspace_base_changed", evidence=scope_evidence
                 )
@@ -2118,7 +2237,8 @@ class Orchestrator:
             runs = [
                 dict(row) for row in conn.execute(
                     "SELECT r.run_id,r.task_id,r.attempt,r.worker_id,r.state,r.started_at,r.heartbeat_at,"
-                    "r.snapshot_id,r.verify_status,r.review_status,r.completed_at,r.error,"
+                    "r.claim_git_head,r.snapshot_id,r.verify_status,r.review_status,"
+                    "r.completed_at,r.error,"
                     "t.project_id,t.writer_key "
                     "FROM runs r JOIN tasks t ON t.task_id=r.task_id ORDER BY r.started_at"
                 )

@@ -1215,6 +1215,7 @@ class ProductizationTests(unittest.TestCase):
         self.assertIn('PREPARED_PENDING_REF_UPDATE',text)
         self.assertIn('PROJECT_PAUSED',text)
         self.assertIn('PROJECTS_PAUSED',text)
+        self.assertIn('BLOCKED',text)
 
     def test_project_scoped_dispatcher_binds_claim_and_next(self):
         config = ProjectRegistry(self.home).add(

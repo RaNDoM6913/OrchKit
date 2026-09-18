@@ -101,6 +101,123 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(second["status"], "CLAIMED")
         self.assertEqual(second["task_id"], "VERIFY-2")
 
+    def _make_git_workspace(self, name="claim-base-repo"):
+        repo = Path(self.tmp.name) / name
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(repo)], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email",
+             "fixture@example.invalid"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name",
+             "Claim Base Fixture"], check=True
+        )
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", "initial"], check=True
+        )
+        return repo
+
+    def test_dynamic_git_task_binds_head_at_claim(self):
+        repo = self._make_git_workspace("dynamic-claim")
+        task = self.task("CLAIM-DYNAMIC")
+        task["workspace"] = str(repo)
+        task["publication"] = {
+            "kind": "git_local",
+            "branch": "main",
+            "commit_message": "claim dynamic",
+        }
+        self.load([task], revision="claim-dynamic")
+        expected = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["status"], "CLAIMED")
+        self.assertEqual(claim["context"]["claim_git_head"], expected)
+        with self.orch.connect() as conn:
+            row = conn.execute(
+                "SELECT claim_git_head FROM runs WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone()
+        self.assertEqual(row["claim_git_head"], expected)
+
+    def test_foreign_commit_after_dynamic_claim_blocks_verification(self):
+        repo = self._make_git_workspace("dynamic-race")
+        task = self.task("CLAIM-RACE")
+        task["workspace"] = str(repo)
+        task["publication"] = {
+            "kind": "git_local",
+            "branch": "main",
+            "commit_message": "claim race",
+        }
+        self.load([task], revision="claim-race")
+        claim = self.orch.claim("worker")
+        original = claim["context"]["claim_git_head"]
+        (repo / "CLAIM-RACE.json").write_text('{"worker":true}\n')
+        receipt = self.root / "claim-race-receipt.json"
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": "CLAIM-RACE",
+            "changed_paths": ["CLAIM-RACE.json"],
+        }))
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        self.orch.submit(claim["run_id"], lease, receipt)
+        self.orch.quiesce(claim["run_id"], lease)
+
+        foreign = repo / "foreign.txt"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "foreign.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", "foreign",
+             "--", "foreign.txt"],
+            check=True,
+        )
+        result = self.orch.verify(claim["run_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "workspace_base_changed")
+        evidence = result["feedback"]["evidence"]
+        self.assertEqual(evidence["claim_git_head"], original)
+        self.assertNotEqual(evidence["git_head"], original)
+
+    def test_stale_explicit_base_blocks_before_capability_is_created(self):
+        repo = self._make_git_workspace("stale-claim")
+        base = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        task = self.task("CLAIM-STALE")
+        task["workspace"] = str(repo)
+        task["publication"] = {
+            "kind": "git_local",
+            "branch": "main",
+            "expected_base": base,
+            "commit_message": "claim stale",
+        }
+        self.load([task], revision="claim-stale")
+        (repo / "advance.txt").write_text("advance\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "advance.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", "advance"], check=True
+        )
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["status"], "BLOCKED")
+        self.assertEqual(claim["reason"], "claim_expected_base_changed")
+        self.assertEqual(claim["task_id"], "CLAIM-STALE")
+        claims = self.orch.runtime / "claims"
+        self.assertEqual(list(claims.glob("*.json")), [])
+        status = self.orch.status()
+        task_row = next(
+            item for item in status["tasks"] if item["task_id"] == "CLAIM-STALE"
+        )
+        self.assertEqual(task_row["status"], "BLOCKED")
+
     def test_fifo_order_is_preserved_across_separately_loaded_plans(self):
         self.load([self.task("Z-FIRST")], revision="fifo-p1")
         path = self.root / "fifo-p2.json"

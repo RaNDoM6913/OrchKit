@@ -7,7 +7,7 @@ A local, subscription-only coordinator for development performed by real ChatGPT
 Implemented and locally verified through 2026-09-18:
 
 - SQLite durable plan/task/run/event ledger with immutable plan-revision digests.
-- DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation. Writer identity is independently derived from the resolved workspace/Git common directory, so plans cannot spoof isolation; VERIFIED snapshots retain that writer reservation until completion/publication.
+- DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation. Writer identity is independently derived from the resolved workspace/Git common directory, so plans cannot spoof isolation; VERIFIED snapshots retain that writer reservation until completion/publication. Git runs also persist the exact claim-time HEAD, so a foreign commit after capability issuance blocks verification instead of silently becoming the task base.
 - Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capabilities are revoked at quiesce/abort.
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat.
 - Receipt validation against task write allowlists.
@@ -209,4 +209,4 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 python3 -m py_compile orch/*.py
 ```
 
-The current **160-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+The current **164-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, bounded evidence retention, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
