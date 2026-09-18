@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from orch.core import Orchestrator
 from orch.codex_review import prepare_review
@@ -541,6 +542,57 @@ class OrchestratorTests(unittest.TestCase):
             "check_authority_changed:support:authority_file:check_support.py:HASH_CHANGED",
             result["reason"],
         )
+
+    def test_oversized_context_blocks_without_run_or_capability(self):
+        task = self.task("CONTEXT-LARGE")
+        task["goal"] = "x" * 40000
+        self.load([task], revision="context-large")
+
+        result = self.orch.claim("worker")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertTrue(result["reason"].startswith("context_pack_too_large:"))
+        self.assertEqual(
+            list((self.orch.runtime / "claims").glob("*.json")), []
+        )
+        status = self.orch.status()
+        self.assertEqual(status["runs"], [])
+        task_row = next(
+            item for item in status["tasks"]
+            if item["task_id"] == "CONTEXT-LARGE"
+        )
+        self.assertEqual(task_row["status"], "BLOCKED")
+        self.assertEqual(self.orch.reconcile()["status"], "CLEAN")
+
+    def test_capability_write_failure_aborts_run_and_releases_writer(self):
+        self.load(
+            [self.task("CAP-WRITE-FAIL")],
+            revision="cap-write-fail",
+        )
+        with mock.patch(
+            "pathlib.Path.write_text",
+            side_effect=OSError("synthetic capability write failure"),
+        ):
+            result = self.orch.claim("worker")
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "capability_create_failed")
+        self.assertIn("run_id", result)
+        self.assertEqual(
+            list((self.orch.runtime / "claims").glob("*.json")), []
+        )
+        with self.orch.connect() as conn:
+            run = conn.execute(
+                "SELECT state,error,completed_at FROM runs WHERE run_id=?",
+                (result["run_id"],),
+            ).fetchone()
+            task = conn.execute(
+                "SELECT status FROM tasks WHERE task_id='CAP-WRITE-FAIL'"
+            ).fetchone()
+        self.assertEqual(run["state"], "ABORTED")
+        self.assertIn("synthetic capability write failure", run["error"])
+        self.assertTrue(run["completed_at"])
+        self.assertEqual(task["status"], "BLOCKED")
+        self.assertEqual(self.orch.reconcile()["status"], "CLEAN")
 
     def test_scope_escape_rejected(self):
         self.load([self.task('T1')]); c=self.orch.claim('w')

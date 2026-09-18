@@ -896,6 +896,38 @@ class Orchestrator:
                     result["details"] = details
                 return result
             run_id = f"{row['task_id']}-A{attempt}-{uuid.uuid4().hex[:10]}"
+            try:
+                context_pack = self._build_context_pack(
+                    conn,
+                    row,
+                    payload,
+                    run_id=run_id,
+                    attempt=attempt,
+                    claim_git_head=claim_git_head,
+                    run_persisted=False,
+                )
+            except ValueError as exc:
+                reason = str(exc)
+                conn.execute(
+                    "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
+                    (now, row["task_id"]),
+                )
+                self._event(
+                    conn,
+                    "TASK_BLOCKED_CONTEXT",
+                    task_id=row["task_id"],
+                    payload={
+                        "reason": reason,
+                        "project_id": row["project_id"],
+                    },
+                )
+                conn.execute("COMMIT")
+                return {
+                    "status": "BLOCKED",
+                    "task_id": row["task_id"],
+                    "project_id": row["project_id"],
+                    "reason": reason,
+                }
             lease = secrets.token_urlsafe(24)
             conn.execute(
                 "INSERT INTO runs("
@@ -925,16 +957,122 @@ class Orchestrator:
             conn.execute("COMMIT")
         claims = ensure_private_dir(self.runtime / "claims")
         cap = self._capability_path(run_id)
-        cap.write_text(
-            json.dumps({"run_id": run_id, "lease_token": lease}, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        os.chmod(cap, 0o600)
+        try:
+            cap.write_text(
+                json.dumps(
+                    {"run_id": run_id, "lease_token": lease},
+                    separators=(",", ":"),
+                ) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(cap, 0o600)
+        except Exception as exc:
+            try:
+                if cap.exists() and cap.is_file() and not cap.is_symlink():
+                    cap.unlink()
+            except OSError:
+                pass
+            failure = (
+                f"capability_create_failed:{type(exc).__name__}:"
+                f"{str(exc)[:500]}"
+            )
+            failed_at = utc_now()
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE runs SET state='ABORTED',error=?,completed_at=? "
+                    "WHERE run_id=?",
+                    (failure, failed_at, run_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='BLOCKED',updated_at=? "
+                    "WHERE task_id=?",
+                    (failed_at, row["task_id"]),
+                )
+                self._event(
+                    conn,
+                    "RUN_CAPABILITY_CREATE_FAILED",
+                    task_id=row["task_id"],
+                    run_id=run_id,
+                    payload={"reason": failure},
+                )
+                conn.execute("COMMIT")
+            return {
+                "status": "BLOCKED",
+                "task_id": row["task_id"],
+                "project_id": row["project_id"],
+                "run_id": run_id,
+                "reason": "capability_create_failed",
+            }
         return {
-            "status": "CLAIMED", "run_id": run_id, "task_id": row["task_id"],
-            "project_id": row["project_id"], "attempt": attempt,
-            "capability_file": str(cap), "context": self.context(run_id),
+            "status": "CLAIMED",
+            "run_id": run_id,
+            "task_id": row["task_id"],
+            "project_id": row["project_id"],
+            "attempt": attempt,
+            "capability_file": str(cap),
+            "context": context_pack,
         }
+
+    def _build_context_pack(
+        self,
+        conn: sqlite3.Connection,
+        task: sqlite3.Row,
+        payload: Dict[str, Any],
+        *,
+        run_id: str,
+        attempt: int,
+        claim_git_head: Optional[str],
+        run_persisted: bool,
+    ) -> Dict[str, Any]:
+        if run_persisted:
+            previous = conn.execute(
+                "SELECT feedback_json,snapshot_id,attempt FROM runs "
+                "WHERE task_id=? AND run_id<>? AND feedback_json IS NOT NULL "
+                "ORDER BY attempt DESC LIMIT 1",
+                (task["task_id"], run_id),
+            ).fetchone()
+        else:
+            previous = conn.execute(
+                "SELECT feedback_json,snapshot_id,attempt FROM runs "
+                "WHERE task_id=? AND feedback_json IS NOT NULL "
+                "ORDER BY attempt DESC LIMIT 1",
+                (task["task_id"],),
+            ).fetchone()
+        feedback = (
+            json.loads(previous["feedback_json"])
+            if previous and previous["feedback_json"]
+            else None
+        )
+        pack = {
+            "schema_version": 1,
+            "variant": "B_NEW_CHAT_PER_ATTEMPT",
+            "run_id": run_id,
+            "task_id": task["task_id"],
+            "attempt": attempt,
+            "plan_revision": task["plan_revision"],
+            "project_id": task["project_id"],
+            "writer_key": task["writer_key"],
+            "queue_seq": task["queue_seq"],
+            "claim_git_head": claim_git_head,
+            "goal": payload.get("goal"),
+            "non_goals": payload.get("non_goals", []),
+            "workspace": payload["workspace"],
+            "allowed_paths": payload.get("allowed_paths", []),
+            "protected_paths": payload.get("protected_paths", {}),
+            "checks": payload.get("checks", []),
+            "review": normalize_review_policy(payload),
+            "owner_acceptance": bool(payload.get("owner_acceptance")),
+            "publication": payload.get("publication", {"kind": "none"}),
+            "feedback": feedback,
+            "previous_snapshot_id": (
+                previous["snapshot_id"] if previous else None
+            ),
+        }
+        size = len(canonical_json(pack).encode("utf-8"))
+        if size > 32768:
+            raise ValueError(f"context_pack_too_large:{size}")
+        return pack
 
     def lease_from_capability(self, run_id: str, capability_file: Path) -> str:
         path = capability_file.resolve()
@@ -948,28 +1086,24 @@ class Orchestrator:
 
     def context(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:
-            run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
             if not run:
                 raise ValueError("unknown_run")
-            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)
+            ).fetchone()
             payload = self._task_payload(task)
-            previous = conn.execute("SELECT feedback_json,snapshot_id,attempt FROM runs WHERE task_id=? AND run_id<>? AND feedback_json IS NOT NULL ORDER BY attempt DESC LIMIT 1",
-                                    (task["task_id"], run_id)).fetchone()
-            feedback = json.loads(previous["feedback_json"]) if previous and previous["feedback_json"] else None
-            pack = {"schema_version": 1, "variant": "B_NEW_CHAT_PER_ATTEMPT", "run_id": run_id,
-                    "task_id": task["task_id"], "attempt": run["attempt"], "plan_revision": task["plan_revision"],
-                    "project_id": task["project_id"], "writer_key": task["writer_key"],
-                    "queue_seq": task["queue_seq"],
-                    "claim_git_head": run["claim_git_head"],
-                    "goal": payload.get("goal"), "non_goals": payload.get("non_goals", []),
-                    "workspace": payload["workspace"], "allowed_paths": payload.get("allowed_paths", []),
-                    "protected_paths": payload.get("protected_paths", {}), "checks": payload.get("checks", []),
-                    "review": normalize_review_policy(payload), "owner_acceptance": bool(payload.get("owner_acceptance")),
-                    "publication": payload.get("publication", {"kind": "none"}), "feedback": feedback,
-                    "previous_snapshot_id": previous["snapshot_id"] if previous else None}
-            if len(canonical_json(pack).encode("utf-8")) > 32768:
-                raise ValueError("context_pack_too_large")
-            return pack
+            return self._build_context_pack(
+                conn,
+                task,
+                payload,
+                run_id=run_id,
+                attempt=int(run["attempt"]),
+                claim_git_head=run["claim_git_head"],
+                run_persisted=True,
+            )
 
     def heartbeat(self, run_id: str, lease_token: str) -> Dict[str, Any]:
         with self.connect() as conn:
