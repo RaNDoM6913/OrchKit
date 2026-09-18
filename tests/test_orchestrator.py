@@ -116,6 +116,53 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(next_one["status"], "READY")
         self.assertEqual(next_one["task_id"], "P1-FIRST")
 
+    def test_queue_view_explains_writer_and_dependency_waits(self):
+        first = self.task("QUEUE-1")
+        second = self.task("QUEUE-2")
+        third = self.task("QUEUE-3", deps=["QUEUE-2"])
+        self.load([first, second, third], revision="queue-view")
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["task_id"], "QUEUE-1")
+        view = self.orch.queue_view()
+        by_id = {item["task_id"]: item for item in view["tasks"]}
+        self.assertEqual(by_id["QUEUE-1"]["queue_state"], "ACTIVE")
+        self.assertEqual(by_id["QUEUE-2"]["queue_state"], "WAITING_WRITER")
+        self.assertEqual(by_id["QUEUE-2"]["writer_lock"]["run_id"], claim["run_id"])
+        self.assertEqual(by_id["QUEUE-3"]["queue_state"], "WAITING_DEPENDENCY")
+        self.assertEqual(by_id["QUEUE-3"]["waiting_dependencies"], ["QUEUE-2"])
+        self.assertEqual(view["summary"]["active_writer_count"], 1)
+
+    def test_queue_view_is_bounded_and_project_filterable(self):
+        ws2 = Path(self.tmp.name) / "queue-ws2"
+        ws2.mkdir()
+        one = self.task("QUEUE-P1")
+        one["project_id"] = "project-one"
+        two = self.task("QUEUE-P2")
+        two["project_id"] = "project-two"
+        two["workspace"] = str(ws2)
+        self.load([one, two], revision="queue-filter")
+        filtered = self.orch.queue_view(project_id="project-two", limit=1)
+        self.assertEqual(filtered["summary"]["total"], 1)
+        self.assertEqual(filtered["tasks"][0]["task_id"], "QUEUE-P2")
+        all_tasks = self.orch.queue_view(limit=1)
+        self.assertEqual(all_tasks["summary"]["total"], 2)
+        self.assertEqual(all_tasks["shown"], 1)
+        self.assertTrue(all_tasks["truncated"])
+
+    def test_cancel_task_only_applies_before_execution(self):
+        self.load([self.task("CANCEL-1"), self.task("ACTIVE-1")], revision="cancel")
+        cancelled = self.orch.cancel_task("CANCEL-1", "operator removed obsolete work")
+        self.assertEqual(cancelled["status"], "CANCELLED")
+        view = self.orch.queue_view()
+        by_id = {item["task_id"]: item for item in view["tasks"]}
+        self.assertEqual(by_id["CANCEL-1"]["task_status"], "CANCELLED")
+        claim = self.orch.claim("worker")
+        self.assertEqual(claim["task_id"], "ACTIVE-1")
+        with self.assertRaisesRegex(ValueError, "task_active"):
+            self.orch.cancel_task("ACTIVE-1", "must not cancel an active writer")
+        repeated = self.orch.cancel_task("CANCEL-1", "idempotent")
+        self.assertTrue(repeated["already_cancelled"])
+
     def test_scope_escape_rejected(self):
         self.load([self.task('T1')]); c=self.orch.claim('w')
         receipt=self.root/'bad.json'; receipt.write_text(json.dumps({'run_id':c['run_id'],'task_id':'T1','changed_paths':['../escape']})+'\n')

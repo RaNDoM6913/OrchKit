@@ -83,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     make_plan.add_argument("--output", required=True)
     remove = project_sub.add_parser("remove"); remove.add_argument("project_id")
 
+    queue = sub.add_parser("queue", help="inspect or manage the durable task queue")
+    queue_sub = queue.add_subparsers(dest="queue_command", required=True)
+    queue_list = queue_sub.add_parser("list")
+    queue_list.add_argument("--project")
+    queue_list.add_argument("--limit", type=int, default=100)
+    queue_cancel = queue_sub.add_parser("cancel")
+    queue_cancel.add_argument("task_id")
+    queue_cancel.add_argument("--reason", required=True)
+
     git = sub.add_parser("git", help="read-only Git inspection through a registered project")
     git_sub = git.add_subparsers(dest="git_command", required=True)
     git_inspect = git_sub.add_parser("inspect"); git_inspect.add_argument("project_id")
@@ -172,6 +181,13 @@ def main(argv=None) -> int:
                 result = registry.remove(args.project_id)
             else:
                 raise ValueError("unknown_project_command")
+        elif args.command == "queue":
+            if args.queue_command == "list":
+                result = orch.queue_view(project_id=args.project, limit=args.limit)
+            elif args.queue_command == "cancel":
+                result = orch.cancel_task(args.task_id, args.reason)
+            else:
+                raise ValueError("unknown_queue_command")
         elif args.command == "git":
             registry = ProjectRegistry(root)
             if args.git_command == "inspect":

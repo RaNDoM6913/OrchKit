@@ -1108,6 +1108,126 @@ class Orchestrator:
         return self._finalize_publication(run_id, run["task_id"], commit_id=commit_id,
                                           remote_commit=remote_commit, kind="git", remote=remote, ref=ref)
 
+    def queue_view(self, project_id: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
+        if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
+            raise ValueError("invalid_project_id")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("invalid_queue_limit")
+        with self.connect() as conn:
+            paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
+            locks = self._active_writer_locks(conn)
+            active_by_task = {item["task_id"]: item for item in locks.values()}
+            rows = conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall()
+            task_statuses = {row["task_id"]: row["status"] for row in rows}
+            attempt_rows = conn.execute(
+                "SELECT task_id,COUNT(*) AS n FROM runs GROUP BY task_id"
+            ).fetchall()
+            attempts_by_task = {row["task_id"]: row["n"] for row in attempt_rows}
+        items: List[Dict[str, Any]] = []
+        task_status_counts: Dict[str, int] = {}
+        queue_state_counts: Dict[str, int] = {}
+        for row in rows:
+            if project_id is not None and row["project_id"] != project_id:
+                continue
+            payload = self._task_payload(row)
+            attempts = int(attempts_by_task.get(row["task_id"], 0))
+            max_attempts = int(payload.get("max_attempts", 2))
+            waiting_dependencies = [
+                dep for dep in payload.get("dependencies", [])
+                if task_statuses.get(dep) != "DONE"
+            ]
+            lock = locks.get(row["writer_key"])
+            if row["task_id"] in active_by_task:
+                queue_state = "ACTIVE"
+            elif row["status"] in READY_TASK_STATES:
+                if attempts >= max_attempts:
+                    queue_state = "EXHAUSTED"
+                elif waiting_dependencies:
+                    queue_state = "WAITING_DEPENDENCY"
+                elif lock:
+                    queue_state = "WAITING_WRITER"
+                else:
+                    queue_state = "READY"
+            else:
+                queue_state = row["status"]
+            task_status_counts[row["status"]] = task_status_counts.get(row["status"], 0) + 1
+            queue_state_counts[queue_state] = queue_state_counts.get(queue_state, 0) + 1
+            item = {
+                "task_id": row["task_id"],
+                "project_id": row["project_id"],
+                "queue_seq": row["queue_seq"],
+                "task_status": row["status"],
+                "queue_state": queue_state,
+                "attempts": attempts,
+                "max_attempts": max_attempts,
+                "writer_key": row["writer_key"],
+                "waiting_dependencies": waiting_dependencies,
+            }
+            if lock and queue_state == "WAITING_WRITER":
+                item["writer_lock"] = {
+                    "run_id": lock["run_id"],
+                    "task_id": lock["task_id"],
+                    "state": lock["state"],
+                }
+            items.append(item)
+        total = len(items)
+        return {
+            "status": "PAUSED" if paused else "OK",
+            "project_id": project_id,
+            "paused": json.loads(paused["value_json"]) if paused else None,
+            "summary": {
+                "total": total,
+                "task_status": dict(sorted(task_status_counts.items())),
+                "queue_state": dict(sorted(queue_state_counts.items())),
+                "active_writer_count": len(locks),
+            },
+            "active_writers": list(locks.values()),
+            "tasks": items[:limit],
+            "shown": min(total, limit),
+            "truncated": total > limit,
+        }
+
+    def cancel_task(self, task_id: str, reason: str) -> Dict[str, Any]:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", task_id) is None:
+            raise ValueError("invalid_task_id")
+        if not reason.strip():
+            raise ValueError("cancel_reason_required")
+        cancellable = READY_TASK_STATES | {"BLOCKED"}
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not task:
+                conn.execute("ROLLBACK")
+                raise ValueError("unknown_task")
+            if task["status"] == "CANCELLED":
+                conn.execute("COMMIT")
+                return {"status": "CANCELLED", "task_id": task_id, "already_cancelled": True}
+            active = conn.execute(
+                "SELECT run_id,state FROM runs WHERE task_id=? AND state IN (?,?,?,?,?) "
+                "ORDER BY started_at DESC LIMIT 1",
+                (task_id, *tuple(ACTIVE_RUN_STATES)),
+            ).fetchone()
+            if active:
+                conn.execute("ROLLBACK")
+                raise ValueError(f"task_active:{active['run_id']}")
+            if task["status"] not in cancellable:
+                conn.execute("ROLLBACK")
+                raise ValueError(f"task_not_cancellable:{task['status']}")
+            now = utc_now()
+            conn.execute(
+                "UPDATE tasks SET status='CANCELLED',updated_at=? WHERE task_id=?",
+                (now, task_id),
+            )
+            self._event(
+                conn, "TASK_CANCELLED", task_id=task_id,
+                payload={"reason": reason.strip()[:500], "previous_status": task["status"]},
+            )
+            conn.execute("COMMIT")
+        return {
+            "status": "CANCELLED", "task_id": task_id,
+            "previous_status": task["status"], "reason": reason.strip()[:500],
+        }
+
     def status(self) -> Dict[str, Any]:
         with self.connect() as conn:
             tasks = [
