@@ -1158,13 +1158,7 @@ def restore_backup_archive(
             "pending_publications": len(health["pending_publications"]),
         }
         receipt_path = staging / "restore-receipt.json"
-        receipt_path.write_text(
-            json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        with receipt_path.open("rb") as handle:
-            os.fsync(handle.fileno())
-        os.chmod(receipt_path, 0o600)
+        atomic_write_json(receipt_path, receipt, mode=0o600)
 
         os.replace(staging, dest)
         published = True

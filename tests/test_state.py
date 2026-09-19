@@ -469,6 +469,23 @@ class StateMaintenanceTests(unittest.TestCase):
         leftovers = list(destination.parent.glob(f".{destination.name}.restore-*"))
         self.assertEqual(leftovers, [])
 
+    def test_restore_receipt_write_failure_never_publishes_destination(self):
+        archive = Path(backup_state(self.orch)["path"])
+        destination = Path(self.tmp.name) / "receipt-write-failed"
+        with mock.patch(
+            "orch.state.atomic_write_json",
+            side_effect=OSError("synthetic receipt write failure"),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "synthetic receipt write failure"
+            ):
+                restore_backup_archive(archive, destination)
+        self.assertFalse(destination.exists())
+        leftovers = list(
+            destination.parent.glob(f".{destination.name}.restore-*")
+        )
+        self.assertEqual(leftovers, [])
+
     def test_restore_backup_migrates_verified_schema_v2_archive(self):
         workspace = Path(self.tmp.name) / "legacy-restore-workspace"
         workspace.mkdir()
