@@ -1,10 +1,13 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 
-from orch.core import Orchestrator
+from orch.config import atomic_write_json
+from orch.core import PLAN_MAX_BYTES, Orchestrator
+from orch.plan import existing_plan_initial_base_binding, write_plan
 
 
 class PlanAdmissionTests(unittest.TestCase):
@@ -68,6 +71,44 @@ class PlanAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plan_file_missing_or_unsafe"):
             self.orch.load_plan(link)
         self.assert_no_tasks()
+
+    def test_plan_artifact_symlink_is_never_followed_or_replaced(self):
+        victim = self.base / "victim.json"
+        victim.write_text('{"owner":"preserve"}\n', encoding="utf-8")
+        link = self.base / "artifact-link.json"
+        link.symlink_to(victim)
+        with self.assertRaisesRegex(ValueError, "plan_artifact_not_regular"):
+            write_plan(link, self.plan(), replace=True)
+        with self.assertRaisesRegex(ValueError, "plan_artifact_not_regular"):
+            existing_plan_initial_base_binding(link)
+        self.assertEqual(
+            victim.read_text(encoding="utf-8"), '{"owner":"preserve"}\n'
+        )
+        self.assertTrue(link.is_symlink())
+
+    def test_atomic_json_write_ignores_predictable_temp_symlink_trap(self):
+        target = self.base / "authority.json"
+        victim = self.base / "temp-victim.json"
+        victim.write_text("owner preserve\n", encoding="utf-8")
+        old_predictable = target.with_name(
+            target.name + f".tmp-{os.getpid()}"
+        )
+        old_predictable.symlink_to(victim)
+        atomic_write_json(target, {"safe": True})
+        self.assertEqual(victim.read_text(encoding="utf-8"), "owner preserve\n")
+        self.assertTrue(old_predictable.is_symlink())
+        self.assertEqual(
+            json.loads(target.read_text(encoding="utf-8")), {"safe": True}
+        )
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_generated_plan_artifact_is_bounded_before_write(self):
+        plan = self.plan(revision="generated-too-large")
+        plan["adapter"]["padding"] = "x" * PLAN_MAX_BYTES
+        output = self.base / "generated-too-large.json"
+        with self.assertRaisesRegex(ValueError, "plan_artifact_too_large"):
+            write_plan(output, plan)
+        self.assertFalse(output.exists())
 
     def test_oversized_plan_is_rejected_before_json_parse(self):
         path = self.base / "oversized.json"

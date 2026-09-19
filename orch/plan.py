@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .config import atomic_write_json
-from .core import normalize_relative_path
+from .config import (atomic_write_json, read_bounded_json_object,
+                     read_bounded_regular_file)
+from .core import (PLAN_MAX_BYTES, PLAN_MAX_TASKS, normalize_relative_path,
+                   validate_task_definition)
 from .git_policy import evaluate_project_git_policy
 
 
@@ -18,14 +21,22 @@ def build_single_task_plan(
     plan_revision: Optional[str] = None, dependencies: Iterable[str] = (),
     max_attempts: int = 2, bind_expected_base: bool = True,
 ) -> Dict[str, Any]:
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", task_id):
+    if (
+        not isinstance(task_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", task_id) is None
+    ):
         raise ValueError("invalid_task_id")
-    if not goal.strip():
+    if not isinstance(goal, str) or not goal.strip():
         raise ValueError("goal_required")
     deps = []
     for dep in dependencies:
-        value = str(dep).strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value == task_id:
+        if not isinstance(dep, str):
+            raise ValueError("invalid_dependency")
+        value = dep.strip()
+        if (
+            re.fullmatch(r"[A-Za-z0-9._-]{1,160}", value) is None
+            or value == task_id
+        ):
             raise ValueError("invalid_dependency")
         if value not in deps:
             deps.append(value)
@@ -33,9 +44,11 @@ def build_single_task_plan(
         raise ValueError("invalid_max_attempts")
     allowed = []
     for item in allowed_paths:
-        if not str(item).strip():
+        if not isinstance(item, str):
+            raise ValueError("invalid_allowed_path")
+        if not item.strip():
             continue
-        allowed.append(normalize_relative_path(str(item)))
+        allowed.append(normalize_relative_path(item))
     if not allowed:
         raise ValueError("allowed_paths_required")
     git_state = evaluate_project_git_policy(project)
@@ -65,7 +78,17 @@ def build_single_task_plan(
     else:
         publication = {"kind": "none"}
     review = dict(project.get("review") or {"mode": "off", "reviewer": "none", "placement": "pre_publish"})
-    review["risk_tags"] = sorted(set(str(item) for item in risk_tags if str(item)))
+    normalized_risk_tags = []
+    for item in risk_tags:
+        if not isinstance(item, str) or not item:
+            raise ValueError("invalid_risk_tags")
+        normalized_risk_tags.append(item)
+    review["risk_tags"] = sorted(set(normalized_risk_tags))
+    if plan_revision is not None and (
+        not isinstance(plan_revision, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", plan_revision) is None
+    ):
+        raise ValueError("invalid_plan_revision")
     revision = plan_revision or f"{project['project_id']}-{task_id.lower()}-{uuid.uuid4().hex[:8]}"
     task = {
         "id": task_id,
@@ -83,20 +106,23 @@ def build_single_task_plan(
         "publication": publication,
         "max_attempts": max_attempts,
     }
+    validate_task_definition(task)
     return {"schema_version": 1, "plan_revision": revision, "tasks": [task]}
 
 
 def existing_plan_initial_base_binding(path: Path) -> Optional[bool]:
-    target = path.expanduser().resolve()
-    if not target.exists():
-        return None
-    if target.is_symlink() or not target.is_file():
-        raise ValueError("plan_artifact_not_regular")
+    target = Path(os.path.abspath(os.path.expanduser(str(path))))
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("plan_artifact_invalid_json") from exc
-    tasks = data.get("tasks") if isinstance(data, dict) else None
+        data, _ = read_bounded_json_object(
+            target,
+            max_bytes=PLAN_MAX_BYTES,
+            unsafe_error="plan_artifact_not_regular",
+            too_large_error="plan_artifact_too_large",
+            invalid_error="plan_artifact_invalid_json",
+        )
+    except FileNotFoundError:
+        return None
+    tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks or not isinstance(tasks[0], dict):
         raise ValueError("plan_artifact_invalid")
     publication = tasks[0].get("publication")
@@ -106,17 +132,33 @@ def existing_plan_initial_base_binding(path: Path) -> Optional[bool]:
 
 
 def write_plan(path: Path, plan: Dict[str, Any], *, replace: bool = True) -> Dict[str, Any]:
-    target = path.resolve()
-    if target.exists() and not replace:
-        if target.is_symlink() or not target.is_file():
-            raise ValueError("plan_artifact_not_regular")
-        existing = json.loads(target.read_text(encoding="utf-8"))
-        if existing != plan:
-            raise ValueError("plan_artifact_conflict")
-        return {
-            "status": "EXISTS", "path": str(target),
-            "plan_revision": plan["plan_revision"], "task_id": plan["tasks"][0]["id"],
-        }
+    encoded = (
+        json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > PLAN_MAX_BYTES:
+        raise ValueError("plan_artifact_too_large")
+    target = Path(os.path.abspath(os.path.expanduser(str(path))))
+    if target.is_symlink():
+        raise ValueError("plan_artifact_not_regular")
+    if not replace:
+        try:
+            existing, _ = read_bounded_json_object(
+                target,
+                max_bytes=PLAN_MAX_BYTES,
+                unsafe_error="plan_artifact_not_regular",
+                too_large_error="plan_artifact_too_large",
+                invalid_error="plan_artifact_invalid_json",
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if existing != plan:
+                raise ValueError("plan_artifact_conflict")
+            return {
+                "status": "EXISTS", "path": str(target),
+                "plan_revision": plan["plan_revision"],
+                "task_id": plan["tasks"][0]["id"],
+            }
     atomic_write_json(target, plan, mode=0o600)
     return {
         "status": "CREATED", "path": str(target),
@@ -126,25 +168,35 @@ def write_plan(path: Path, plan: Dict[str, Any], *, replace: bool = True) -> Dic
 BATCH_MANIFEST_MAX_BYTES = 256 * 1024
 
 
-def read_batch_manifest(path: Path) -> Tuple[Dict[str, Any], str]:
-    source = path.expanduser()
-    if source.is_symlink() or not source.is_file():
-        raise ValueError("batch_manifest_not_regular")
-    size = source.stat().st_size
-    if size > BATCH_MANIFEST_MAX_BYTES:
-        raise ValueError("batch_manifest_too_large")
-    raw = source.read_bytes()
+def read_batch_manifest(path: Path) -> Tuple[Dict[str, Any], str, int]:
+    try:
+        raw, _ = read_bounded_regular_file(
+            path,
+            max_bytes=BATCH_MANIFEST_MAX_BYTES,
+            unsafe_error="batch_manifest_not_regular",
+            too_large_error="batch_manifest_too_large",
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("batch_manifest_not_regular") from exc
     digest = hashlib.sha256(raw).hexdigest()
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid_batch_manifest_json") from exc
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+    if not isinstance(data, dict):
+        raise ValueError("invalid_batch_manifest")
+    unknown = sorted(set(data) - {"schema_version", "plan_revision", "tasks"})
+    if unknown:
+        raise ValueError("unknown_batch_manifest_field:" + unknown[0])
+    version = data.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
         raise ValueError("invalid_batch_manifest")
     tasks = data.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("empty_batch_manifest")
-    return data, digest
+    if len(tasks) > PLAN_MAX_TASKS:
+        raise ValueError("batch_manifest_too_many_tasks")
+    return data, digest, len(raw)
 
 
 def build_batch_plan(
@@ -152,11 +204,14 @@ def build_batch_plan(
     manifest: Dict[str, Any],
     *,
     source_digest: str,
+    source_bytes: Optional[int] = None,
     bind_initial_base: bool = True,
 ) -> Dict[str, Any]:
     tasks = manifest.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("empty_batch_manifest")
+    if len(tasks) > PLAN_MAX_TASKS:
+        raise ValueError("batch_manifest_too_many_tasks")
     ids: List[str] = []
     compiled: List[Dict[str, Any]] = []
     revision = manifest.get("plan_revision")
@@ -172,8 +227,18 @@ def build_batch_plan(
     for index, raw in enumerate(tasks):
         if not isinstance(raw, dict):
             raise ValueError("invalid_batch_task")
+        allowed_fields = {
+            "id", "goal", "allowed_paths", "dependencies", "risk_tags",
+            "owner_acceptance", "max_attempts",
+        }
+        extra = sorted(set(raw) - allowed_fields)
+        if extra:
+            raise ValueError("unknown_batch_task_field:" + extra[0])
         task_id = raw.get("id")
-        if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", task_id):
+        if (
+            not isinstance(task_id, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,160}", task_id) is None
+        ):
             raise ValueError("invalid_task_id")
         if task_id in ids:
             raise ValueError("duplicate_batch_task_id:" + task_id)
@@ -214,6 +279,7 @@ def build_batch_plan(
         "adapter": {
             "kind": "batch_manifest_v1",
             "source_sha256": source_digest,
+            "source_bytes": source_bytes,
             "task_count": len(compiled),
         },
         "tasks": compiled,

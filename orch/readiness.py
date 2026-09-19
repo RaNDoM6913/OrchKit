@@ -7,10 +7,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .config import read_bounded_json_object, read_bounded_regular_file
 from .core import (STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
                    safe_workspace_path, sha256_file)
 from .git_policy import evaluate_project_git_policy
-from .project import PROFILE_DEFAULTS, inspect_project
+from .dispatcher import RDC_MARKER_MAX_BYTES, validate_rdc_marker
+from .project import (PROFILE_DEFAULTS, PROJECT_CONFIG_MAX_BYTES,
+                      inspect_project)
 from .review_policy import normalize_review_policy
 
 
@@ -42,28 +45,34 @@ def _finding(
     }
 
 
-def _read_json_file(path: Path) -> Dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("unsafe_or_missing_file")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
     projects = home / "projects"
     target = projects / f"{project_id}.json"
     if projects.is_symlink() or not projects.is_dir():
         raise ValueError("project_registry_missing_or_unsafe")
-    if target.is_symlink() or not target.is_file():
-        raise ValueError("project_config_missing_or_unsafe")
 
     configs: List[Dict[str, Any]] = []
     for path in sorted(projects.glob("*.json")):
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"project_registry_unsafe:{path.stem}")
         try:
-            item = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"project_registry_unreadable:{path.stem}") from exc
+            item, meta = read_bounded_json_object(
+                path,
+                max_bytes=PROJECT_CONFIG_MAX_BYTES,
+                unsafe_error="project_config_unsafe",
+                too_large_error="project_config_too_large",
+                invalid_error="project_config_invalid_json",
+            )
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"project_registry_unreadable:{path.stem}"
+            ) from exc
+        except ValueError as exc:
+            if str(exc) == "project_config_unsafe":
+                raise ValueError(
+                    f"project_registry_unsafe:{path.stem}"
+                ) from exc
+            raise ValueError(
+                f"project_registry_unreadable:{path.stem}"
+            ) from exc
         root = item.get("root")
         if (
             not isinstance(item.get("project_id"), str)
@@ -71,14 +80,14 @@ def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
             or not root
         ):
             raise ValueError(f"project_registry_invalid:{path.stem}")
-        configs.append({"path": path, "config": item})
+        configs.append({"path": path, "config": item, "meta": meta})
 
     selected = next(
         (item for item in configs if item["path"] == target),
         None,
     )
     if selected is None:
-        raise ValueError("unknown_project")
+        raise ValueError("project_config_missing_or_unsafe")
     config = selected["config"]
     if config.get("project_id") != project_id:
         raise ValueError("project_config_identity_mismatch")
@@ -96,7 +105,7 @@ def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
         raise ValueError("project_root_alias_conflict:" + ",".join(sorted(aliases)))
     return {
         "path": target,
-        "mode": target.stat().st_mode & 0o777,
+        "mode": selected["meta"]["mode"],
         "config": config,
         "resolved_root": resolved_root,
         "registry_count": len(configs),
@@ -734,28 +743,43 @@ def audit_project(
 
 
     rdc_path = resolved_home / "rdc-bootstrap.json"
-    if rdc_path.is_symlink():
-        findings.append(_finding(
-            "rdc_binding",
-            "BLOCKED",
-            "rdc_marker_unsafe_symlink",
-            severity="blocker",
-        ))
-    elif not rdc_path.is_file():
+    try:
+        marker, marker_meta = read_bounded_json_object(
+            rdc_path,
+            max_bytes=RDC_MARKER_MAX_BYTES,
+            unsafe_error="rdc_marker_unsafe",
+            too_large_error="rdc_marker_too_large",
+            invalid_error="rdc_marker_invalid_json",
+        )
+    except FileNotFoundError:
         findings.append(_finding(
             "rdc_binding",
             "ATTENTION",
             "rdc_marker_unverified",
             severity="attention",
         ))
+    except ValueError as exc:
+        findings.append(_finding(
+            "rdc_binding",
+            "BLOCKED",
+            str(exc),
+            severity="blocker",
+        ))
     else:
         try:
-            marker_mode = rdc_path.stat().st_mode & 0o777
-            if marker_mode != 0o600:
-                raise ValueError(f"rdc_marker_mode:{oct(marker_mode)}")
-            marker = json.loads(rdc_path.read_text(encoding="utf-8"))
-            if not marker.get("device_id") or not marker.get("device_name"):
-                raise ValueError("rdc_marker_invalid")
+            if marker_meta["mode"] != 0o600:
+                raise ValueError(
+                    f"rdc_marker_mode:{oct(marker_meta['mode'])}"
+                )
+            validate_rdc_marker(marker)
+        except ValueError as exc:
+            findings.append(_finding(
+                "rdc_binding",
+                "BLOCKED",
+                str(exc),
+                severity="blocker",
+            ))
+        else:
             findings.append(_finding(
                 "rdc_binding",
                 "PASS",
@@ -764,33 +788,40 @@ def audit_project(
                     "device_name": marker["device_name"],
                     "recorded_at": marker.get("recorded_at"),
                     "mode": "0o600",
+                    "bytes": marker_meta["bytes"],
                 },
-            ))
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            findings.append(_finding(
-                "rdc_binding",
-                "BLOCKED",
-                str(exc),
-                severity="blocker",
             ))
 
     dispatcher = resolved_home / "dispatchers" / f"{project_id}.txt"
-    if dispatcher.is_symlink():
+    dispatcher_raw = None
+    dispatcher_meta = None
+    dispatcher_error = None
+    try:
+        dispatcher_raw, dispatcher_meta = read_bounded_regular_file(
+            dispatcher,
+            max_bytes=256 * 1024,
+            unsafe_error="project_dispatcher_unsafe",
+            too_large_error="project_dispatcher_too_large",
+        )
+    except FileNotFoundError:
+        pass
+    except ValueError as exc:
+        dispatcher_error = str(exc)
+
+    if dispatcher_error is not None:
         findings.append(_finding(
             "project_dispatcher",
             "BLOCKED",
-            {"path": str(dispatcher), "reason": "unsafe_symlink"},
+            {"path": str(dispatcher), "reason": dispatcher_error},
             severity="blocker",
         ))
-    elif dispatcher.is_file():
-        mode = dispatcher.stat().st_mode & 0o777
+    elif dispatcher_raw is not None:
         try:
-            text = dispatcher.read_text(encoding="utf-8")
-        except OSError as exc:
+            text = dispatcher_raw.decode("utf-8")
+        except UnicodeDecodeError:
             text = ""
-            dispatcher_error = str(exc)
-        else:
-            dispatcher_error = None
+            dispatcher_error = "project_dispatcher_invalid_utf8"
+        mode = dispatcher_meta["mode"]
         required_fragments = (
             f"--project {project_id}",
             f"scheduled-variant-b-{project_id}",
@@ -809,6 +840,7 @@ def audit_project(
                     "actual_mode": oct(mode),
                     "read_error": dispatcher_error,
                     "missing_scope_fragments": missing_fragments,
+                    "bytes": dispatcher_meta["bytes"],
                 },
                 severity="blocker",
             ))
@@ -820,6 +852,7 @@ def audit_project(
                     "path": str(dispatcher),
                     "mode": "0o600",
                     "scope_bound": True,
+                    "bytes": dispatcher_meta["bytes"],
                 },
             ))
     elif require_dispatcher:

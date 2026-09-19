@@ -231,6 +231,30 @@ class StateMaintenanceTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_backup_output_is_symlink_safe_and_temp_name_is_exclusive(self):
+        victim = Path(self.tmp.name) / "backup-victim.bin"
+        victim.write_bytes(b"owner preserve")
+        link = Path(self.tmp.name) / "backup-link.zip"
+        link.symlink_to(victim)
+        with self.assertRaisesRegex(ValueError, "backup_output_unsafe"):
+            backup_state(self.orch, link)
+        self.assertEqual(victim.read_bytes(), b"owner preserve")
+        self.assertTrue(link.is_symlink())
+
+        output = Path(self.tmp.name) / "custom-backup.zip"
+        predictable = output.with_name(
+            output.name + f".tmp-{os.getpid()}"
+        )
+        predictable.symlink_to(victim)
+        result = backup_state(self.orch, output)
+        self.assertEqual(Path(result["path"]), output)
+        self.assertEqual(victim.read_bytes(), b"owner preserve")
+        self.assertTrue(predictable.is_symlink())
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            verify_backup_archive(output)["status"], "VERIFIED"
+        )
+
     def test_backup_verifier_accepts_current_secret_free_backup(self):
         result = backup_state(self.orch)
         verified = verify_backup_archive(Path(result["path"]))
@@ -243,6 +267,37 @@ class StateMaintenanceTests(unittest.TestCase):
             verified["database_sha256"],
             verified["manifest"]["database_sha256"],
         )
+
+    def test_backup_verifier_rejects_symlink_source(self):
+        source_path = Path(backup_state(self.orch)["path"])
+        link = Path(self.tmp.name) / "backup-source-link.zip"
+        link.symlink_to(source_path)
+        checked = verify_backup_archive(link)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertEqual(checked["errors"], ["backup_not_regular_file"])
+        self.assertEqual(Path(checked["path"]), link)
+
+    def test_restore_blocks_source_change_after_verification(self):
+        source_path = Path(backup_state(self.orch)["path"])
+        destination = Path(self.tmp.name) / "changed-source-restore"
+        real_verify = verify_backup_archive
+
+        def verify_then_mutate(path, **kwargs):
+            result = real_verify(path, **kwargs)
+            with Path(path).open("ab") as handle:
+                handle.write(b"changed-after-verification")
+            return result
+
+        with mock.patch.object(
+            state_module,
+            "verify_backup_archive",
+            side_effect=verify_then_mutate,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "backup_source_changed_after_verification"
+            ):
+                restore_backup_archive(source_path, destination)
+        self.assertFalse(destination.exists())
 
     def test_backup_verifier_rejects_manifest_database_hash_mismatch(self):
         source_path = Path(backup_state(self.orch)["path"])
@@ -738,6 +793,35 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertFalse(inspected["automatic_action"])
         reconcile_home_replacement(live, finalize=True)
+
+    def test_replacement_journal_read_is_bounded_and_mode_bound(self):
+        live, _source, archive = self._replacement_fixture(
+            "inspect-journal-bounds"
+        )
+        result = replace_home_from_backup(archive, live)
+        journal = Path(result["journal"])
+        journal.write_bytes(
+            b"{" + b"x" * state_module.REPLACEMENT_JOURNAL_MAX_BYTES
+        )
+        os.chmod(journal, 0o600)
+        inspected = inspect_home_replacement(live)
+        self.assertEqual(inspected["status"], "BLOCKED")
+        self.assertEqual(
+            inspected["classification"], "REPLACEMENT_JOURNAL_INVALID"
+        )
+        self.assertEqual(inspected["reason"], "replacement_journal_too_large")
+
+        live2, _source2, archive2 = self._replacement_fixture(
+            "inspect-journal-mode"
+        )
+        result2 = replace_home_from_backup(archive2, live2)
+        journal2 = Path(result2["journal"])
+        os.chmod(journal2, 0o644)
+        inspected2 = inspect_home_replacement(live2)
+        self.assertEqual(inspected2["status"], "BLOCKED")
+        self.assertEqual(
+            inspected2["reason"], "replacement_journal_mode_unsafe"
+        )
 
     def test_replacement_recovery_inspect_sees_old_moved_without_creating_dest(self):
         live, _source, archive = self._replacement_fixture("inspect-old-moved")

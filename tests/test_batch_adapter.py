@@ -9,6 +9,7 @@ import unittest
 
 from orch.cli import main as cli_main
 from orch.core import Orchestrator
+from orch.plan import BATCH_MANIFEST_MAX_BYTES, PLAN_MAX_TASKS
 
 
 class BatchAdapterTests(unittest.TestCase):
@@ -84,10 +85,12 @@ class BatchAdapterTests(unittest.TestCase):
         self.assertEqual(result["task_ids"], ["BATCH-1", "BATCH-2"])
         self.assertEqual(result["task_count"], 2)
         self.assertEqual(result["source_sha256"], digest)
+        self.assertEqual(result["source_bytes"], manifest.stat().st_size)
         self.assertEqual(result["load"]["queued_count"], 2)
         plan = json.loads(Path(result["plan_path"]).read_text(encoding="utf-8"))
         self.assertEqual(plan["adapter"]["kind"], "batch_manifest_v1")
         self.assertEqual(plan["adapter"]["source_sha256"], digest)
+        self.assertEqual(plan["adapter"]["source_bytes"], manifest.stat().st_size)
         self.assertEqual(plan["tasks"][1]["dependencies"], ["BATCH-1"])
         queue = Orchestrator(self.home).queue_view(project_id=self.project_id)
         by_id = {item["task_id"]: item for item in queue["tasks"]}
@@ -186,6 +189,92 @@ class BatchAdapterTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(result["error"], "batch_manifest_not_regular")
         self.assertEqual(Orchestrator(self.home).status()["tasks"], [])
+
+    def test_oversized_manifest_is_refused_before_json_parse(self):
+        manifest = self.base / "oversized.json"
+        manifest.write_bytes(b"{" + b"x" * BATCH_MANIFEST_MAX_BYTES)
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue-batch", self.project_id, str(manifest),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "batch_manifest_too_large")
+        self.assertEqual(Orchestrator(self.home).status()["tasks"], [])
+
+    def test_unknown_manifest_and_task_fields_fail_closed(self):
+        manifest = self.base / "unknown-top.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "tasks": [{
+                "id": "UNKNOWN-TOP", "goal": "top",
+                "allowed_paths": ["top.json"],
+            }],
+            "surprise": True,
+        }), encoding="utf-8")
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue-batch", self.project_id, str(manifest),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "unknown_batch_manifest_field:surprise")
+
+        manifest, _ = self.write_manifest([{
+            "id": "UNKNOWN-TASK", "goal": "task",
+            "allowed_paths": ["task.json"], "surprise": True,
+        }], revision="unknown-task-v1", name="unknown-task.json")
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue-batch", self.project_id, str(manifest),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "unknown_batch_task_field:surprise")
+        self.assertEqual(Orchestrator(self.home).status()["tasks"], [])
+        self.assertFalse((self.home / "plans" / "unknown-task-v1.json").exists())
+
+    def test_batch_task_count_is_bounded_before_plan_write(self):
+        tasks = [
+            {
+                "id": f"MANY-{index:03d}", "goal": "bounded",
+                "allowed_paths": [f"result-{index:03d}.json"],
+            }
+            for index in range(PLAN_MAX_TASKS + 1)
+        ]
+        manifest, _ = self.write_manifest(
+            tasks, revision="too-many-batch-v1", name="too-many.json"
+        )
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue-batch", self.project_id, str(manifest),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "batch_manifest_too_many_tasks")
+        self.assertEqual(Orchestrator(self.home).status()["tasks"], [])
+        self.assertFalse((self.home / "plans" / "too-many-batch-v1.json").exists())
+
+    def test_generated_tasks_are_bounded_before_plan_write(self):
+        manifest, _ = self.write_manifest([{
+            "id": "GOAL-LARGE", "goal": "x" * (16 * 1024 + 1),
+            "allowed_paths": ["large.json"],
+        }], revision="goal-large-batch-v1", name="goal-large.json")
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue-batch", self.project_id, str(manifest),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "invalid_goal_too_large")
+        self.assertFalse((self.home / "plans" / "goal-large-batch-v1.json").exists())
+
+        rc, result = self.invoke(
+            "--root", str(self.home),
+            "queue", "enqueue", self.project_id,
+            "--task-id", "SINGLE-GOAL-LARGE",
+            "--goal", "x" * (16 * 1024 + 1),
+            "--allowed-path", "single-large.json",
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "invalid_goal_too_large")
+        plans = list((self.home / "plans").glob("*.json"))
+        self.assertEqual(plans, [])
 
 
 if __name__ == "__main__":

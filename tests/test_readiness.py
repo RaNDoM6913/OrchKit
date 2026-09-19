@@ -10,7 +10,7 @@ import unittest
 
 from orch.cli import main as cli_main
 from orch.core import Orchestrator
-from orch.dispatcher import record_rdc, render_dispatcher
+from orch.dispatcher import RDC_MARKER_MAX_BYTES, record_rdc, render_dispatcher
 from orch.plan import build_single_task_plan
 from orch.project import ProjectRegistry
 from orch.readiness import audit_project
@@ -341,6 +341,41 @@ class ProjectReadinessTests(unittest.TestCase):
             for path in (config_path, db_path, rdc_path)
         }
         self.assertEqual(before, after)
+
+    def test_oversized_rdc_marker_blocks_readiness(self):
+        rdc_path = self.home / "rdc-bootstrap.json"
+        rdc_path.write_bytes(b"{" + b"x" * RDC_MARKER_MAX_BYTES)
+        result = audit_project(self.home, self.config["project_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        rdc = self._check(result, "rdc_binding")
+        self.assertEqual(rdc["status"], "BLOCKED")
+        self.assertEqual(rdc["detail"], "rdc_marker_too_large")
+
+    def test_oversized_dispatcher_blocks_readiness(self):
+        dispatchers = self.home / "dispatchers"
+        dispatchers.mkdir(mode=0o700)
+        path = dispatchers / f"{self.config['project_id']}.txt"
+        path.write_bytes(b"x" * (256 * 1024 + 1))
+        os.chmod(path, 0o600)
+        result = audit_project(self.home, self.config["project_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        dispatcher = self._check(result, "project_dispatcher")
+        self.assertEqual(dispatcher["status"], "BLOCKED")
+        self.assertEqual(
+            dispatcher["detail"]["reason"], "project_dispatcher_too_large"
+        )
+
+    def test_oversized_project_config_blocks_readiness(self):
+        config_path = (
+            self.home / "projects" / f"{self.config['project_id']}.json"
+        )
+        config_path.write_bytes(b"{" + b"x" * (2 * 1024 * 1024))
+        result = audit_project(self.home, self.config["project_id"])
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(
+            self._check(result, "registry")["detail"],
+            f"project_registry_unreadable:{self.config['project_id']}",
+        )
 
     def test_required_scoped_dispatcher_moves_attention_to_ready(self):
         before = audit_project(

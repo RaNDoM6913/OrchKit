@@ -9,10 +9,14 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import atomic_write_json, ensure_private_dir
+from .config import (HOME_CONFIG_MAX_BYTES, atomic_write_json,
+                     ensure_private_dir, read_bounded_json_object)
 from .core import sha256_file
 from .git_transport import inspect_transport_url
 from .review_policy import MODES, REVIEWERS
+
+PROJECT_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "safe": {
@@ -203,13 +207,18 @@ class ProjectRegistry:
             replace: bool = False) -> Dict[str, Any]:
         if profile is None:
             global_config = self.home / "config.json"
-            if global_config.is_file():
-                try:
-                    profile = json.loads(global_config.read_text(encoding="utf-8")).get("default_profile", "safe")
-                except (OSError, json.JSONDecodeError):
-                    profile = "safe"
-            else:
+            try:
+                home_config, _ = read_bounded_json_object(
+                    global_config,
+                    max_bytes=HOME_CONFIG_MAX_BYTES,
+                    unsafe_error="home_config_unsafe",
+                    too_large_error="home_config_too_large",
+                    invalid_error="home_config_invalid_json",
+                )
+            except FileNotFoundError:
                 profile = "safe"
+            else:
+                profile = home_config.get("default_profile", "safe")
         if profile not in PROFILE_DEFAULTS:
             raise ValueError("invalid_profile")
         inventory = inspect_project(path)
@@ -223,12 +232,27 @@ class ProjectRegistry:
         for candidate in sorted(self.projects_dir.glob("*.json")):
             if candidate == target:
                 continue
-            if candidate.is_symlink() or not candidate.is_file():
-                raise ValueError(f"project_registry_unsafe:{candidate.stem}")
             try:
-                existing_config = json.loads(candidate.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError(f"project_registry_unreadable:{candidate.stem}") from exc
+                existing_config, _ = read_bounded_json_object(
+                    candidate,
+                    max_bytes=PROJECT_CONFIG_MAX_BYTES,
+                    unsafe_error="project_config_unsafe",
+                    too_large_error="project_config_too_large",
+                    invalid_error="project_config_invalid_json",
+                    repair_mode=0o600,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"project_registry_unreadable:{candidate.stem}"
+                ) from exc
+            except ValueError as exc:
+                if str(exc) == "project_config_unsafe":
+                    raise ValueError(
+                        f"project_registry_unsafe:{candidate.stem}"
+                    ) from exc
+                raise ValueError(
+                    f"project_registry_unreadable:{candidate.stem}"
+                ) from exc
             existing_root = existing_config.get("root")
             if not isinstance(existing_root, str) or not existing_root:
                 raise ValueError(f"project_registry_invalid:{candidate.stem}")
@@ -287,23 +311,44 @@ class ProjectRegistry:
         rows: List[Dict[str, Any]] = []
         for path in sorted(self.projects_dir.glob("*.json")):
             try:
-                if path.is_symlink() or not path.is_file():
-                    rows.append({"project_id": path.stem, "status": "UNSAFE"})
-                    continue
-                item = json.loads(path.read_text(encoding="utf-8"))
-                rows.append({"project_id": item.get("project_id"), "name": item.get("name"), "root": item.get("root"), "profile": item.get("profile")})
-            except (OSError, json.JSONDecodeError):
+                item, _ = read_bounded_json_object(
+                    path,
+                    max_bytes=PROJECT_CONFIG_MAX_BYTES,
+                    unsafe_error="project_config_unsafe",
+                    too_large_error="project_config_too_large",
+                    invalid_error="project_config_invalid_json",
+                    repair_mode=0o600,
+                )
+                rows.append({
+                    "project_id": item.get("project_id"),
+                    "name": item.get("name"),
+                    "root": item.get("root"),
+                    "profile": item.get("profile"),
+                })
+            except FileNotFoundError:
                 rows.append({"project_id": path.stem, "status": "UNREADABLE"})
+            except ValueError as exc:
+                status = (
+                    "UNSAFE"
+                    if str(exc) == "project_config_unsafe"
+                    else "UNREADABLE"
+                )
+                rows.append({"project_id": path.stem, "status": status})
         return rows
 
     def get(self, project_id: str) -> Dict[str, Any]:
         path = self._path(project_id)
-        if path.is_symlink():
-            raise ValueError("project_config_unsafe")
-        if not path.is_file():
-            raise ValueError("unknown_project")
-        os.chmod(path, 0o600)
-        config = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            config, _ = read_bounded_json_object(
+                path,
+                max_bytes=PROJECT_CONFIG_MAX_BYTES,
+                unsafe_error="project_config_unsafe",
+                too_large_error="project_config_too_large",
+                invalid_error="project_config_invalid_json",
+                repair_mode=0o600,
+            )
+        except FileNotFoundError as exc:
+            raise ValueError("unknown_project") from exc
         if not config.get("writer_key") and config.get("root"):
             root = Path(config["root"]).expanduser().resolve()
             try:

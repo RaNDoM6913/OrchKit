@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 from .codex_review import CODEX_BIN, subscription_preflight
 from .config import ensure_home
+from .dispatcher import read_rdc
 
 
 def run_doctor(home: Path, *, check_codex: bool = True) -> Dict[str, Any]:
@@ -27,11 +28,30 @@ def run_doctor(home: Path, *, check_codex: bool = True) -> Dict[str, Any]:
             "status": "PASS" if preflight.get("status") == "PASS" else "OPTIONAL_BLOCKED",
             "detail": preflight,
         })
-    rdc_marker = home / "rdc-bootstrap.json"
-    if rdc_marker.is_file():
-        checks.append({"id": "rdc_chat_bridge", "status": "RECORDED", "detail": str(rdc_marker)})
+    try:
+        rdc = read_rdc(home)
+    except ValueError as exc:
+        checks.append({
+            "id": "rdc_chat_bridge",
+            "status": "BLOCKED",
+            "detail": str(exc),
+        })
     else:
-        checks.append({"id": "rdc_chat_bridge", "status": "UNVERIFIED", "detail": "Requires a ChatGPT bootstrap run; local CLI cannot prove connector availability."})
+        if rdc["status"] == "RECORDED":
+            checks.append({
+                "id": "rdc_chat_bridge",
+                "status": "RECORDED",
+                "detail": rdc,
+            })
+        else:
+            checks.append({
+                "id": "rdc_chat_bridge",
+                "status": "UNVERIFIED",
+                "detail": (
+                    "Requires a ChatGPT bootstrap run; local CLI cannot prove "
+                    "connector availability."
+                ),
+            })
     hard_block = any(item["status"] == "BLOCKED" for item in checks)
     attention = any(item["status"] in {"OPTIONAL_BLOCKED", "OPTIONAL_MISSING", "UNVERIFIED"} for item in checks)
     return {

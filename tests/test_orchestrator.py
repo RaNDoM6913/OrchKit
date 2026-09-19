@@ -597,6 +597,35 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(task["status"], "BLOCKED")
         self.assertEqual(self.orch.reconcile()["status"], "CLEAN")
 
+    def test_capability_read_rejects_symlink_and_alias_paths(self):
+        self.load([self.task("CAP-LINK")], revision="cap-link")
+        claim = self.orch.claim("worker")
+        cap = Path(claim["capability_file"])
+        alias = self.root / "capability-alias.json"
+        alias.symlink_to(cap)
+        with self.assertRaisesRegex(ValueError, "invalid_capability_file"):
+            self.orch.lease_from_capability(claim["run_id"], alias)
+
+        external = self.root / "external-capability.json"
+        cap.rename(external)
+        cap.symlink_to(external)
+        with self.assertRaisesRegex(ValueError, "invalid_capability_file"):
+            self.orch.lease_from_capability(claim["run_id"], cap)
+        self.assertTrue(cap.is_symlink())
+
+    def test_capability_read_requires_private_bounded_exact_schema(self):
+        self.load([self.task("CAP-BOUND")], revision="cap-bound")
+        claim = self.orch.claim("worker")
+        cap = Path(claim["capability_file"])
+        cap.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "invalid_capability_mode"):
+            self.orch.lease_from_capability(claim["run_id"], cap)
+
+        cap.write_bytes(b"{" + b"x" * 4096)
+        cap.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "capability_file_too_large"):
+            self.orch.lease_from_capability(claim["run_id"], cap)
+
     def test_claim_exposes_exact_receipt_path_and_submit_records_digest(self):
         self.load([self.task("RECEIPT-OK")], revision="receipt-ok")
         claim = self.orch.claim("worker")

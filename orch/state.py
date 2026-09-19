@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat as statmod
 import sqlite3
 import shutil
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 
-from .config import atomic_write_json, ensure_private_dir
+from .config import (atomic_write_json, ensure_private_dir,
+                     read_bounded_json_object)
 from .core import (ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
                    Orchestrator, utc_now)
+
+REPLACEMENT_JOURNAL_MAX_BYTES = 64 * 1024
+RESTORE_RECEIPT_MAX_BYTES = 64 * 1024
 
 
 def _sha256(path: Path) -> str:
@@ -605,7 +611,88 @@ def _backup_members(orch: Orchestrator) -> List[Path]:
     return sorted(set(members))
 
 
+@contextmanager
+def _frozen_backup_source(path: Path, *, max_archive_bytes: int):
+    source = Path(os.path.abspath(os.path.expanduser(str(path))))
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif source.is_symlink():
+        raise ValueError("backup_not_regular_file")
+    try:
+        fd = os.open(str(source), flags)
+    except OSError as exc:
+        raise ValueError("backup_not_regular_file") from exc
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode):
+            raise ValueError("backup_not_regular_file")
+        if info.st_size > max_archive_bytes:
+            raise ValueError("backup_archive_size_limit_exceeded")
+        with tempfile.TemporaryDirectory(
+            prefix="orch-backup-source-"
+        ) as tmp:
+            snapshot = Path(tmp) / "source.zip"
+            sha = hashlib.sha256()
+            written = 0
+            with os.fdopen(fd, "rb", closefd=True) as source_handle:
+                fd = -1
+                with snapshot.open("xb") as dest:
+                    while True:
+                        block = source_handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        written += len(block)
+                        if written > max_archive_bytes:
+                            raise ValueError(
+                                "backup_archive_size_limit_exceeded"
+                            )
+                        sha.update(block)
+                        dest.write(block)
+                    dest.flush()
+                    os.fsync(dest.fileno())
+            os.chmod(snapshot, 0o600)
+            yield {
+                "source": source,
+                "snapshot": snapshot,
+                "sha256": sha.hexdigest(),
+                "bytes": written,
+            }
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def verify_backup_archive(
+    path: Path, *, max_uncompressed_bytes: int = 1024 * 1024 * 1024,
+) -> Dict[str, Any]:
+    if max_uncompressed_bytes <= 0:
+        raise ValueError("invalid_backup_verify_limit")
+    source = Path(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        with _frozen_backup_source(
+            path, max_archive_bytes=max_uncompressed_bytes
+        ) as frozen:
+            result = _verify_frozen_backup_archive(
+                frozen["snapshot"],
+                max_uncompressed_bytes=max_uncompressed_bytes,
+            )
+            result["path"] = str(source)
+            result["archive_sha256"] = frozen["sha256"]
+            result["archive_bytes"] = frozen["bytes"]
+            return result
+    except ValueError as exc:
+        return {
+            "status": "BLOCKED",
+            "path": str(source),
+            "errors": [str(exc)],
+            "warnings": [],
+        }
+
+
+def _verify_frozen_backup_archive(
     path: Path, *, max_uncompressed_bytes: int = 1024 * 1024 * 1024,
 ) -> Dict[str, Any]:
     from pathlib import PurePosixPath
@@ -848,29 +935,43 @@ def restore_backup_archive(
     ))
     os.chmod(staging, 0o700)
     published = False
+    source_archive_path = Path(
+        os.path.abspath(os.path.expanduser(str(path)))
+    )
+    source_archive_sha256 = verified["archive_sha256"]
     try:
         runtime = staging / ".runtime"
         runtime.mkdir(mode=0o700)
-        with zipfile.ZipFile(path.expanduser().resolve(), "r") as archive:
-            for info in archive.infolist():
-                name = info.filename
-                if not _restorable_backup_member(name):
-                    raise ValueError(f"restore_member_not_allowed:{name}")
-                if name == "state/manifest.json":
-                    continue
-                if name == "files/dispatcher-prompt.txt":
-                    continue
-                if name == "state/orch.sqlite3":
-                    target = runtime / "orch.sqlite3"
-                elif name.startswith("files/"):
-                    relative = Path(*Path(name).parts[1:])
-                    target = staging / relative
-                else:
-                    raise ValueError(f"restore_member_not_allowed:{name}")
-                _write_streamed_member(
-                    archive, name, target,
-                    max_bytes=max_uncompressed_bytes,
-                )
+        with _frozen_backup_source(
+            path, max_archive_bytes=max_uncompressed_bytes
+        ) as frozen:
+            if frozen["sha256"] != source_archive_sha256:
+                raise ValueError("backup_source_changed_after_verification")
+            source_archive_path = frozen["source"]
+            with zipfile.ZipFile(frozen["snapshot"], "r") as archive:
+                for info in archive.infolist():
+                    name = info.filename
+                    if not _restorable_backup_member(name):
+                        raise ValueError(
+                            f"restore_member_not_allowed:{name}"
+                        )
+                    if name == "state/manifest.json":
+                        continue
+                    if name == "files/dispatcher-prompt.txt":
+                        continue
+                    if name == "state/orch.sqlite3":
+                        target = runtime / "orch.sqlite3"
+                    elif name.startswith("files/"):
+                        relative = Path(*Path(name).parts[1:])
+                        target = staging / relative
+                    else:
+                        raise ValueError(
+                            f"restore_member_not_allowed:{name}"
+                        )
+                    _write_streamed_member(
+                        archive, name, target,
+                        max_bytes=max_uncompressed_bytes,
+                    )
 
         for directory in [staging, *sorted(
             (item for item in staging.rglob("*") if item.is_dir()),
@@ -892,8 +993,8 @@ def restore_backup_archive(
         receipt = {
             "schema_version": 1,
             "restored_at": utc_now(),
-            "source_archive": str(path.expanduser().resolve()),
-            "source_archive_sha256": _sha256(path.expanduser().resolve()),
+            "source_archive": str(source_archive_path),
+            "source_archive_sha256": source_archive_sha256,
             "source_manifest": verified["manifest"],
             "source_schema_version": verified["schema_version"],
             "restored_schema_version": health["schema_version"],
@@ -931,7 +1032,7 @@ def restore_backup_archive(
         return {
             "status": "RESTORED",
             "destination": str(dest),
-            "archive": str(path.expanduser().resolve()),
+            "archive": str(source_archive_path),
             "archive_sha256": receipt["source_archive_sha256"],
             "source_schema_version": verified["schema_version"],
             "restored_schema_version": final_health["schema_version"],
@@ -1012,11 +1113,18 @@ def _replacement_write(path: Path, data: Dict[str, Any]) -> None:
 def _replacement_load(destination: Path) -> Tuple[Path, Dict[str, Any]]:
     dest = destination.expanduser().resolve()
     journal = _replacement_journal_path(dest)
-    if journal.is_symlink():
-        raise ValueError("replacement_journal_unsafe")
-    if not journal.is_file():
-        raise ValueError("replacement_journal_missing")
-    data = json.loads(journal.read_text(encoding="utf-8"))
+    try:
+        data, meta = read_bounded_json_object(
+            journal,
+            max_bytes=REPLACEMENT_JOURNAL_MAX_BYTES,
+            unsafe_error="replacement_journal_unsafe",
+            too_large_error="replacement_journal_too_large",
+            invalid_error="replacement_journal_invalid_json",
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("replacement_journal_missing") from exc
+    if meta["mode"] != 0o600:
+        raise ValueError("replacement_journal_mode_unsafe")
     if data.get("destination") != str(dest):
         raise ValueError("replacement_journal_destination_mismatch")
     parent = dest.parent
@@ -1044,11 +1152,17 @@ def _replacement_load(destination: Path) -> Tuple[Path, Dict[str, Any]]:
 
 def _restored_home_matches(path: Path, archive_sha256: str) -> bool:
     receipt = path / "restore-receipt.json"
-    if receipt.is_symlink() or not receipt.is_file():
-        return False
     try:
-        data = json.loads(receipt.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data, meta = read_bounded_json_object(
+            receipt,
+            max_bytes=RESTORE_RECEIPT_MAX_BYTES,
+            unsafe_error="restore_receipt_unsafe",
+            too_large_error="restore_receipt_too_large",
+            invalid_error="restore_receipt_invalid_json",
+        )
+    except (FileNotFoundError, ValueError):
+        return False
+    if meta["mode"] != 0o600:
         return False
     return data.get("source_archive_sha256") == archive_sha256
 
@@ -1919,8 +2033,15 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
     if health["active_runs"]:
         raise ValueError("active_runs_present")
     backups = ensure_private_dir(orch.root / "backups")
-    target = output.expanduser().resolve() if output else backups / f"orch-state-{utc_now().replace(':','').replace('+0000','Z')}.zip"
+    target = (
+        Path(os.path.abspath(os.path.expanduser(str(output))))
+        if output
+        else backups
+        / f"orch-state-{utc_now().replace(':','').replace('+0000','Z')}.zip"
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        raise ValueError("backup_output_unsafe")
     with tempfile.TemporaryDirectory(prefix="orch-backup-", dir=str(orch.runtime)) as tmp:
         db_copy = Path(tmp) / "orch.sqlite3"
         source = orch.connect()
@@ -1936,14 +2057,49 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
             "database_sha256": _sha256(db_copy),
             "excluded_secret_classes": ["claims", "capability_files", "provider_credentials"],
         }
-        temp_zip = target.with_name(target.name + f".tmp-{os.getpid()}")
-        with zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.write(db_copy, "state/orch.sqlite3")
-            archive.writestr("state/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-            for path in _backup_members(orch):
-                archive.write(path, "files/" + path.relative_to(orch.root).as_posix())
-        os.chmod(temp_zip, 0o600)
-        os.replace(temp_zip, target)
+        fd = -1
+        temp_zip: Optional[Path] = None
+        try:
+            fd, temp_name = tempfile.mkstemp(
+                prefix=target.name + ".tmp-",
+                dir=str(target.parent),
+            )
+            temp_zip = Path(temp_name)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w+b", closefd=True) as handle:
+                fd = -1
+                with zipfile.ZipFile(
+                    handle, "w", compression=zipfile.ZIP_DEFLATED
+                ) as archive:
+                    archive.write(db_copy, "state/orch.sqlite3")
+                    archive.writestr(
+                        "state/manifest.json",
+                        json.dumps(
+                            manifest,
+                            ensure_ascii=False,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                    )
+                    for path in _backup_members(orch):
+                        archive.write(
+                            path,
+                            "files/" + path.relative_to(orch.root).as_posix(),
+                        )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp_zip), str(target))
+            temp_zip = None
+            _fsync_directory(target.parent)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_zip is not None:
+                try:
+                    temp_zip.unlink()
+                except FileNotFoundError:
+                    pass
     return {
         "status": "BACKED_UP",
         "path": str(target),

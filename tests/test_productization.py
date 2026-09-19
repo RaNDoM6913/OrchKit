@@ -10,14 +10,15 @@ import unittest
 from unittest import mock
 
 from orch.cli import main as cli_main
-from orch.config import configure_home
+from orch.config import HOME_CONFIG_MAX_BYTES, configure_home
 from orch.doctor import run_doctor
-from orch.dispatcher import render_dispatcher
+from orch.dispatcher import (RDC_MARKER_MAX_BYTES, read_rdc, record_rdc,
+                             render_dispatcher)
 from orch.git_policy import evaluate_project_git_policy
 from orch.git_transport import inspect_transport_url
 from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
-from orch.project import ProjectRegistry
+from orch.project import PROJECT_CONFIG_MAX_BYTES, ProjectRegistry
 from orch.review_policy import decide_review, normalize_review_policy
 from orch.state import (backup_state, check_state,
                         reconcile_home_replacement, replace_home_from_backup)
@@ -280,6 +281,64 @@ class ProductizationTests(unittest.TestCase):
             registry.get(project_id)
         listed = {item["project_id"]: item for item in registry.list()}
         self.assertEqual(listed[project_id]["status"], "UNSAFE")
+
+    def test_project_registry_rejects_oversized_config(self):
+        registry = ProjectRegistry(self.home)
+        registered = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        config_path.write_bytes(b"{" + b"x" * PROJECT_CONFIG_MAX_BYTES)
+        with self.assertRaisesRegex(ValueError, "project_config_too_large"):
+            registry.get(project_id)
+        listed = {item["project_id"]: item for item in registry.list()}
+        self.assertEqual(listed[project_id]["status"], "UNREADABLE")
+
+    def test_home_config_read_is_bounded_and_no_follow(self):
+        configure_home(self.home, profile="safe")
+        config_path = self.home / "config.json"
+        external = self.base / "external-home-config.json"
+        external.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+        config_path.unlink()
+        config_path.symlink_to(external)
+        with self.assertRaisesRegex(ValueError, "home_config_unsafe"):
+            configure_home(self.home, profile="safe")
+        with self.assertRaisesRegex(ValueError, "home_config_unsafe"):
+            ProjectRegistry(self.home).add(self.repo)
+
+        config_path.unlink()
+        config_path.write_bytes(b"{" + b"x" * HOME_CONFIG_MAX_BYTES)
+        with self.assertRaisesRegex(ValueError, "home_config_too_large"):
+            configure_home(self.home, profile="safe")
+
+    def test_rdc_marker_read_is_bounded_validated_and_no_follow(self):
+        recorded = record_rdc(
+            self.home, device_id="device-1", device_name="Fixture Mac"
+        )
+        marker = Path(recorded["path"])
+        loaded = read_rdc(self.home)
+        self.assertEqual(loaded["status"], "RECORDED")
+        self.assertEqual(loaded["mode"], "0o600")
+        self.assertLess(loaded["bytes"], RDC_MARKER_MAX_BYTES)
+
+        external = self.base / "external-rdc.json"
+        external.write_text(marker.read_text(encoding="utf-8"), encoding="utf-8")
+        marker.unlink()
+        marker.symlink_to(external)
+        with self.assertRaisesRegex(ValueError, "rdc_marker_unsafe"):
+            read_rdc(self.home)
+        doctor = run_doctor(self.home, check_codex=False)
+        rdc = next(
+            item for item in doctor["checks"] if item["id"] == "rdc_chat_bridge"
+        )
+        self.assertEqual(rdc["status"], "BLOCKED")
+        self.assertEqual(rdc["detail"], "rdc_marker_unsafe")
+
+        marker.unlink()
+        marker.write_bytes(b"{" + b"x" * RDC_MARKER_MAX_BYTES)
+        with self.assertRaisesRegex(ValueError, "rdc_marker_too_large"):
+            read_rdc(self.home)
 
     def test_safe_profile_denies_publication_by_default(self):
         registry = ProjectRegistry(self.home)
@@ -1242,7 +1301,10 @@ class ProductizationTests(unittest.TestCase):
         self.assertIn(f"permanently scoped to project_id={project_id}", text)
 
     def test_global_dispatcher_remains_unscoped(self):
-        target = self.base / "global-dispatcher.txt"
+        custom_dir = self.base / "custom-dispatcher-output"
+        custom_dir.mkdir(mode=0o755)
+        os.chmod(custom_dir, 0o755)
+        target = custom_dir / "global-dispatcher.txt"
         with mock.patch.dict(
             os.environ, {"ORCH_EXECUTABLE": "/tmp/orch"}, clear=False
         ):
@@ -1254,6 +1316,38 @@ class ProductizationTests(unittest.TestCase):
         self.assertNotIn("claim --worker scheduled-variant-b --project", text)
         self.assertIn("oldest runnable task whose writer key is free", text)
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(custom_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_dispatcher_render_rejects_symlink_output(self):
+        victim = self.base / "dispatcher-victim.txt"
+        victim.write_text("owner preserve\n", encoding="utf-8")
+        target = self.base / "dispatcher-link.txt"
+        target.symlink_to(victim)
+        with self.assertRaisesRegex(ValueError, "dispatcher_target_unsafe"):
+            render_dispatcher(self.home, output=target)
+        self.assertEqual(
+            victim.read_text(encoding="utf-8"), "owner preserve\n"
+        )
+        self.assertTrue(target.is_symlink())
+
+    def test_dispatcher_cli_preserves_symlink_boundary(self):
+        victim = self.base / "dispatcher-cli-victim.txt"
+        victim.write_text("owner preserve\n", encoding="utf-8")
+        target = self.base / "dispatcher-cli-link.txt"
+        target.symlink_to(victim)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "dispatcher", "render",
+                "--output", str(target),
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "dispatcher_target_unsafe")
+        self.assertEqual(
+            victim.read_text(encoding="utf-8"), "owner preserve\n"
+        )
 
     def test_project_scoped_dispatcher_requires_registered_project(self):
         with self.assertRaisesRegex(ValueError, "unknown_project"):

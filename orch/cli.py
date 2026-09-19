@@ -282,7 +282,7 @@ def main(argv=None) -> int:
         elif args.command == "dispatcher":
             if args.dispatcher_command != "render":
                 raise ValueError("unknown_dispatcher_command")
-            output = Path(args.output).expanduser().resolve() if args.output else None
+            output = Path(args.output).expanduser() if args.output else None
             result = render_dispatcher(root, output=output, project_id=args.project)
         elif args.command == "project":
             if args.project_command == "audit":
@@ -391,7 +391,7 @@ def main(argv=None) -> int:
                 else:
                     registry = ProjectRegistry(root)
                     manifest_path = Path(args.manifest).expanduser()
-                    manifest, source_digest = read_batch_manifest(manifest_path)
+                    manifest, source_digest, source_bytes = read_batch_manifest(manifest_path)
                     prior = orch.project_unresolved_tasks(args.project_id)
                     plans_dir = ensure_private_dir(root / "plans")
                     manifest_revision = manifest.get("plan_revision")
@@ -409,6 +409,7 @@ def main(argv=None) -> int:
                         registry.get(args.project_id),
                         manifest,
                         source_digest=source_digest,
+                        source_bytes=source_bytes,
                         bind_initial_base=bind_initial_base,
                     )
                     plan_path = plans_dir / f"{plan['plan_revision']}.json"
@@ -435,6 +436,7 @@ def main(argv=None) -> int:
                         "plan_artifact_status": written["status"],
                         "source_manifest": str(manifest_path.resolve()),
                         "source_sha256": source_digest,
+                        "source_bytes": source_bytes,
                         "audit_status": readiness["status"],
                         "base_binding": (
                             "dynamic_at_verify"
@@ -550,7 +552,7 @@ def main(argv=None) -> int:
             elif args.state_command == "migrations":
                 result = migration_history(orch)
             elif args.state_command == "backup":
-                output = Path(args.output).expanduser().resolve() if args.output else None
+                output = Path(args.output).expanduser() if args.output else None
                 result = backup_state(orch, output)
             elif args.state_command == "verify-backup":
                 result = verify_backup_archive(Path(args.path).expanduser())
@@ -592,7 +594,7 @@ def main(argv=None) -> int:
             else:
                 raise ValueError("unknown_state_command")
         elif args.command == "load-plan":
-            result = orch.load_plan(Path(args.plan).expanduser().resolve())
+            result = orch.load_plan(Path(args.plan).expanduser())
         elif args.command == "claim":
             result = orch.claim(args.worker, project_id=args.project)
         elif args.command == "context":

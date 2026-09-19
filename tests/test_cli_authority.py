@@ -156,6 +156,58 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(status["variant"], "B_NEW_CHAT_PER_ATTEMPT")
 
+    def test_state_backup_cli_preserves_symlink_boundary(self):
+        home = self.base / "backup-symlink-home"
+        Orchestrator(home)
+        victim = self.base / "backup-cli-victim.zip"
+        victim.write_bytes(b"owner preserve")
+        link = self.base / "backup-cli-link.zip"
+        link.symlink_to(victim)
+
+        rc, result = self.invoke(
+            "--root", str(home),
+            "state", "backup",
+            "--output", str(link),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "backup_output_unsafe")
+        self.assertEqual(victim.read_bytes(), b"owner preserve")
+        self.assertTrue(link.is_symlink())
+
+    def test_load_plan_cli_preserves_no_follow_symlink_boundary(self):
+        home = self.base / "load-plan-symlink-home"
+        workspace = self.base / "load-plan-workspace"
+        workspace.mkdir()
+        Orchestrator(home)
+        target = self.base / "load-plan-real.json"
+        target.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "cli-symlink-v1",
+            "tasks": [{
+                "id": "CLI-SYMLINK",
+                "goal": "must not follow cli symlink",
+                "workspace": str(workspace),
+                "dependencies": [],
+                "allowed_paths": ["result.json"],
+                "protected_paths": {},
+                "checks": [],
+                "required_review": False,
+                "owner_acceptance": False,
+                "publication": {"kind": "none"},
+                "max_attempts": 2,
+            }],
+        }) + "\n", encoding="utf-8")
+        link = self.base / "load-plan-link.json"
+        link.symlink_to(target)
+
+        rc, result = self.invoke(
+            "--root", str(home), "load-plan", str(link)
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error"], "plan_file_missing_or_unsafe")
+        self.assertEqual(Orchestrator(home).status()["tasks"], [])
+        self.assertTrue(link.is_symlink())
+
     def test_symlinked_ledger_is_refused_without_touching_target(self):
         home = self.base / "symlink-home"
         runtime = home / ".runtime"

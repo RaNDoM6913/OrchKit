@@ -1,14 +1,15 @@
-# Agent Workflow Orchestrator — v0.10 bounded handoff ingestion
+# Agent Workflow Orchestrator — v0.11 authority I/O hardening
 
 A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
 
 ## Current state
 
-Implemented and locally verified through 2026-09-18:
+Implemented and locally verified through 2026-09-19:
 
 - SQLite durable plan/task/run/event ledger with immutable plan-revision digests.
 - DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation. Direct load-plan ingestion is no-follow/regular-file checked, capped at 1 MiB/512 tasks, hashes the exact parsed bytes, and enforces bounded known task/check/review/publication metadata before ledger admission. Writer identity is independently derived from the resolved workspace/Git common directory, so plans cannot spoof isolation; VERIFIED snapshots retain that writer reservation until completion/publication. Git runs also persist the exact claim-time HEAD, so a foreign commit after capability issuance blocks verification instead of silently becoming the task base.
-- Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capabilities are revoked at quiesce/abort.
+- Authority I/O is fail-closed across generated/direct plans, batch manifests, home/project config, RDC markers, dispatcher artifacts, capability files, replacement journals and backup paths. Inputs use bounded no-follow regular-file reads; atomic authority writes use exclusive random temp files; CLI paths preserve leaf symlinks for the callee to reject instead of resolving them early. Backup verification records the frozen archive SHA-256, and restore re-freezes the source and requires the same digest before extraction.
+- Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capability reads are exact-path, no-follow, bounded and mode-bound, and capabilities are revoked at quiesce/abort.
 - Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat. Claim preflights the exact context before persisting writer authority, and capability-write failures abort/cleanly block instead of stranding RUNNING state.
 - Claim-bound worker receipt ingestion: every run receives an exact private receipt_file; submit rejects alternate paths/symlinks, bounds raw JSON to 64 KiB, normalizes v1 changed paths, caps path count/summary size, and records raw receipt SHA-256/bytes before durable state transition. Claim also fails closed before capability issuance when new non-protected workspace bytes, protected-baseline drift, or bound verifier-authority drift are already present.
 - Verifier checks use admission-bound execution authority: argv[0] is resolved and hashed once, relevant support/config files are hash/presence-bound, and verification refuses drift before executing a check.
@@ -36,7 +37,7 @@ This removes same-chat continuation from the acceptance contract while preservin
 
 ## Installable CLI and multi-project setup
 
-Version 0.10 keeps the v0.9 claim-boundary guarantees and adds bounded, exact-path, no-follow ingestion for both worker receipts and reviewer reports, with durable raw SHA-256/byte evidence. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+Version 0.11 keeps the v0.10 bounded handoff guarantees and hardens the remaining local authority I/O surfaces: generated task admission, batch manifests, plan artifacts, capability reads, config/registry/RDC/dispatcher state, replacement journals, backup publication, and verify→restore source binding. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
 
 Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
 
@@ -44,7 +45,7 @@ Build a shareable wheel without network access on the proven macOS/Python 3.9 en
 python3 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current agent_workflow_orchestrator-0.10.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers claim-bound worker receipts and frozen-path review report import without invoking a model reviewer. Exact wheel size, SHA-256 and evidence are recorded in docs/59_V010_BOUNDED_HANDOFF_INGESTION.md.
+The current agent_workflow_orchestrator-0.11.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers the v0.11 authority boundaries without invoking a model reviewer. Exact wheel size, SHA-256 and evidence are recorded in docs/61_V011_AUTHORITY_IO_HARDENING.md.
 
 First-run flow for another user:
 

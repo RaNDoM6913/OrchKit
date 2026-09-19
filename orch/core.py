@@ -14,7 +14,8 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .config import ensure_private_dir, ensure_private_file
+from .config import (ensure_private_dir, ensure_private_file,
+                     read_bounded_json_object)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .review_policy import decide_review, normalize_review_policy
 
@@ -28,6 +29,7 @@ WORKER_RECEIPT_MAX_SUMMARY_BYTES = 4096
 REVIEW_REPORT_MAX_BYTES = 256 * 1024
 REVIEW_REPORT_MAX_FINDINGS = 100
 REVIEW_REPORT_MAX_UNCERTAINTY = 100
+CAPABILITY_MAX_BYTES = 4096
 PLAN_MAX_BYTES = 1024 * 1024
 PLAN_MAX_TASKS = 512
 PLAN_MAX_ALLOWED_PATHS = 512
@@ -1443,12 +1445,30 @@ class Orchestrator:
         return pack
 
     def lease_from_capability(self, run_id: str, capability_file: Path) -> str:
-        path = capability_file.resolve()
-        claims = (self.runtime / "claims").resolve()
-        if not _inside(claims, path) or not path.is_file() or path.is_symlink():
+        expected = self._capability_path(run_id)
+        supplied = Path(
+            os.path.abspath(os.path.expanduser(str(capability_file)))
+        )
+        if supplied != expected:
             raise ValueError("invalid_capability_file")
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("run_id") != run_id or not isinstance(data.get("lease_token"), str):
+        try:
+            data, meta = read_bounded_json_object(
+                expected,
+                max_bytes=CAPABILITY_MAX_BYTES,
+                unsafe_error="invalid_capability_file",
+                too_large_error="capability_file_too_large",
+                invalid_error="capability_file_invalid_json",
+            )
+        except FileNotFoundError as exc:
+            raise ValueError("invalid_capability_file") from exc
+        if meta["mode"] != 0o600:
+            raise ValueError("invalid_capability_mode")
+        if (
+            set(data) != {"run_id", "lease_token"}
+            or data.get("run_id") != run_id
+            or not isinstance(data.get("lease_token"), str)
+            or not data["lease_token"]
+        ):
             raise ValueError("capability_identity_mismatch")
         return data["lease_token"]
 
