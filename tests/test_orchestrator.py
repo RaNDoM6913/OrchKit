@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from orch.core import Orchestrator, canonical_json
-from orch.codex_review import prepare_review
+from orch.codex_review import prepare_review, run_review
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -1030,6 +1030,171 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(
             (self.orch.runtime / 'review_exports' / claim['run_id']).exists()
         )
+
+    def test_review_execution_rejects_tampered_prepared_prompt(self):
+        self.load([self.task('T1', review=True)], revision='review-prompt-bind')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+        Path(prepared['prompt']).write_text(
+            '{"tampered":true}\n', encoding='utf-8'
+        )
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch('orch.codex_review.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, 'review_prompt_stale'):
+                run_review(self.orch, claim['run_id'], execute=True)
+        run.assert_not_called()
+
+    def test_review_execution_rejects_tampered_prepared_schema(self):
+        self.load([self.task('T1', review=True)], revision='review-schema-bind')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+        Path(prepared['schema']).write_text(
+            '{"tampered":true}\n', encoding='utf-8'
+        )
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch('orch.codex_review.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, 'review_schema_stale'):
+                run_review(self.orch, claim['run_id'], execute=True)
+        run.assert_not_called()
+
+    def test_review_execution_refuses_preexisting_events_symlink(self):
+        self.load([self.task('T1', review=True)], revision='review-events-link')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+        victim = self.root / 'events-victim.txt'
+        victim.write_text('owner-preserve\n', encoding='utf-8')
+        events = Path(prepared['export']) / 'events.jsonl'
+        events.symlink_to(victim)
+        before = victim.read_bytes()
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch(
+            'orch.codex_review.subscription_preflight',
+            return_value={'status': 'PASS'},
+        ), mock.patch('orch.codex_review.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, 'review_events_unsafe'):
+                run_review(self.orch, claim['run_id'], execute=True)
+        run.assert_not_called()
+        self.assertEqual(victim.read_bytes(), before)
+        self.assertTrue(events.is_symlink())
+
+    def test_review_execution_refuses_preexisting_report_symlink(self):
+        self.load([self.task('T1', review=True)], revision='review-report-link')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+        victim = self.root / 'report-victim.json'
+        victim.write_text('owner-preserve\n', encoding='utf-8')
+        report = Path(prepared['report'])
+        report.symlink_to(victim)
+        before = victim.read_bytes()
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch(
+            'orch.codex_review.subscription_preflight',
+            return_value={'status': 'PASS'},
+        ), mock.patch('orch.codex_review.subprocess.run') as run:
+            with self.assertRaisesRegex(ValueError, 'review_report_preexisting'):
+                run_review(self.orch, claim['run_id'], execute=True)
+        run.assert_not_called()
+        self.assertEqual(victim.read_bytes(), before)
+        self.assertTrue(report.is_symlink())
+
+    def test_review_execution_blocks_oversized_event_stream(self):
+        self.load([self.task('T1', review=True)], revision='review-events-big')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+
+        def fake_run(cmd, **kwargs):
+            kwargs['stdout'].write('0123456789abcdef')
+            kwargs['stdout'].flush()
+            return subprocess.CompletedProcess(cmd, 0, stderr='')
+
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch(
+            'orch.codex_review.subscription_preflight',
+            return_value={'status': 'PASS'},
+        ), mock.patch(
+            'orch.codex_review.REVIEW_EVENTS_MAX_BYTES', 8
+        ), mock.patch(
+            'orch.codex_review.subprocess.run', side_effect=fake_run
+        ):
+            result = run_review(self.orch, claim['run_id'], execute=True)
+        self.assertEqual(result['status'], 'BLOCKED')
+        self.assertEqual(result['reason'], 'review_events_too_large')
+        self.assertFalse(Path(prepared['report']).exists())
+
+    def test_review_execution_imports_mocked_bound_report(self):
+        self.load([self.task('T1', review=True)], revision='review-exec-ok')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+
+        def fake_run(cmd, **kwargs):
+            kwargs['stdout'].write('{"event":"complete"}\n')
+            kwargs['stdout'].flush()
+            report = Path(cmd[cmd.index('-o') + 1])
+            report.write_text(json.dumps({
+                'run_id': claim['run_id'],
+                'snapshot_id': verified['snapshot_id'],
+                'verdict': 'PASS',
+                'findings': [],
+                'uncertainty': [],
+            }) + '\n', encoding='utf-8')
+            return subprocess.CompletedProcess(cmd, 0, stderr='')
+
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch(
+            'orch.codex_review.subscription_preflight',
+            return_value={'status': 'PASS'},
+        ), mock.patch(
+            'orch.codex_review.subprocess.run', side_effect=fake_run
+        ):
+            result = run_review(self.orch, claim['run_id'], execute=True)
+        self.assertEqual(result['status'], 'COMPLETE')
+        self.assertEqual(result['imported']['status'], 'PASS')
+        events = Path(result['events'])
+        self.assertEqual(events.stat().st_mode & 0o777, 0o600)
+        self.assertGreater(result['events_bytes'], 0)
+
+    def test_review_execution_timeout_is_blocked(self):
+        self.load([self.task('T1', review=True)], revision='review-exec-timeout')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+
+        def timeout_run(cmd, **kwargs):
+            kwargs['stdout'].write('{"event":"started"}\n')
+            kwargs['stdout'].flush()
+            raise subprocess.TimeoutExpired(cmd, 180, stderr='timed out')
+
+        with mock.patch(
+            'orch.codex_review.prepare_review', return_value=prepared
+        ), mock.patch(
+            'orch.codex_review.subscription_preflight',
+            return_value={'status': 'PASS'},
+        ), mock.patch(
+            'orch.codex_review.subprocess.run', side_effect=timeout_run
+        ):
+            result = run_review(self.orch, claim['run_id'], execute=True)
+        self.assertEqual(result['status'], 'BLOCKED')
+        self.assertEqual(result['reason'], 'review_timeout')
+        self.assertTrue(Path(result['events']).is_file())
 
     def test_verifier_blocks_check_mutation_of_snapshotted_file(self):
         mutator = self.ws / 'mutate.py'

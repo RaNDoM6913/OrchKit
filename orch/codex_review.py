@@ -18,6 +18,9 @@ from .core import (VERIFICATION_EVIDENCE_MAX_BYTES, Orchestrator,
                    safe_workspace_path, sha256_bytes, utc_now)
 
 CODEX_BIN = Path('/Applications/ChatGPT.app/Contents/Resources/codex')
+REVIEW_SCHEMA_MAX_BYTES = 64 * 1024
+REVIEW_PROMPT_MAX_BYTES = 512 * 1024
+REVIEW_EVENTS_MAX_BYTES = 4 * 1024 * 1024
 
 
 def safe_env() -> Dict[str, str]:
@@ -220,6 +223,72 @@ def _copy_bound_evidence(
     if not isinstance(data, dict):
         raise ValueError("review_evidence_invalid_json:" + evidence_id)
     return data
+
+
+def _bound_generated_review_artifact(
+    path: Path,
+    *,
+    max_bytes: int,
+    artifact: str,
+) -> Dict[str, Any]:
+    raw, meta = read_bounded_regular_file(
+        path,
+        max_bytes=max_bytes,
+        unsafe_error="review_" + artifact + "_unsafe",
+        too_large_error="review_" + artifact + "_too_large",
+    )
+    return {
+        "sha256": sha256_bytes(raw),
+        "bytes": meta["bytes"],
+    }
+
+
+def _read_prepared_review_artifact(
+    path: Path,
+    binding: Dict[str, Any],
+    *,
+    max_bytes: int,
+    artifact: str,
+) -> bytes:
+    if not isinstance(binding, dict):
+        raise ValueError("review_" + artifact + "_binding_invalid")
+    expected_sha = binding.get("sha256")
+    expected_bytes = binding.get("bytes")
+    if (
+        not isinstance(expected_sha, str)
+        or len(expected_sha) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha)
+        or not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
+        or expected_bytes < 0
+        or expected_bytes > max_bytes
+    ):
+        raise ValueError("review_" + artifact + "_binding_invalid")
+    raw, meta = read_bounded_regular_file(
+        path,
+        max_bytes=max_bytes,
+        unsafe_error="review_" + artifact + "_unsafe",
+        too_large_error="review_" + artifact + "_too_large",
+    )
+    if meta["bytes"] != expected_bytes or sha256_bytes(raw) != expected_sha:
+        raise ValueError("review_" + artifact + "_stale")
+    return raw
+
+
+def _open_private_review_output(path: Path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        raise ValueError("review_events_unsafe")
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise ValueError("review_events_unsafe") from exc
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
 
 
 def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
@@ -477,6 +546,11 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
         }
         schema_path = export / "review_schema.json"
         atomic_write_json(schema_path, schema, mode=0o600)
+        schema_binding = _bound_generated_review_artifact(
+            schema_path,
+            max_bytes=REVIEW_SCHEMA_MAX_BYTES,
+            artifact="schema",
+        )
 
         prompt = {
             "role": "reviewer_only",
@@ -506,11 +580,18 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
         }
         prompt_path = export / "review_prompt.json"
         atomic_write_json(prompt_path, prompt, mode=0o600)
+        prompt_binding = _bound_generated_review_artifact(
+            prompt_path,
+            max_bytes=REVIEW_PROMPT_MAX_BYTES,
+            artifact="prompt",
+        )
         return {
             "export": str(export),
             "workspace": str(work),
             "schema": str(schema_path),
+            "schema_binding": schema_binding,
             "prompt": str(prompt_path),
+            "prompt_binding": prompt_binding,
             "report": str(export / "review.json"),
             "snapshot_id": run["snapshot_id"],
         }
@@ -520,20 +601,115 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
         raise
 
 
-def run_review(orch: Orchestrator, run_id: str, *, execute: bool=False) -> Dict[str, Any]:
-    prepared=prepare_review(orch,run_id)
-    preflight=subscription_preflight(orch.root)
-    cmd=[str(CODEX_BIN),'--disable','hooks','exec','--ignore-user-config','--sandbox','read-only','--skip-git-repo-check','--json',
-         '--output-schema',prepared['schema'],'-o',str(Path(prepared['export'])/'review.json'),'-C',prepared['workspace'],'-']
+def run_review(
+    orch: Orchestrator,
+    run_id: str,
+    *,
+    execute: bool = False,
+) -> Dict[str, Any]:
+    prepared = prepare_review(orch, run_id)
+    _read_prepared_review_artifact(
+        Path(prepared["schema"]),
+        prepared.get("schema_binding"),
+        max_bytes=REVIEW_SCHEMA_MAX_BYTES,
+        artifact="schema",
+    )
+    prompt_raw = _read_prepared_review_artifact(
+        Path(prepared["prompt"]),
+        prepared.get("prompt_binding"),
+        max_bytes=REVIEW_PROMPT_MAX_BYTES,
+        artifact="prompt",
+    )
+    try:
+        prompt = prompt_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("review_prompt_invalid_utf8") from exc
+
+    preflight = subscription_preflight(orch.root)
+    report = Path(prepared["report"])
+    cmd = [
+        str(CODEX_BIN), "--disable", "hooks", "exec",
+        "--ignore-user-config", "--sandbox", "read-only",
+        "--skip-git-repo-check", "--json",
+        "--output-schema", prepared["schema"],
+        "-o", str(report), "-C", prepared["workspace"], "-",
+    ]
     if not execute:
-        return {'status':'DRY_RUN','preflight':preflight,'command':cmd,'prepared':prepared}
-    if preflight.get('status')!='PASS': return {'status':'BLOCKED','preflight':preflight}
-    prompt=Path(prepared['prompt']).read_text(encoding='utf-8')
-    events=Path(prepared['export'])/'events.jsonl'
-    proc=subprocess.run(cmd,cwd=prepared['workspace'],env=safe_env(),input=prompt,capture_output=True,text=True,timeout=180,check=False)
-    events.write_text(proc.stdout,encoding='utf-8')
-    report=Path(prepared['export'])/'review.json'
-    if proc.returncode!=0 or not report.is_file():
-        return {'status':'BLOCKED','preflight':preflight,'exit_code':proc.returncode,'stderr':proc.stderr[-4000:],'events':str(events)}
-    imported=orch.import_review(run_id,report)
-    return {'status':'COMPLETE','preflight':preflight,'exit_code':proc.returncode,'report':str(report),'imported':imported}
+        return {
+            "status": "DRY_RUN",
+            "preflight": preflight,
+            "command": cmd,
+            "prepared": prepared,
+        }
+    if preflight.get("status") != "PASS":
+        return {"status": "BLOCKED", "preflight": preflight}
+    if report.exists() or report.is_symlink():
+        raise ValueError("review_report_preexisting")
+
+    events = Path(prepared["export"]) / "events.jsonl"
+    with _open_private_review_output(events) as events_handle:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=prepared["workspace"],
+                env=safe_env(),
+                input=prompt,
+                stdout=events_handle,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            events_handle.flush()
+            os.fsync(events_handle.fileno())
+            return {
+                "status": "BLOCKED",
+                "reason": "review_timeout",
+                "preflight": preflight,
+                "stderr": (
+                    exc.stderr[-4000:]
+                    if isinstance(exc.stderr, str)
+                    else ""
+                ),
+                "events": str(events),
+            }
+        events_handle.flush()
+        os.fsync(events_handle.fileno())
+
+    try:
+        _, events_meta = read_bounded_regular_file(
+            events,
+            max_bytes=REVIEW_EVENTS_MAX_BYTES,
+            unsafe_error="review_events_unsafe",
+            too_large_error="review_events_too_large",
+        )
+    except ValueError as exc:
+        return {
+            "status": "BLOCKED",
+            "reason": str(exc),
+            "preflight": preflight,
+            "exit_code": proc.returncode,
+            "stderr": (proc.stderr or "")[-4000:],
+            "events": str(events),
+        }
+
+    if proc.returncode != 0:
+        return {
+            "status": "BLOCKED",
+            "preflight": preflight,
+            "exit_code": proc.returncode,
+            "stderr": (proc.stderr or "")[-4000:],
+            "events": str(events),
+            "events_bytes": events_meta["bytes"],
+        }
+    imported = orch.import_review(run_id, report)
+    return {
+        "status": "COMPLETE",
+        "preflight": preflight,
+        "exit_code": proc.returncode,
+        "report": str(report),
+        "events": str(events),
+        "events_bytes": events_meta["bytes"],
+        "imported": imported,
+    }
