@@ -231,6 +231,35 @@ class StateMaintenanceTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_backup_member_swap_after_census_fails_closed(self):
+        config = self.root / "config.json"
+        config.write_text('{"safe":true}\n', encoding="utf-8")
+        victim = Path(self.tmp.name) / "backup-member-victim.txt"
+        victim.write_text("external secret\n", encoding="utf-8")
+        output = Path(self.tmp.name) / "member-race.zip"
+        original = state_module._backup_members
+
+        def swap_after_census(orch):
+            members = original(orch)
+            config.unlink()
+            config.symlink_to(victim)
+            return members
+
+        with mock.patch.object(
+            state_module,
+            "_backup_members",
+            side_effect=swap_after_census,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "backup_member_unsafe:config.json"
+            ):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+        self.assertTrue(config.is_symlink())
+        self.assertEqual(
+            victim.read_text(encoding="utf-8"), "external secret\n"
+        )
+
     def test_backup_output_is_symlink_safe_and_temp_name_is_exclusive(self):
         victim = Path(self.tmp.name) / "backup-victim.bin"
         victim.write_bytes(b"owner preserve")
@@ -266,6 +295,28 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             verified["database_sha256"],
             verified["manifest"]["database_sha256"],
+        )
+
+    def test_backup_verifier_binds_non_database_member_hashes(self):
+        config = self.root / "config.json"
+        config.write_text('{"profile":"safe"}\n', encoding="utf-8")
+        source_path = Path(backup_state(self.orch)["path"])
+        tampered = Path(self.tmp.name) / "tampered-config.zip"
+        with zipfile.ZipFile(source_path, "r") as source, zipfile.ZipFile(
+            tampered, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "files/config.json":
+                    data = b'{"profile":"tampered"}\n'
+                target.writestr(info, data)
+        checked = verify_backup_archive(tampered)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn(
+            "backup_file_evidence_mismatch", checked["errors"]
+        )
+        self.assertEqual(
+            checked["file_evidence_mismatch"], "files/config.json"
         )
 
     def test_backup_verifier_rejects_symlink_source(self):

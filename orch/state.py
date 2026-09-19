@@ -604,11 +604,74 @@ def _backup_members(orch: Orchestrator) -> List[Path]:
         orch.runtime / "logs", orch.runtime / "worker_receipts",
     ):
         if base.is_dir():
-            members.extend(path for path in base.rglob("*") if path.is_file() and not path.is_symlink())
+            members.extend(
+                path for path in base.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            )
     review_root = orch.runtime / "review_exports"
     if review_root.is_dir():
-        members.extend(path for path in review_root.rglob("*") if path.is_file() and not path.is_symlink())
+        members.extend(
+            path for path in review_root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
     return sorted(set(members))
+
+
+def _stream_backup_member(
+    archive: zipfile.ZipFile,
+    orch: Orchestrator,
+    path: Path,
+) -> Tuple[str, Dict[str, Any]]:
+    try:
+        relative = path.relative_to(orch.root).as_posix()
+    except ValueError as exc:
+        raise ValueError("backup_member_outside_root") from exc
+    arcname = "files/" + relative
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        raise ValueError("backup_member_unsafe:" + relative)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise ValueError("backup_member_unsafe:" + relative) from exc
+    try:
+        before = os.fstat(fd)
+        if not statmod.S_ISREG(before.st_mode):
+            raise ValueError("backup_member_unsafe:" + relative)
+        digest = hashlib.sha256()
+        written = 0
+        with os.fdopen(fd, "rb", closefd=True) as source:
+            fd = -1
+            with archive.open(arcname, "w", force_zip64=True) as dest:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                    written += len(block)
+                    dest.write(block)
+            after = os.fstat(source.fileno())
+        identity_before = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if identity_after != identity_before or written != before.st_size:
+            raise ValueError("backup_member_changed_during_read:" + relative)
+        return arcname, {
+            "sha256": digest.hexdigest(),
+            "bytes": written,
+        }
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 @contextmanager
@@ -780,10 +843,97 @@ def _verify_frozen_backup_archive(
                 base["errors"].append("backup_manifest_database_hash_invalid")
                 return base
             excluded = manifest.get("excluded_secret_classes")
-            required_exclusions = {"claims", "capability_files", "provider_credentials"}
-            if not isinstance(excluded, list) or not required_exclusions.issubset(set(excluded)):
-                base["errors"].append("backup_secret_exclusion_contract_missing")
+            required_exclusions = {
+                "claims", "capability_files", "provider_credentials",
+            }
+            if (
+                not isinstance(excluded, list)
+                or not required_exclusions.issubset(set(excluded))
+            ):
+                base["errors"].append(
+                    "backup_secret_exclusion_contract_missing"
+                )
                 return base
+
+            file_evidence = manifest.get("file_evidence")
+            if file_evidence is None:
+                base["warnings"].append("backup_file_evidence_missing")
+            elif not isinstance(file_evidence, dict):
+                base["errors"].append("backup_file_evidence_invalid")
+                return base
+            else:
+                expected_files = {
+                    name for name in names if name.startswith("files/")
+                }
+                if set(file_evidence) != expected_files:
+                    base["errors"].append(
+                        "backup_file_evidence_members_mismatch"
+                    )
+                    return base
+                evidence_total = 0
+                info_by_name = {info.filename: info for info in infos}
+                for name in sorted(expected_files):
+                    record = file_evidence.get(name)
+                    if not isinstance(record, dict):
+                        base["errors"].append(
+                            "backup_file_evidence_invalid"
+                        )
+                        return base
+                    expected_sha = record.get("sha256")
+                    expected_bytes = record.get("bytes")
+                    if (
+                        set(record) != {"sha256", "bytes"}
+                        or not isinstance(expected_sha, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+                        is None
+                        or not isinstance(expected_bytes, int)
+                        or isinstance(expected_bytes, bool)
+                        or expected_bytes < 0
+                    ):
+                        base["errors"].append(
+                            "backup_file_evidence_invalid"
+                        )
+                        return base
+                    if expected_bytes != int(
+                        info_by_name[name].file_size
+                    ):
+                        base["errors"].append(
+                            "backup_file_evidence_mismatch"
+                        )
+                        base["file_evidence_mismatch"] = name
+                        return base
+                    actual_sha = hashlib.sha256()
+                    actual_bytes = 0
+                    try:
+                        with archive.open(name, "r") as source:
+                            while True:
+                                block = source.read(1024 * 1024)
+                                if not block:
+                                    break
+                                actual_sha.update(block)
+                                actual_bytes += len(block)
+                                evidence_total += len(block)
+                                if evidence_total > max_uncompressed_bytes:
+                                    base["errors"].append(
+                                        "backup_file_evidence_limit_exceeded"
+                                    )
+                                    return base
+                    except (
+                        OSError, RuntimeError, zipfile.BadZipFile,
+                    ):
+                        base["errors"].append(
+                            "backup_file_evidence_read_failed"
+                        )
+                        return base
+                    if (
+                        actual_bytes != expected_bytes
+                        or actual_sha.hexdigest() != expected_sha
+                    ):
+                        base["errors"].append(
+                            "backup_file_evidence_mismatch"
+                        )
+                        base["file_evidence_mismatch"] = name
+                        return base
 
             with tempfile.TemporaryDirectory(prefix="orch-backup-verify-") as tmp:
                 db_copy = Path(tmp) / "orch.sqlite3"
@@ -2055,7 +2205,10 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
             "created_at": utc_now(),
             "source_root": str(orch.root),
             "database_sha256": _sha256(db_copy),
-            "excluded_secret_classes": ["claims", "capability_files", "provider_credentials"],
+            "excluded_secret_classes": [
+                "claims", "capability_files", "provider_credentials",
+            ],
+            "file_evidence": {},
         }
         fd = -1
         temp_zip: Optional[Path] = None
@@ -2072,6 +2225,13 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
                     handle, "w", compression=zipfile.ZIP_DEFLATED
                 ) as archive:
                     archive.write(db_copy, "state/orch.sqlite3")
+                    evidence: Dict[str, Dict[str, Any]] = {}
+                    for path in _backup_members(orch):
+                        arcname, item = _stream_backup_member(
+                            archive, orch, path
+                        )
+                        evidence[arcname] = item
+                    manifest["file_evidence"] = evidence
                     archive.writestr(
                         "state/manifest.json",
                         json.dumps(
@@ -2082,11 +2242,6 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
                         )
                         + "\n",
                     )
-                    for path in _backup_members(orch):
-                        archive.write(
-                            path,
-                            "files/" + path.relative_to(orch.root).as_posix(),
-                        )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(str(temp_zip), str(target))
