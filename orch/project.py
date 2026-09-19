@@ -16,6 +16,7 @@ from .git_transport import inspect_transport_url
 from .review_policy import MODES, REVIEWERS
 
 PROJECT_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+PACKAGE_JSON_MAX_BYTES = 2 * 1024 * 1024
 
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -126,22 +127,59 @@ def _slug(value: str) -> str:
 
 
 def _detect_commands(root: Path) -> Dict[str, Any]:
-    detected: Dict[str, Any] = {"package_manager": None, "suggested_checks": []}
+    detected: Dict[str, Any] = {
+        "package_manager": None,
+        "suggested_checks": [],
+    }
     package_json = root / "package.json"
-    if package_json.is_file():
-        try:
-            package = json.loads(package_json.read_text(encoding="utf-8"))
-            scripts = package.get("scripts") or {}
-            manager = "pnpm" if (root / "pnpm-lock.yaml").exists() else "yarn" if (root / "yarn.lock").exists() else "npm"
+    try:
+        package, package_meta = read_bounded_json_object(
+            package_json,
+            max_bytes=PACKAGE_JSON_MAX_BYTES,
+            unsafe_error="package_json_unsafe",
+            too_large_error="package_json_too_large",
+            invalid_error="package_json_invalid",
+        )
+    except FileNotFoundError:
+        package = None
+    except ValueError as exc:
+        package = None
+        detected["package_json_error"] = str(exc)
+    if package is not None:
+        scripts = package.get("scripts") or {}
+        if not isinstance(scripts, dict):
+            detected["package_json_error"] = "package_json_scripts_invalid"
+        else:
+            manager = (
+                "pnpm"
+                if (root / "pnpm-lock.yaml").exists()
+                else "yarn"
+                if (root / "yarn.lock").exists()
+                else "npm"
+            )
             detected["package_manager"] = manager
-            run_prefix = [manager, "run"] if manager != "npm" else ["npm", "run"]
+            detected["package_json_bytes"] = package_meta["bytes"]
+            run_prefix = (
+                [manager, "run"]
+                if manager != "npm"
+                else ["npm", "run"]
+            )
             for name in ("test", "typecheck", "lint", "build"):
                 if name in scripts:
-                    detected["suggested_checks"].append({"id": name, "argv": run_prefix + [name], "cwd": "."})
-        except (OSError, json.JSONDecodeError):
-            detected["package_json_error"] = True
+                    detected["suggested_checks"].append({
+                        "id": name,
+                        "argv": run_prefix + [name],
+                        "cwd": ".",
+                    })
     if (root / "pyproject.toml").is_file() and (root / "tests").is_dir():
-        detected["suggested_checks"].append({"id": "python-tests", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"], "cwd": "."})
+        detected["suggested_checks"].append({
+            "id": "python-tests",
+            "argv": [
+                "python3", "-m", "unittest",
+                "discover", "-s", "tests", "-v",
+            ],
+            "cwd": ".",
+        })
     return detected
 
 

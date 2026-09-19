@@ -18,7 +18,8 @@ from orch.git_policy import evaluate_project_git_policy
 from orch.git_transport import inspect_transport_url
 from orch.core import Orchestrator, path_allowed
 from orch.plan import build_single_task_plan
-from orch.project import PROJECT_CONFIG_MAX_BYTES, ProjectRegistry
+from orch.project import (PACKAGE_JSON_MAX_BYTES, PROJECT_CONFIG_MAX_BYTES,
+                          ProjectRegistry, inspect_project)
 from orch.review_policy import decide_review, normalize_review_policy
 from orch.state import (backup_state, check_state,
                         reconcile_home_replacement, replace_home_from_backup)
@@ -246,6 +247,62 @@ class ProductizationTests(unittest.TestCase):
         self.assertNotEqual(primary["root"], secondary["root"])
         self.assertEqual(primary["writer_key"], secondary["writer_key"])
         self.assertEqual(len(registry.list()), 2)
+
+    def test_project_inventory_reads_package_json_no_follow(self):
+        external = self.base / "external-package.json"
+        external.write_text(
+            json.dumps({"scripts": {"test": "echo external"}}) + "\n",
+            encoding="utf-8",
+        )
+        package = self.repo / "package.json"
+        package.symlink_to(external)
+        before = external.read_bytes()
+
+        inventory = inspect_project(self.repo)
+        detected = inventory["detected"]
+        self.assertEqual(
+            detected["package_json_error"], "package_json_unsafe"
+        )
+        self.assertIsNone(detected["package_manager"])
+        self.assertEqual(detected["suggested_checks"], [])
+        self.assertEqual(external.read_bytes(), before)
+        self.assertTrue(package.is_symlink())
+
+    def test_project_inventory_bounds_package_json_before_parse(self):
+        package = self.repo / "package.json"
+        package.write_bytes(
+            b"{" + b"x" * PACKAGE_JSON_MAX_BYTES
+        )
+        inventory = inspect_project(self.repo)
+        detected = inventory["detected"]
+        self.assertEqual(
+            detected["package_json_error"], "package_json_too_large"
+        )
+        self.assertIsNone(detected["package_manager"])
+        self.assertEqual(detected["suggested_checks"], [])
+
+    def test_project_inventory_detects_bounded_package_scripts(self):
+        package = self.repo / "package.json"
+        package.write_text(
+            json.dumps({
+                "scripts": {
+                    "test": "node test.js",
+                    "lint": "node lint.js",
+                }
+            }) + "\n",
+            encoding="utf-8",
+        )
+        inventory = inspect_project(self.repo)
+        detected = inventory["detected"]
+        self.assertEqual(detected["package_manager"], "npm")
+        self.assertEqual(
+            detected["package_json_bytes"], package.stat().st_size
+        )
+        self.assertEqual(
+            [item["id"] for item in detected["suggested_checks"]],
+            ["test", "lint"],
+        )
+        self.assertNotIn("package_json_error", detected)
 
     def test_project_registration_protects_existing_dirty_bytes(self):
         dirty = self.repo / "owner-note.txt"
