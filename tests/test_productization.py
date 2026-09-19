@@ -1127,6 +1127,32 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(evidence["publication_guard_status"], "BLOCKED")
         self.assertEqual(evidence["reason"], "outside_allowlist:rogue.txt")
 
+    def test_publication_scope_evidence_refuses_symlink_target(self):
+        orch, claim = self._verified_local_publication(
+            "PUB-SCOPE-LINK", ["result.json"]
+        )
+        victim = self.base / "publication-scope-victim.json"
+        victim.write_text('{"owner":"preserve"}\n', encoding="utf-8")
+        log = orch.logs / (
+            f"{claim['run_id']}-publication-scope-preflight.json"
+        )
+        log.symlink_to(victim)
+        before = victim.read_bytes()
+        with self.assertRaisesRegex(ValueError, "atomic_json_target_unsafe"):
+            orch.publish(claim["run_id"])
+        self.assertEqual(victim.read_bytes(), before)
+        self.assertTrue(log.is_symlink())
+        with orch.connect() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT status FROM publications WHERE run_id=?",
+                (claim["run_id"],),
+            ).fetchone())
+        staged = subprocess.run(
+            ["git", "-C", str(self.repo), "diff", "--cached", "--name-only"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(staged, "")
+
     def test_publish_blocks_new_allowed_but_unsnapshotted_path(self):
         orch, claim = self._verified_local_publication(
             "PUB-SCOPE-2", ["result.json", "extra.json"]

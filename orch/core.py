@@ -2260,8 +2260,7 @@ class Orchestrator:
                 "expected_base": expected_base,
                 "reason": str(exc),
             }
-            log_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            ensure_private_file(log_path)
+            atomic_write_json(log_path, evidence, mode=0o600)
             raise ValueError(f"publication_workspace_snapshot_changed:{exc}") from exc
 
         changed = sorted(manifest.get("files", {}))
@@ -2289,8 +2288,7 @@ class Orchestrator:
         evidence["publication_guard_status"] = "BLOCKED" if reason else "PASS"
         if reason:
             evidence["reason"] = reason
-        log_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        ensure_private_file(log_path)
+        atomic_write_json(log_path, evidence, mode=0o600)
         evidence["log_path"] = str(log_path)
         if reason:
             raise ValueError("publication_workspace_scope_changed:" + reason)
