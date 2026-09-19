@@ -56,11 +56,47 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+    target = Path(os.path.abspath(os.path.expanduser(str(path))))
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif target.is_symlink():
+        raise ValueError("hash_file_unsafe")
+    try:
+        fd = os.open(str(target), flags)
+    except OSError as exc:
+        raise ValueError("hash_file_unsafe") from exc
+    try:
+        before = os.fstat(fd)
+        if not statmod.S_ISREG(before.st_mode):
+            raise ValueError("hash_file_unsafe")
+        digest = hashlib.sha256()
+        read_bytes = 0
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                read_bytes += len(block)
+            after = os.fstat(handle.fileno())
+        before_identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if before_identity != after_identity or read_bytes != before.st_size:
+            raise ValueError("hash_file_changed_during_read")
+        return digest.hexdigest()
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _inside(root: Path, candidate: Path) -> bool:

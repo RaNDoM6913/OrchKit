@@ -4,9 +4,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from orch.config import atomic_write_json
-from orch.core import PLAN_MAX_BYTES, Orchestrator
+from orch.core import PLAN_MAX_BYTES, Orchestrator, sha256_file
 from orch.plan import existing_plan_initial_base_binding, write_plan
 
 
@@ -85,6 +86,40 @@ class PlanAdmissionTests(unittest.TestCase):
             victim.read_text(encoding="utf-8"), '{"owner":"preserve"}\n'
         )
         self.assertTrue(link.is_symlink())
+
+    def test_sha256_file_is_no_follow_and_detects_identity_drift(self):
+        target = self.base / "hash-target.bin"
+        raw = b"bound-bytes\n"
+        target.write_bytes(raw)
+        self.assertEqual(sha256_file(target), hashlib.sha256(raw).hexdigest())
+
+        link = self.base / "hash-link.bin"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "hash_file_unsafe"):
+            sha256_file(link)
+
+        real_fstat = os.fstat
+        calls = 0
+
+        def changed_fstat(fd):
+            nonlocal calls
+            info = real_fstat(fd)
+            calls += 1
+            if calls != 2:
+                return info
+            changed = mock.Mock()
+            for field in (
+                "st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns",
+            ):
+                setattr(changed, field, getattr(info, field))
+            changed.st_ctime_ns = info.st_ctime_ns + 1
+            return changed
+
+        with mock.patch("orch.core.os.fstat", side_effect=changed_fstat):
+            with self.assertRaisesRegex(
+                ValueError, "hash_file_changed_during_read"
+            ):
+                sha256_file(target)
 
     def test_atomic_json_write_ignores_predictable_temp_symlink_trap(self):
         target = self.base / "authority.json"
