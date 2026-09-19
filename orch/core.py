@@ -14,8 +14,8 @@ import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .config import (ensure_private_dir, ensure_private_file,
-                     read_bounded_json_object)
+from .config import (atomic_write_json, ensure_private_dir,
+                     ensure_private_file, read_bounded_json_object)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .review_policy import decide_review, normalize_review_policy
 
@@ -1326,14 +1326,11 @@ class Orchestrator:
         claims = ensure_private_dir(self.runtime / "claims")
         cap = self._capability_path(run_id)
         try:
-            cap.write_text(
-                json.dumps(
-                    {"run_id": run_id, "lease_token": lease},
-                    separators=(",", ":"),
-                ) + "\n",
-                encoding="utf-8",
+            atomic_write_json(
+                cap,
+                {"run_id": run_id, "lease_token": lease},
+                mode=0o600,
             )
-            os.chmod(cap, 0o600)
         except Exception as exc:
             try:
                 if cap.exists() and cap.is_file() and not cap.is_symlink():

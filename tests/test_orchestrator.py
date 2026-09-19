@@ -566,13 +566,34 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(task_row["status"], "BLOCKED")
         self.assertEqual(self.orch.reconcile()["status"], "CLEAN")
 
+    def test_claim_creates_private_exact_capability(self):
+        self.load(
+            [self.task("CAP-ATOMIC")],
+            revision="cap-atomic",
+        )
+        claim = self.orch.claim("worker")
+        cap = Path(claim["capability_file"])
+        self.assertEqual(
+            cap,
+            self.orch.runtime / "claims" / f"{claim['run_id']}.json",
+        )
+        self.assertEqual(cap.stat().st_mode & 0o777, 0o600)
+        payload = json.loads(cap.read_text(encoding="utf-8"))
+        self.assertEqual(set(payload), {"run_id", "lease_token"})
+        self.assertEqual(payload["run_id"], claim["run_id"])
+        self.assertTrue(payload["lease_token"])
+        self.assertEqual(
+            self.orch.lease_from_capability(claim["run_id"], cap),
+            payload["lease_token"],
+        )
+
     def test_capability_write_failure_aborts_run_and_releases_writer(self):
         self.load(
             [self.task("CAP-WRITE-FAIL")],
             revision="cap-write-fail",
         )
         with mock.patch(
-            "pathlib.Path.write_text",
+            "orch.core.atomic_write_json",
             side_effect=OSError("synthetic capability write failure"),
         ):
             result = self.orch.claim("worker")
