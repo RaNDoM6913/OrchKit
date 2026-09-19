@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import select
 import shutil
+import stat as statmod
 import subprocess
+import tempfile
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from .core import Orchestrator, canonical_json, safe_workspace_path, sha256_file, utc_now
+from .config import (atomic_write_bytes, atomic_write_json,
+                     ensure_private_dir, read_bounded_regular_file)
+from .core import (VERIFICATION_EVIDENCE_MAX_BYTES, Orchestrator,
+                   safe_workspace_path, sha256_bytes, utc_now)
 
 CODEX_BIN = Path('/Applications/ChatGPT.app/Contents/Resources/codex')
 
@@ -63,81 +69,455 @@ def subscription_preflight(root: Path) -> Dict[str, Any]:
     return summary
 
 
+def _copy_bound_review_file(
+    source: Path,
+    target: Path,
+    *,
+    relative: str,
+    expected_sha256: str,
+    expected_bytes: Optional[int],
+    error_prefix: str,
+) -> Dict[str, Any]:
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise ValueError(error_prefix + "_binding_invalid:" + relative)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif source.is_symlink():
+        raise ValueError(error_prefix + ":" + relative)
+    try:
+        fd = os.open(str(source), flags)
+    except OSError as exc:
+        raise ValueError(error_prefix + ":" + relative) from exc
+    temp: Optional[Path] = None
+    out_fd = -1
+    try:
+        before = os.fstat(fd)
+        if not statmod.S_ISREG(before.st_mode):
+            raise ValueError(error_prefix + ":" + relative)
+        if (
+            expected_bytes is not None
+            and before.st_size != expected_bytes
+        ):
+            raise ValueError(error_prefix + ":" + relative)
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        out_fd, temp_name = tempfile.mkstemp(
+            prefix=target.name + ".tmp-",
+            dir=str(target.parent),
+        )
+        temp = Path(temp_name)
+        os.fchmod(out_fd, 0o600)
+        digest = hashlib.sha256()
+        written = 0
+        with os.fdopen(fd, "rb", closefd=True) as src:
+            fd = -1
+            with os.fdopen(out_fd, "wb", closefd=True) as dst:
+                out_fd = -1
+                while True:
+                    block = src.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                    written += len(block)
+                    dst.write(block)
+                dst.flush()
+                os.fsync(dst.fileno())
+            after = os.fstat(src.fileno())
+        before_identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if (
+            before_identity != after_identity
+            or written != before.st_size
+            or (
+                expected_bytes is not None
+                and written != expected_bytes
+            )
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise ValueError(error_prefix + ":" + relative)
+        os.replace(str(temp), str(target))
+        temp = None
+        return {
+            "sha256": expected_sha256,
+            "bytes": written,
+        }
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if out_fd >= 0:
+            os.close(out_fd)
+        if temp is not None:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _copy_bound_evidence(
+    source: Path,
+    target: Path,
+    *,
+    record: Dict[str, Any],
+    evidence_id: str,
+) -> Dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError("review_evidence_binding_invalid:" + evidence_id)
+    expected_sha = record.get("sha256")
+    expected_bytes = record.get("bytes")
+    if (
+        not isinstance(expected_sha, str)
+        or len(expected_sha) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha)
+        or not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
+        or expected_bytes < 0
+    ):
+        raise ValueError("review_evidence_binding_invalid:" + evidence_id)
+    try:
+        raw, meta = read_bounded_regular_file(
+            source,
+            max_bytes=VERIFICATION_EVIDENCE_MAX_BYTES,
+            unsafe_error="review_evidence_unsafe",
+            too_large_error="review_evidence_too_large",
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "review_evidence_missing:" + evidence_id
+        ) from exc
+    except ValueError as exc:
+        raise ValueError(
+            str(exc) + ":" + evidence_id
+        ) from exc
+    if (
+        meta["bytes"] != expected_bytes
+        or sha256_bytes(raw) != expected_sha
+    ):
+        raise ValueError("review_evidence_stale:" + evidence_id)
+    atomic_write_bytes(
+        target,
+        raw,
+        mode=0o600,
+        unsafe_error="review_export_target_unsafe",
+    )
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "review_evidence_invalid_json:" + evidence_id
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError("review_evidence_invalid_json:" + evidence_id)
+    return data
+
+
 def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
     decision = orch.review_decision(run_id)
-    if not decision.get('required'):
-        raise ValueError('review_not_required')
-    if decision.get('reviewer') != 'codex':
-        raise ValueError('reviewer_not_codex')
+    if not decision.get("required"):
+        raise ValueError("review_not_required")
+    if decision.get("reviewer") != "codex":
+        raise ValueError("reviewer_not_codex")
     with orch.connect() as conn:
-        run=conn.execute('SELECT * FROM runs WHERE run_id=?',(run_id,)).fetchone()
-        if not run or run['state']!='REVIEWING': raise ValueError('run_not_reviewing')
-        task=conn.execute('SELECT * FROM tasks WHERE task_id=?',(run['task_id'],)).fetchone()
-        payload=json.loads(task['payload_json'])
-        snap=conn.execute('SELECT manifest_json FROM snapshots WHERE snapshot_id=?',(run['snapshot_id'],)).fetchone()
-        if not snap: raise ValueError('snapshot_missing')
-        manifest=json.loads(snap['manifest_json'])
-    export=orch.runtime/'review_exports'/run_id
-    if export.exists(): shutil.rmtree(export)
-    work=export/'workspace'; work.mkdir(parents=True)
-    workspace=Path(payload['workspace']).resolve()
-    copied=set(); deleted_files=[]
-    for rel, meta in sorted(manifest.get('files',{}).items()):
-        if meta.get('deleted'):
-            deleted_files.append(rel)
-            continue
-        src=safe_workspace_path(workspace,rel,must_exist=True)
-        dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied.add(rel)
-    support_files={}
-    for check in payload.get('checks',[]):
-        for arg in check.get('argv',[])[1:]:
-            if not isinstance(arg,str) or not arg or arg.startswith('-') or Path(arg).is_absolute():
+        run = conn.execute(
+            "SELECT * FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if not run or run["state"] != "REVIEWING":
+            raise ValueError("run_not_reviewing")
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)
+        ).fetchone()
+        if not task:
+            raise ValueError("review_task_missing")
+        payload = json.loads(task["payload_json"])
+        snap = conn.execute(
+            "SELECT manifest_json FROM snapshots WHERE snapshot_id=?",
+            (run["snapshot_id"],),
+        ).fetchone()
+        if not snap:
+            raise ValueError("snapshot_missing")
+        manifest = json.loads(snap["manifest_json"])
+
+    orch._assert_manifest_current(payload, manifest)
+    evidence_binding = manifest.get("verification_evidence")
+    if not isinstance(evidence_binding, dict):
+        raise ValueError("review_evidence_binding_missing")
+
+    export = orch.runtime / "review_exports" / run_id
+    if export.is_symlink() or (export.exists() and not export.is_dir()):
+        raise ValueError("review_export_unsafe")
+    if export.exists():
+        shutil.rmtree(export)
+    ensure_private_dir(export)
+    work = ensure_private_dir(export / "workspace")
+    workspace = Path(payload["workspace"]).resolve()
+
+    try:
+        copied: Dict[str, Dict[str, Any]] = {}
+        deleted_files = []
+        for rel, meta in sorted(manifest.get("files", {}).items()):
+            if not isinstance(meta, dict):
+                raise ValueError("review_snapshot_binding_invalid:" + rel)
+            if meta.get("deleted"):
+                deleted_files.append(rel)
                 continue
-            try:
-                src=safe_workspace_path(workspace,arg,must_exist=True)
-            except (ValueError,OSError):
-                continue
-            if not src.is_file():
-                continue
-            rel=Path(arg).as_posix()
-            if rel not in copied:
-                dst=work/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied.add(rel)
-            support_files[rel]={'sha256':sha256_file(src),'purpose':'approved_check_support'}
-    verification=[]
-    evidence_dir=work/'verification_evidence'; evidence_dir.mkdir()
-    scope_evidence=None
-    scope_log=orch.logs/f"{run_id}-scope.json"
-    if scope_log.is_file():
-        scope_data=json.loads(scope_log.read_text(encoding='utf-8'))
-        scope_target=evidence_dir/'scope.json'; shutil.copy2(scope_log,scope_target)
-        scope_evidence={**scope_data,'evidence_file':str(scope_target.relative_to(work)),'sha256':sha256_file(scope_target)}
-    for check in payload.get('checks',[]):
-        safe_id=str(check.get('id','check')).replace('/','_')
-        log=orch.logs/f"{run_id}-{safe_id}.json"
-        if not log.is_file():
-            continue
-        data=json.loads(log.read_text(encoding='utf-8'))
-        target=evidence_dir/f"{safe_id}.json"; shutil.copy2(log,target)
-        verification.append({'id':data.get('id'),'exit_code':data.get('exit_code'),'timed_out':data.get('timed_out'),
-                             'stdout':data.get('stdout','')[-2000:],'stderr':data.get('stderr','')[-2000:],
-                             'evidence_file':str(target.relative_to(work)),'sha256':sha256_file(target)})
-    schema={'type':'object','additionalProperties':False,'required':['run_id','snapshot_id','verdict','findings','uncertainty'],
-            'properties':{'run_id':{'type':'string'},'snapshot_id':{'type':'string'},'verdict':{'type':'string','enum':['PASS','NEEDS_FIX','BLOCKED']},
-                          'findings':{'type':'array','items':{'type':'object','additionalProperties':False,'required':['severity','path','evidence','impact'],
-                                      'properties':{'severity':{'type':'string'},'path':{'type':'string'},'evidence':{'type':'string'},'impact':{'type':'string'}}}},
-                          'uncertainty':{'type':'array','items':{'type':'string'}}}}
-    schema_path=export/'review_schema.json'; schema_path.write_text(json.dumps(schema,indent=2)+'\n',encoding='utf-8')
-    prompt={'role':'reviewer_only','run_id':run_id,'snapshot_id':run['snapshot_id'],'goal':payload.get('goal'),'non_goals':payload.get('non_goals',[]),
-            'review_decision':decision,
-            'files':sorted(manifest.get('files',{})),'deleted_files':deleted_files,
-            'file_manifest':manifest.get('files',{}),'support_files':support_files,'checks':payload.get('checks',[]),
-            'verification_evidence':verification,'scope_evidence':scope_evidence,
-            'instructions':['Read only the exported workspace.','Do not edit files or run project hooks.',
-                            'Verifier checks already ran against the source workspace; inspect supplied evidence and frozen support files.',
-                            'Only rerun an approved check when necessary; never expand beyond the exported workspace.',
-                            'Report only concrete findings.','PASS only when the stated goal/checklist is met.']}
-    prompt_path=export/'review_prompt.json'; prompt_path.write_text(json.dumps(prompt,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-    return {'export':str(export),'workspace':str(work),'schema':str(schema_path),'prompt':str(prompt_path),'report':str(export/'review.json'),'snapshot_id':run['snapshot_id']}
+            expected_sha = meta.get("sha256")
+            expected_bytes = meta.get("bytes")
+            if (
+                not isinstance(expected_bytes, int)
+                or isinstance(expected_bytes, bool)
+                or expected_bytes < 0
+            ):
+                raise ValueError(
+                    "review_snapshot_binding_invalid:" + rel
+                )
+            src = safe_workspace_path(
+                workspace, rel, must_exist=True
+            )
+            dst = safe_workspace_path(
+                work, rel, must_exist=False
+            )
+            copied[rel] = _copy_bound_review_file(
+                src,
+                dst,
+                relative=rel,
+                expected_sha256=expected_sha,
+                expected_bytes=expected_bytes,
+                error_prefix="review_snapshot_stale",
+            )
+
+        support_bindings: Dict[str, str] = {}
+        for check in payload.get("checks", []):
+            authority = check.get("authority_files", [])
+            if not isinstance(authority, list):
+                raise ValueError("review_support_binding_invalid")
+            for item in authority:
+                if not isinstance(item, dict):
+                    raise ValueError("review_support_binding_invalid")
+                if item.get("expected") != "file":
+                    continue
+                rel = item.get("path")
+                expected_sha = item.get("sha256")
+                if not isinstance(rel, str) or not isinstance(
+                    expected_sha, str
+                ):
+                    raise ValueError("review_support_binding_invalid")
+                prior = support_bindings.get(rel)
+                if prior is not None and prior != expected_sha:
+                    raise ValueError(
+                        "review_support_binding_conflict:" + rel
+                    )
+                support_bindings[rel] = expected_sha
+
+        support_files: Dict[str, Dict[str, Any]] = {}
+        for rel, expected_sha in sorted(support_bindings.items()):
+            if rel in copied:
+                if copied[rel]["sha256"] != expected_sha:
+                    raise ValueError("review_support_stale:" + rel)
+                copied_support = copied[rel]
+            else:
+                src = safe_workspace_path(
+                    workspace, rel, must_exist=True
+                )
+                dst = safe_workspace_path(
+                    work, rel, must_exist=False
+                )
+                copied_support = _copy_bound_review_file(
+                    src,
+                    dst,
+                    relative=rel,
+                    expected_sha256=expected_sha,
+                    expected_bytes=None,
+                    error_prefix="review_support_stale",
+                )
+                copied[rel] = copied_support
+            support_files[rel] = {
+                "sha256": expected_sha,
+                "bytes": copied_support["bytes"],
+                "purpose": "approved_check_support",
+            }
+
+        scope_record = evidence_binding.get("scope")
+        authority_record = evidence_binding.get("check_authority")
+        check_records = evidence_binding.get("checks")
+        if (
+            not isinstance(scope_record, dict)
+            or not isinstance(authority_record, dict)
+            or not isinstance(check_records, list)
+        ):
+            raise ValueError("review_evidence_binding_invalid")
+        expected_scope_name = f"{run_id}-scope.json"
+        expected_authority_name = f"{run_id}-check-authority.json"
+        if scope_record.get("file") != expected_scope_name:
+            raise ValueError("review_evidence_binding_invalid:scope")
+        if authority_record.get("file") != expected_authority_name:
+            raise ValueError(
+                "review_evidence_binding_invalid:check_authority"
+            )
+        checks = payload.get("checks", [])
+        if len(check_records) != len(checks):
+            raise ValueError("review_evidence_binding_invalid:checks")
+
+        evidence_dir = ensure_private_dir(
+            work / "verification_evidence"
+        )
+        scope_target = evidence_dir / "scope.json"
+        scope_data = _copy_bound_evidence(
+            orch.logs / expected_scope_name,
+            scope_target,
+            record=scope_record,
+            evidence_id="scope",
+        )
+        scope_evidence = {
+            **scope_data,
+            "evidence_file": str(scope_target.relative_to(work)),
+            "sha256": scope_record["sha256"],
+            "bytes": scope_record["bytes"],
+        }
+
+        authority_target = evidence_dir / "check-authority.json"
+        authority_data = _copy_bound_evidence(
+            orch.logs / expected_authority_name,
+            authority_target,
+            record=authority_record,
+            evidence_id="check_authority",
+        )
+        check_authority_evidence = {
+            **authority_data,
+            "evidence_file": str(authority_target.relative_to(work)),
+            "sha256": authority_record["sha256"],
+            "bytes": authority_record["bytes"],
+        }
+
+        verification = []
+        for index, check in enumerate(checks):
+            check_id = str(check.get("id", "check"))
+            record = check_records[index]
+            if (
+                not isinstance(record, dict)
+                or record.get("id") != check_id
+            ):
+                raise ValueError(
+                    "review_evidence_binding_invalid:check:" + check_id
+                )
+            filename = record.get("file")
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or not filename.startswith(run_id + "-")
+                or not filename.endswith(".json")
+            ):
+                raise ValueError(
+                    "review_evidence_binding_invalid:check:" + check_id
+                )
+            exported_name = filename[len(run_id) + 1:]
+            target = evidence_dir / exported_name
+            data = _copy_bound_evidence(
+                orch.logs / filename,
+                target,
+                record=record,
+                evidence_id="check:" + check_id,
+            )
+            verification.append({
+                "id": data.get("id"),
+                "exit_code": data.get("exit_code"),
+                "timed_out": data.get("timed_out"),
+                "stdout": data.get("stdout", "")[-2000:],
+                "stderr": data.get("stderr", "")[-2000:],
+                "evidence_file": str(target.relative_to(work)),
+                "sha256": record["sha256"],
+                "bytes": record["bytes"],
+            })
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "run_id", "snapshot_id", "verdict",
+                "findings", "uncertainty",
+            ],
+            "properties": {
+                "run_id": {"type": "string"},
+                "snapshot_id": {"type": "string"},
+                "verdict": {
+                    "type": "string",
+                    "enum": ["PASS", "NEEDS_FIX", "BLOCKED"],
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "severity", "path", "evidence", "impact",
+                        ],
+                        "properties": {
+                            "severity": {"type": "string"},
+                            "path": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "impact": {"type": "string"},
+                        },
+                    },
+                },
+                "uncertainty": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+        }
+        schema_path = export / "review_schema.json"
+        atomic_write_json(schema_path, schema, mode=0o600)
+
+        prompt = {
+            "role": "reviewer_only",
+            "run_id": run_id,
+            "snapshot_id": run["snapshot_id"],
+            "goal": payload.get("goal"),
+            "non_goals": payload.get("non_goals", []),
+            "review_decision": decision,
+            "files": sorted(manifest.get("files", {})),
+            "deleted_files": deleted_files,
+            "file_manifest": manifest.get("files", {}),
+            "support_files": support_files,
+            "checks": checks,
+            "verification_evidence": verification,
+            "scope_evidence": scope_evidence,
+            "check_authority_evidence": check_authority_evidence,
+            "instructions": [
+                "Read only the exported workspace.",
+                "Do not edit files or run project hooks.",
+                "Verifier checks already ran against the source workspace; "
+                "inspect supplied evidence and frozen support files.",
+                "Only rerun an approved check when necessary; never expand "
+                "beyond the exported workspace.",
+                "Report only concrete findings.",
+                "PASS only when the stated goal/checklist is met.",
+            ],
+        }
+        prompt_path = export / "review_prompt.json"
+        atomic_write_json(prompt_path, prompt, mode=0o600)
+        return {
+            "export": str(export),
+            "workspace": str(work),
+            "schema": str(schema_path),
+            "prompt": str(prompt_path),
+            "report": str(export / "review.json"),
+            "snapshot_id": run["snapshot_id"],
+        }
+    except Exception:
+        if export.exists() and export.is_dir() and not export.is_symlink():
+            shutil.rmtree(export)
+        raise
 
 
 def run_review(orch: Orchestrator, run_id: str, *, execute: bool=False) -> Dict[str, Any]:

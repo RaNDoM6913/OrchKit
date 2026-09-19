@@ -173,6 +173,33 @@ class PlanAdmissionTests(unittest.TestCase):
             self.orch.load_plan(path)
         self.assert_no_tasks()
 
+    def test_check_ids_are_filename_safe_and_unique(self):
+        unsafe = self.task("CHECK-ID-UNSAFE")
+        unsafe["checks"] = [{
+            "id": "lint/unit",
+            "argv": ["/usr/bin/true"],
+            "cwd": ".",
+        }]
+        path, _ = self.write_plan(
+            self.plan(tasks=[unsafe], revision="unsafe-check-id"),
+            name="unsafe-check-id.json",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_check_id"):
+            self.orch.load_plan(path)
+
+        duplicate = self.task("CHECK-ID-DUP")
+        duplicate["checks"] = [
+            {"id": "verify", "argv": ["/usr/bin/true"], "cwd": "."},
+            {"id": "verify", "argv": ["/usr/bin/true"], "cwd": "."},
+        ]
+        path, _ = self.write_plan(
+            self.plan(tasks=[duplicate], revision="duplicate-check-id"),
+            name="duplicate-check-id.json",
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate_check_id:verify"):
+            self.orch.load_plan(path)
+        self.assert_no_tasks()
+
     def test_goal_and_check_argv_are_bounded_at_admission(self):
         goal_task = self.task("GOAL-LARGE")
         goal_task["goal"] = "x" * (16 * 1024 + 1)

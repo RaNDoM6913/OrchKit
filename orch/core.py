@@ -15,7 +15,8 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import (atomic_write_json, ensure_private_dir,
-                     ensure_private_file, read_bounded_json_object)
+                     ensure_private_file, read_bounded_json_object,
+                     read_bounded_regular_file)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .review_policy import decide_review, normalize_review_policy
 
@@ -30,6 +31,7 @@ REVIEW_REPORT_MAX_BYTES = 256 * 1024
 REVIEW_REPORT_MAX_FINDINGS = 100
 REVIEW_REPORT_MAX_UNCERTAINTY = 100
 CAPABILITY_MAX_BYTES = 4096
+VERIFICATION_EVIDENCE_MAX_BYTES = 1024 * 1024
 PLAN_MAX_BYTES = 1024 * 1024
 PLAN_MAX_TASKS = 512
 PLAN_MAX_ALLOWED_PATHS = 512
@@ -447,6 +449,7 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         "id", "argv", "cwd", "timeout_sec",
         "authority_paths", "authority_absent_paths",
     }
+    seen_check_ids = set()
     for check in checks:
         if not isinstance(check, dict):
             raise ValueError("invalid_check")
@@ -455,6 +458,11 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
             raise ValueError("unknown_check_field:" + extra[0])
         check_id = check.get("id", "unnamed")
         _bounded_text(check_id, "invalid_check_id", max_bytes=128)
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", check_id) is None:
+            raise ValueError("invalid_check_id")
+        if check_id in seen_check_ids:
+            raise ValueError("duplicate_check_id:" + check_id)
+        seen_check_ids.add(check_id)
         argv = check.get("argv")
         if (
             not isinstance(argv, list)
@@ -1897,10 +1905,62 @@ class Orchestrator:
                       "stdout": (exc.stdout or "")[-8000:] if isinstance(exc.stdout, str) else "",
                       "stderr": (exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "",
                       "timed_out": True}
-        log_path = self.logs / f"{run_id}-{str(check.get('id','check')).replace('/','_')}.json"
-        log_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        log_path = self.logs / (
+            f"{run_id}-{str(check.get('id','check')).replace('/','_')}.json"
+        )
+        atomic_write_json(log_path, result, mode=0o600)
         result["log_path"] = str(log_path)
         return result
+
+    def _verification_evidence_manifest(
+        self,
+        run_id: str,
+        checks: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        def record(path: Path, *, error_id: str) -> Dict[str, Any]:
+            try:
+                raw, meta = read_bounded_regular_file(
+                    path,
+                    max_bytes=VERIFICATION_EVIDENCE_MAX_BYTES,
+                    unsafe_error="verification_evidence_unsafe",
+                    too_large_error="verification_evidence_too_large",
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "verification_evidence_missing:" + error_id
+                ) from exc
+            except ValueError as exc:
+                raise ValueError(
+                    f"{str(exc)}:{error_id}"
+                ) from exc
+            return {
+                "file": path.name,
+                "sha256": sha256_bytes(raw),
+                "bytes": meta["bytes"],
+            }
+
+        scope = record(
+            self.logs / f"{run_id}-scope.json",
+            error_id="scope",
+        )
+        authority = record(
+            self.logs / f"{run_id}-check-authority.json",
+            error_id="check_authority",
+        )
+        check_items: List[Dict[str, Any]] = []
+        for check in checks:
+            check_id = str(check.get("id", "check"))
+            safe_id = check_id.replace("/", "_")
+            item = record(
+                self.logs / f"{run_id}-{safe_id}.json",
+                error_id="check:" + check_id,
+            )
+            check_items.append({"id": check_id, **item})
+        return {
+            "scope": scope,
+            "check_authority": authority,
+            "checks": check_items,
+        }
 
     def verify(self, run_id: str) -> Dict[str, Any]:
         with self.connect() as conn:
@@ -1913,7 +1973,7 @@ class Orchestrator:
         workspace = Path(payload["workspace"]).resolve()
         scope_evidence = self._workspace_scope_evidence(payload, receipt["changed_paths"])
         scope_log = self.logs / f"{run_id}-scope.json"
-        scope_log.write_text(json.dumps(scope_evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_json(scope_log, scope_evidence, mode=0o600)
         scope_evidence["log_path"] = str(scope_log)
         if scope_evidence["status"] == "BLOCKED":
             if scope_evidence["outside_allowlist"]:
@@ -1940,10 +2000,7 @@ class Orchestrator:
             workspace, payload.get("checks", [])
         )
         authority_log = self.logs / f"{run_id}-check-authority.json"
-        authority_log.write_text(
-            json.dumps(authority_evidence, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(authority_log, authority_evidence, mode=0o600)
         authority_evidence["log_path"] = str(authority_log)
         if authority_evidence["status"] == "BLOCKED":
             scope_evidence["check_authority"] = authority_evidence
@@ -1965,8 +2022,39 @@ class Orchestrator:
             if reason.startswith(safety_prefixes):
                 return self._block_verification(run_id, reason, evidence=scope_evidence)
             raise
-        checks = [self._run_check(workspace, run_id, item) for item in payload.get("checks", [])]
-        passed = all(item["exit_code"] == 0 and not item["timed_out"] for item in checks)
+        checks = [
+            self._run_check(workspace, run_id, item)
+            for item in payload.get("checks", [])
+        ]
+        post_authority = self._check_authority_evidence(
+            workspace, payload.get("checks", [])
+        )
+        if post_authority["status"] == "BLOCKED":
+            scope_evidence["check_authority_after_checks"] = post_authority
+            return self._block_verification(
+                run_id,
+                "check_mutated_authority:"
+                + str(post_authority["reason"]),
+                evidence=scope_evidence,
+            )
+        try:
+            self._assert_manifest_current(payload, manifest)
+            manifest["verification_evidence"] = (
+                self._verification_evidence_manifest(run_id, checks)
+            )
+        except ValueError as exc:
+            return self._block_verification(
+                run_id,
+                str(exc),
+                evidence=scope_evidence,
+            )
+        snapshot_id = "sha256:" + sha256_bytes(
+            canonical_json(manifest).encode("utf-8")
+        )
+        passed = all(
+            item["exit_code"] == 0 and not item["timed_out"]
+            for item in checks
+        )
         now = utc_now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")

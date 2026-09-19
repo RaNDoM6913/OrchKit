@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from orch.core import Orchestrator
+from orch.core import Orchestrator, canonical_json
 from orch.codex_review import prepare_review
 
 
@@ -947,6 +947,112 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(prompt['verification_evidence'][0]['exit_code'],0)
         self.assertEqual(prompt['scope_evidence']['status'],'NON_GIT_UNAVAILABLE')
         self.assertEqual(prompt['scope_evidence']['evidence_file'],'verification_evidence/scope.json')
+        self.assertEqual(
+            prompt['check_authority_evidence']['status'], 'PASS'
+        )
+        self.assertEqual(
+            prompt['check_authority_evidence']['evidence_file'],
+            'verification_evidence/check-authority.json',
+        )
+        with self.orch.connect() as conn:
+            snap = conn.execute(
+                'SELECT manifest_json FROM snapshots WHERE snapshot_id=?',
+                (verified['snapshot_id'],),
+            ).fetchone()
+        manifest = json.loads(snap['manifest_json'])
+        self.assertIn('verification_evidence', manifest)
+        self.assertEqual(
+            verified['snapshot_id'],
+            'sha256:' + hashlib.sha256(
+                canonical_json(manifest).encode('utf-8')
+            ).hexdigest(),
+        )
+
+    def test_review_export_rejects_workspace_drift_after_verify(self):
+        self.load([self.task('T1', review=True)], revision='review-drift')
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        (self.ws / 'T1.json').write_text(
+            '{"value":999}\n', encoding='utf-8'
+        )
+        with self.assertRaisesRegex(
+            ValueError, 'snapshot_stale:T1.json'
+        ):
+            prepare_review(self.orch, claim['run_id'])
+
+    def test_review_export_rejects_support_drift_after_verify(self):
+        checks_dir = self.ws / 'checks'
+        checks_dir.mkdir()
+        check_file = checks_dir / 'check.py'
+        check_file.write_text(
+            "print('support-ok')\n", encoding='utf-8'
+        )
+        check = {
+            'id': 'support-drift',
+            'argv': [sys.executable, 'checks/check.py'],
+            'cwd': '.',
+            'timeout_sec': 5,
+        }
+        self.load(
+            [self.task('T1', checks=[check], review=True)],
+            revision='review-support-drift',
+        )
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        check_file.write_text(
+            "print('mutated-after-verify')\n", encoding='utf-8'
+        )
+        with self.assertRaisesRegex(
+            ValueError, 'review_support_stale:checks/check.py'
+        ):
+            prepare_review(self.orch, claim['run_id'])
+
+    def test_review_export_rejects_tampered_verifier_evidence(self):
+        self.load(
+            [self.task('T1', review=True)],
+            revision='review-evidence-drift',
+        )
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'T1')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        scope_log = (
+            self.orch.logs / f"{claim['run_id']}-scope.json"
+        )
+        scope_log.write_text(
+            '{"status":"tampered"}\n', encoding='utf-8'
+        )
+        with self.assertRaisesRegex(
+            ValueError, 'review_evidence_stale:scope'
+        ):
+            prepare_review(self.orch, claim['run_id'])
+        self.assertFalse(
+            (self.orch.runtime / 'review_exports' / claim['run_id']).exists()
+        )
+
+    def test_verifier_blocks_check_mutation_of_snapshotted_file(self):
+        mutator = self.ws / 'mutate.py'
+        mutator.write_text(
+            "from pathlib import Path\n"
+            "Path('T1.json').write_text("
+            "'{\\\"value\\\":999}\\n', encoding='utf-8')\n",
+            encoding='utf-8',
+        )
+        check = {
+            'id': 'mutates-output',
+            'argv': [sys.executable, 'mutate.py'],
+            'cwd': '.',
+            'timeout_sec': 5,
+        }
+        self.load(
+            [self.task('T1', checks=[check], review=True)],
+            revision='review-check-mutation',
+        )
+        claim = self.orch.claim('w')
+        result = self.write_result(claim, 'T1')
+        self.assertEqual(result['status'], 'BLOCKED')
+        self.assertEqual(result['reason'], 'snapshot_stale:T1.json')
 
     def test_dependency_cycle_is_rejected_at_plan_load(self):
         one=self.task('T1',deps=['T2']); two=self.task('T2',deps=['T1'])
