@@ -284,6 +284,27 @@ class StateMaintenanceTests(unittest.TestCase):
             verify_backup_archive(output)["status"], "VERIFIED"
         )
 
+    def test_backup_digest_refuses_post_publish_symlink_swap(self):
+        output = Path(self.tmp.name) / "swapped-backup.zip"
+        victim = Path(self.tmp.name) / "backup-swap-victim.bin"
+        victim.write_bytes(b"owner preserve")
+        before = victim.read_bytes()
+        real_replace = os.replace
+
+        def replace_then_swap(source, destination):
+            real_replace(source, destination)
+            if Path(destination) == output:
+                output.unlink()
+                output.symlink_to(victim)
+
+        with mock.patch(
+            "orch.state.os.replace", side_effect=replace_then_swap
+        ):
+            with self.assertRaisesRegex(ValueError, "hash_file_unsafe"):
+                backup_state(self.orch, output)
+        self.assertEqual(victim.read_bytes(), before)
+        self.assertTrue(output.is_symlink())
+
     def test_backup_verifier_accepts_current_secret_free_backup(self):
         result = backup_state(self.orch)
         verified = verify_backup_archive(Path(result["path"]))

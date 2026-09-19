@@ -15,19 +15,10 @@ import zipfile
 from .config import (atomic_write_json, ensure_private_dir,
                      read_bounded_json_object)
 from .core import (ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
-                   Orchestrator, utc_now)
+                   Orchestrator, sha256_file, utc_now)
 
 REPLACEMENT_JOURNAL_MAX_BYTES = 64 * 1024
 RESTORE_RECEIPT_MAX_BYTES = 64 * 1024
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
 
 
 
@@ -2198,7 +2189,7 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
             "schema_version": STATE_SCHEMA_VERSION,
             "created_at": utc_now(),
             "source_root": str(orch.root),
-            "database_sha256": _sha256(db_copy),
+            "database_sha256": sha256_file(db_copy),
             "excluded_secret_classes": [
                 "claims", "capability_files", "provider_credentials",
             ],
@@ -2252,7 +2243,7 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
     return {
         "status": "BACKED_UP",
         "path": str(target),
-        "sha256": _sha256(target),
+        "sha256": sha256_file(target),
         "bytes": target.stat().st_size,
         "manifest": manifest,
     }
