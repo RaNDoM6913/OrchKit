@@ -1,213 +1,140 @@
-# Agent Workflow Orchestrator — v0.11 authority I/O hardening
+# OrchKit
 
-A local, subscription-only coordinator for development performed by real ChatGPT conversations through Remote Desktop Commander (RDC). Each task or repair attempt intentionally uses a **new ChatGPT conversation**. The next conversation receives bounded durable state from SQLite instead of relying on previous chat context.
+Durable local orchestration for development work across fresh ChatGPT conversations.
 
-## Current state
+OrchKit is a local control plane for scope-bounded, verifiable development workflows. Each task or repair attempt runs in a new ChatGPT conversation, while durable workflow state lives locally instead of depending on previous chat history.
 
-Implemented and locally verified through 2026-09-19:
+## Why OrchKit?
 
-- SQLite durable plan/task/run/event ledger with immutable plan-revision digests.
-- DAG dependency checks, cycle rejection, task-id conflict detection, durable cross-plan FIFO ordering, and atomic project/workspace writer isolation. Direct load-plan ingestion is no-follow/regular-file checked, capped at 1 MiB/512 tasks, hashes the exact parsed bytes, and enforces bounded known task/check/review/publication metadata before ledger admission. Writer identity is independently derived from the resolved workspace/Git common directory, so plans cannot spoof isolation; VERIFIED snapshots retain that writer reservation until completion/publication. Git runs also persist the exact claim-time HEAD, so a foreign commit after capability issuance blocks verification instead of silently becoming the task base.
-- Authority I/O is fail-closed across generated/direct plans, batch manifests, home/project config, RDC markers, dispatcher artifacts, capability files, replacement journals and backup paths. Inputs use bounded no-follow regular-file reads; atomic authority writes use exclusive random temp files; CLI paths preserve leaf symlinks for the callee to reject instead of resolving them early. Backup verification records the frozen archive SHA-256, and restore re-freezes the source and requires the same digest before extraction.
-- Capability-file based run authority (`0600`) so lease secrets are not put in command arguments; capability reads are exact-path, no-follow, bounded and mode-bound, and capabilities are revoked at quiesce/abort.
-- Bounded context packs (32 KiB) with verifier/Codex feedback carried into a new attempt/chat. Claim preflights the exact context before persisting writer authority, and capability-write failures abort/cleanly block instead of stranding RUNNING state.
-- Claim-bound worker receipt ingestion: every run receives an exact private receipt_file; submit rejects alternate paths/symlinks, bounds raw JSON to 64 KiB, normalizes v1 changed paths, caps path count/summary size, and records raw receipt SHA-256/bytes before durable state transition. Claim also fails closed before capability issuance when new non-protected workspace bytes, protected-baseline drift, or bound verifier-authority drift are already present.
-- Verifier checks use admission-bound execution authority: argv[0] is resolved and hashed once, relevant support/config files are hash/presence-bound, and verification refuses drift before executing a check.
-- Cooperative quiescence marker with the direct-RDC residual risk explicitly recorded.
-- Independent Git scope census, registered checks, protected-file hashes, content snapshots and stale-snapshot detection. The verifier blocks unreported/out-of-allowlist repository changes, and Git publication repeats the scope census before side effects and before the compare-and-swap ref update so foreign post-verification worktree changes fail closed.
-- Snapshot-bound review handoff and import: verification binds exact scope/check-authority/check evidence into the snapshot, review export refuses workspace/support/evidence drift and copies only bound bytes, report import uses the exact frozen path, and failed verification/review becomes `NEEDS_FIX` for a **new** ChatGPT run.
-- Codex subscription preflight via the official app-server (`account/read`, `account/rateLimits/read`), hooks disabled, purchased-credit fallback blocked.
-- Frozen read-only Codex review export and output schema; model review is only launched by explicit `codex-review --execute` after preflight PASS.
-- Exact Git publication: verified bytes/deletions → exact stage → snapshot-bound detached commit → compare-and-swap branch update → sandboxed bound-URL push → sandboxed remote verification. Transport runs from a short-lived ORCH-owned bare repository instead of project Git config, disables global/system config, interactive credential helpers and unsafe protocol fallback, and permits only local file, HTTPS-without-embedded-password, or hardened SSH transports. The durable publication journal records INTENT/STAGED/PREPARED/COMMITTED/PUSHED/REMOTE_VERIFIED so concurrent HEAD changes and uncertain outcomes are reconciled before retry.
-- Recovery/status commands do not auto-expire active writers; `recovery inspect` gives secret-free state-specific restart guidance for both durable runs/publications and external home-replacement journals, including byte-accounted unmanaged sibling artifacts without automatic deletion. Explicit global `pause`/`resume`, project-level queue pause/resume, and `abort --retry` remain operator actions. Transactional schema upgrades/history, backup verification/fresh restore/crash-safe replacement+rollback, `state check`, stale-capability pruning, evidence retention controls, and publication reconciliation are implemented. Archive/replacement/replacement-only recovery CLI commands lazily avoid initializing an unrelated command root. Local ORCH authority is private-by-construction: runtime/state directories are `0700`, SQLite/WAL/SHM and durable authority artifacts are `0600`, and symlinked authority paths fail closed. Git inventory/verifier subprocesses neutralize configured clean/process filters, and publication disables repository hooks; changed filtered paths fail closed before staging.
-- Owner acceptance is stored separately and bound to the exact `run_id + snapshot_id`.
-- Packaged Scheduled ChatGPT dispatcher template at `orch/templates/dispatcher_prompt.txt`; `orch dispatcher render` creates the user-specific prompt. `dispatcher_prompt.txt` is the repo-local development render.
+Long-running development work becomes fragile when correctness depends on one conversation remembering everything that happened before.
 
-Local deterministic E2E evidence: two dependent fixture tasks completed as two independent runs; both checks passed, two commits were pushed to a local bare remote, local/remote HEAD matched, protected sentinel stayed unchanged, and the queue ended at `NO_WORK`/`CLEAN`.
+OrchKit separates durable workflow state from the chat itself. It keeps task state, retry context, verification evidence, review state, approvals, and publication state in a local control plane so a fresh ChatGPT conversation can continue from bounded, explicit context.
 
-**Real Scheduled ChatGPT E2E also passed:** the reusable standalone dispatcher ran two separate Scheduled ChatGPT workers (`scheduled-variant-b`) through RDC. `LIVE-1` and dependent `LIVE-2` each produced their own run/snapshot, passed independent checks, and were published as commits `f92c918...` and `5830e6b...` to a local bare remote. Final local/remote HEAD matched, the protected sentinel was unchanged, `orch next` returned `NO_WORK`, `orch reconcile` returned `CLEAN`, and the dispatcher was disabled.
+## How it works
 
-**Autonomous chaining also passed:** in `variant-b-autochain-v1`, `CHAIN-1` completed and re-armed the same native task from inside its Scheduled ChatGPT run. A later fresh Scheduled ChatGPT run automatically claimed dependent `CHAIN-2` with no manual dispatch between them. Both published successfully; final local/remote HEAD matched at `4e571b8...`, the sentinel remained unchanged, the queue ended `NO_WORK`/`CLEAN`, and the native task ended disabled.
+1. A Git project is registered with OrchKit.
+2. A bounded task is added with allowed paths, checks, review policy, and publication policy.
+3. A fresh ChatGPT conversation claims one task attempt.
+4. OrchKit returns the task's bounded durable context.
+5. ChatGPT performs the substantive development work.
+6. The worker submits its result and relinquishes its write capability.
+7. OrchKit independently verifies the actual workspace and registered checks.
+8. Optional Codex review can run against verified frozen input when policy requires it.
+9. Required owner approval is bound to the verified snapshot.
+10. Verified work can be completed or published through guarded Git steps.
+11. If more work is ready, the next attempt starts in another fresh ChatGPT conversation.
 
-## Why Variant B
+## Core properties
 
-ORCH-001 proved standalone Scheduled ChatGPT → RDC → Mac, but the available automation surface did not prove an observable chat ID or same-chat context continuation. The owner explicitly approved Variant B: a new real ChatGPT conversation per task/repair, with durable handoff through this coordinator.
+- Fresh ChatGPT conversation for every task or repair attempt.
+- Durable local SQLite ledger for workflow state.
+- Bounded context instead of dependency on prior chat history.
+- Scope-bounded writes through explicit allowed paths.
+- Protected-baseline checks for pre-existing user work.
+- Independent local verification before completion or publication.
+- Snapshot-bound review and owner approval.
+- Optional Codex review; ChatGPT remains the primary worker.
+- Guarded Git publication without force-push, reset, clean, or stash.
+- Durable reconciliation for uncertain publication outcomes.
+- Explicit blocked and paused states instead of treating uncertainty as success.
 
-This removes same-chat continuation from the acceptance contract while preserving the important requirements: ChatGPT remains the substantive worker, RDC remains the Mac bridge, Codex is an optional review-only adapter, and no paid API/external-AI fallback is allowed.
+## Requirements
 
-## Installable CLI and multi-project setup
+The current implementation is validated primarily in a macOS-oriented environment.
 
-Version 0.11 keeps the v0.10 bounded handoff guarantees and hardens the remaining local authority I/O surfaces: generated task admission, batch manifests, plan artifacts, capability reads, config/registry/RDC/dispatcher state, replacement journals, backup publication, and verify→restore source binding. The installed `orch` command uses `$ORCH_HOME` or `~/.orch` by default; the repository `bin/orch` wrapper keeps the historical repo-local runtime for development/evidence.
+- Python 3.9 or newer
+- Git
+- A connected ChatGPT-to-computer bridge for the automated worker workflow
 
-Build a shareable wheel without network access on the proven macOS/Python 3.9 environment:
+Codex is optional and is only used when review policy enables it.
 
-```sh
-python3 -m pip wheel . --no-deps --no-build-isolation -w dist
+Broader operating-system support has not yet been established.
+
+## CLI
+
+The command-line entry point is:
+
+```text
+orch
 ```
 
-The current agent_workflow_orchestrator-0.11.0-py3-none-any.whl is built offline and validated from a clean disposable installation. Installed acceptance covers the v0.11 authority boundaries without invoking a model reviewer. Exact wheel size, SHA-256 and evidence are recorded in docs/61_V011_AUTHORITY_IO_HARDENING.md.
-
-First-run flow for another user:
+The verified setup flow begins with:
 
 ```sh
 orch setup --profile safe
 orch doctor
 orch rdc bootstrap-prompt
-# run the returned bootstrap once in the user's own ChatGPT with RDC
 orch rdc show
-orch project add /absolute/path/to/repo --profile standard --review-mode risk_based
+```
+
+A project can then be registered and audited:
+
+```sh
+orch project add /path/to/repository --profile safe
 orch project list
 orch project audit PROJECT_ID
-orch git policy PROJECT_ID
-orch dispatcher render
+orch dispatcher render --project PROJECT_ID
 ```
 
-`project add` is read-only toward the target repository. It inventories root/branch/HEAD/upstream/origin/status/hooks/AGENTS/package scripts, records existing dirty/staged/untracked regular-file bytes as protected baselines, and stores policy in the user's ORCH home rather than editing the project. `safe`, `standard`, and `autonomous` profiles are available; `safe` denies commit/push by default. Force push/reset/clean/stash remain denied.
-
-Create a bounded one-task plan from the registered project instead of hand-writing ORCH internals:
-
-```sh
-orch project make-plan PROJECT_ID \
-  --task-id TASK-001 \
-  --goal "Implement the approved bounded change" \
-  --allowed-path src/example.py \
-  --risk-tag architecture \
-  --owner-approval \
-  --output ~/task-001.json
-orch load-plan ~/task-001.json
-```
-
-For routine durable work, enqueue directly from the registered project without hand-writing a plan:
-
-```sh
-orch queue enqueue PROJECT_ID \
-  --task-id TASK-002 \
-  --goal "Implement the next bounded change" \
-  --allowed-path src/next.py \
-  --depends TASK-001
-```
-
-For a bounded multi-task DAG, use: orch queue enqueue-batch PROJECT_ID /absolute/path/to/tasks.json. The source manifest is read-only, size-bounded, SHA-256 provenance is retained, and the whole DAG is admitted transactionally.
-
-The compiled plan is retained under the ORCH home with mode `0600`. Dependencies may refer to tasks loaded by earlier plan revisions. Git publication bases are admission-bound only when safe: tasks queued behind unresolved work, explicit dependencies, and later tasks in a batch bind their exact Git HEAD during verification so prior ORCH publications do not create false stale-base failures.
-
-Pause only one project queue without blocking independent projects:
-
-```sh
-orch queue pause-project PROJECT_ID --reason "maintenance"
-orch queue resume-project PROJECT_ID
-```
-
-A project pause affects only new dispatch. Existing active runs keep their explicit recovery semantics, and resumed tasks keep their original durable FIFO position.
-
-`orch project remove PROJECT_ID` is fail-closed while that project has unresolved durable work or writer/publication reservations. CLI registration creates the authoritative SQLite ledger up front; deregistration refuses to manufacture an empty ledger if that state file is missing or unsafe. Cancel or complete unresolved tasks first; successful deregistration clears project pause state but preserves historical ledger evidence.
-
-The registry also enforces one project identity per exact resolved workspace root: the same root cannot be registered again under a different name. Distinct linked Git worktrees remain separate project roots but share the same Git writer isolation.
-
-The project audit command performs a read-only readiness/security census before new work is entrusted to a registered project. It validates registry/root/writer identity, durable ledger integrity, queue/recovery reservations, protected and newly foreign workspace bytes, Git/publication transport policy, bound verifier executable/support-file authority for nonterminal tasks, RDC binding, and optional project-scoped dispatcher state. Use --require-dispatcher when autonomous Scheduled ChatGPT dispatch is part of the readiness contract. The audit never creates a missing ledger or edits the target repository.
-
-Operational commands never bootstrap missing durable state. Only explicit `init` or first project registration may create a ledger, and only in a genuinely fresh home with no prior registry/runtime authority. If an established home loses its ledger, claim/next/queue/state operations fail closed until recovery. Queue enqueue and CLI make-plan also enforce the read-only readiness audit before writing a plan; BLOCKED readiness stops task admission while ATTENTION remains queueable.
-
-Publication is derived from project policy: no publication for Safe, `git_local` when local commits are allowed but no usable remote exists, and exact commit + ordinary push + remote-ref verification when both commit and push are allowed.
-
-## Optional Review Policy Engine
-
-Codex is **not** a mandatory ORCH component. Task/project policy supports:
-
-- `off`: verifier → approval/publication with no model reviewer.
-- `risk_based`: review only when configured signals fire (risk tags, sensitive paths, large diffs, retry attempts).
-- `required`: every successful verification goes through the selected reviewer.
-
-The current packaged reviewer adapter is `codex`; core review decisions are independent from the Codex implementation so additional adapters can be added later. Legacy `required_review=true` plans remain compatible and normalize to `mode=required, reviewer=codex`. A task that does not require review never runs Codex preflight or consumes Codex usage.
-
-## Run locally
-
-```sh
-cd <orchkit-root>
-./bin/orch init
-./bin/orch load-plan /absolute/path/to/approved-plan.json
-./bin/orch next
-./bin/orch status
-./bin/orch reconcile
-./bin/orch recovery inspect
-./bin/orch recovery inspect --replacement-home /absolute/path/to/orch-home
-./bin/orch state check
-./bin/orch state migrations
-./bin/orch state retention
-./bin/orch state backup
-./bin/orch state verify-backup /absolute/path/to/orch-state-....zip
-./bin/orch state restore-backup /absolute/path/to/orch-state-....zip \
-  --destination /absolute/path/to/new-orch-home
-./bin/orch state replace-backup /absolute/path/to/orch-state-....zip \
-  --destination /absolute/path/to/existing-standalone-orch-home
-./bin/orch state replace-reconcile \
-  --destination /absolute/path/to/existing-standalone-orch-home
-# while rollback is retained:
-./bin/orch state replace-reconcile \
-  --destination /absolute/path/to/existing-standalone-orch-home --rollback
-# discard retained rollback/forward-copy only after explicit decision:
-./bin/orch state replace-reconcile \
-  --destination /absolute/path/to/existing-standalone-orch-home --finalize
-```
-
-A scheduled ChatGPT worker claims exactly one attempt:
-
-```sh
-./bin/orch claim --worker scheduled-variant-b
-```
-
-The claim response contains `run_id`, `capability_file`, and the bounded task context. The worker edits only `allowed_paths`, writes a receipt, then:
-
-```sh
-./bin/orch submit --run-id RUN --cap CAP_FILE --receipt RECEIPT.json
-./bin/orch quiesce --run-id RUN --cap CAP_FILE
-./bin/orch verify --run-id RUN
-```
-
-For a normal verified task use `publish` when publication kind is `git`, otherwise `complete`. When review is required:
-
-```sh
-./bin/orch codex-preflight
-./bin/orch codex-review --run-id RUN          # prepare/dry-run only
-./bin/orch codex-review --run-id RUN --execute
-```
-
-`codex-review --execute` refuses to run when the official account preflight is not a ChatGPT-authenticated, non-exhausted subscription path or purchased-credit availability is detected.
-
-### Publication crash recovery
-
-`publish` writes a durable publication intent before the first Git side effect. If a commit/push result becomes uncertain, do not blindly repeat it:
-
-```sh
-orch publish-reconcile --run-id RUN
-# only when the observed state reports resume_available=true:
-orch publish-reconcile --run-id RUN --resume
-```
-
-Reconciliation can prove a staged snapshot, adopt a commit that happened before the journal update, verify an already-pushed remote commit, or return `SAFE_TO_RETRY` only when no Git side effect is observed. Unexpected staging or remote advancement blocks automatic continuation.
-
-## Scheduled dispatcher
-
-The dispatcher template packaged with ORCH is the durable bootstrap. The default dispatcher render command substitutes the user's ORCH home and executable into a reusable standalone Scheduled Task prompt. One task claims one queued attempt, works through RDC, verifies/reviews/publishes it, calls next, and only when READY re-arms itself for one later fresh ChatGPT conversation. When the queue reaches NO_WORK, the task is left disabled.
-
-For multi-project operation, dispatcher render --project PROJECT_ID creates a private prompt permanently scoped to that registered project. Separate native Scheduled ChatGPT tasks can use separate scoped prompts so independent repositories can be worked concurrently; ORCH writer keys still serialize linked worktrees or any projects sharing one Git authority. The original unscoped/global renderer remains the default.
-
-The launcher is intentionally platform-native. The local Python program does not hold or repurpose OpenAI OAuth tokens and does not call a model API.
-
-## Real Codex review evidence
-
-The subscription reviewer path is not only mocked. With account preflight showing ChatGPT auth, purchased credits disabled/balance 0 and the included limit available, a real Codex review was executed against a frozen disposable fixture. The first review correctly blocked because the export omitted its approved check support. ChatGPT repaired `orch/codex_review.py`; a fresh second snapshot received a real Codex `PASS` with exit code 0. The final adapter also places verifier evidence inside the exported workspace and has deterministic test coverage. No external AI or paid API fallback was used.
+Installation instructions will be added when the public distribution method is finalized.
 
 ## Security boundary
 
-The current RDC configuration has broad terminal access. Therefore helper leases and allowlists are a cooperative control, not an OS sandbox against a malicious worker. The MVP is suitable for the disposable fixtures proven here. Connecting `<protected-project>` for writes is **not enabled** and remains <separately-authorized-integration> with a separate approval and stronger repository-specific contract.
+OrchKit is a cooperative local control plane, not an operating-system sandbox.
 
-## Tests
+It verifies workflow state, scope, capabilities, snapshots, checks, approvals, and publication policy. However, a process with broad terminal access under the same operating-system user may still be able to bypass helper-level restrictions.
 
-```sh
-cd <orchkit-root>
-PYTHONPATH=. python3 -m unittest discover -s tests -v
-python3 -m py_compile orch/*.py
-```
+Strong adversarial isolation would require an additional OS or identity boundary that OrchKit does not currently provide.
 
-The current **246-test** deterministic suite covers orchestration/recovery/review, durable cross-plan FIFO ordering, project/workspace writer isolation and lifecycle controls, plan graph validation, capability revocation, protected-file safety blocking, verified deletions, setup profiles, optional review policy, project registration/ledger authority, dirty-byte protection, Git policy, sandboxed/bound Git transport, publication crash reconciliation, transactional schema migration, identity/hash-bound retention pruning under concurrent filesystem drift, backup verification/fresh restore, crash-safe state-home replacement/rollback, replacement-aware recovery/artifact census, dispatcher retry guards, dotfile/path-scope safety, and doctor behavior.
+## Verification and review
+
+Worker self-report is not treated as independent verification.
+
+OrchKit checks the actual workspace, declared scope, protected content, registered verification authority, and configured checks before a result can advance.
+
+Review policy supports three modes:
+
+- `off`
+- `risk_based`
+- `required`
+
+The packaged reviewer is Codex, but Codex is not required for OrchKit's core workflow.
+
+## Git publication
+
+When Git publication is enabled, OrchKit is designed to publish only verified snapshot content through guarded steps.
+
+The current implementation includes checks for:
+
+- expected branch and base
+- clean pre-existing staging
+- exact changed-path staging
+- snapshot consistency
+- ordinary non-force publication
+- remote-ref verification
+- reconciliation after uncertain commit or push outcomes
+
+## Documentation
+
+Start with the public documentation index:
+
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Security model](docs/security-model.md)
+- [Public roadmap](ROADMAP.md)
+
+Additional guides for task lifecycle, project setup, verification, Git publication, recovery, and state/backups are being added in staged documentation slices.
+
+## Project status
+
+OrchKit is under active development.
+
+The current implementation has been developed and validated primarily on macOS with Python 3.9+. Public release artifacts, broader platform validation, and additional compatibility claims will be documented only after they are verified.
+
+## Contributing
+
+A public contribution workflow will be documented before the first contributor-focused release.
+
+## License
+
+Apache License 2.0.
