@@ -116,16 +116,14 @@ The current implementation includes checks for:
 
 ## Documentation
 
-Public documentation is being organized around:
+Start with the public documentation index:
 
-- Architecture
-- Task lifecycle
-- Project setup
-- Verification and review
-- Git publication
-- Security model
-- Recovery
-- State and backups
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Security model](docs/security-model.md)
+- [Public roadmap](ROADMAP.md)
+
+Additional guides for task lifecycle, project setup, verification, Git publication, recovery, and state/backups are being added in staged documentation slices.
 
 ## Project status
 
