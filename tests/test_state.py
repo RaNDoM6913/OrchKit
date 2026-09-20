@@ -1141,6 +1141,48 @@ class StateMaintenanceTests(unittest.TestCase):
         finally:
             db.close()
 
+    def _terminal_retention_fixture(self, task_id="RETENTION-RACE"):
+        workspace = Path(self.tmp.name) / (task_id.lower() + "-ws")
+        workspace.mkdir()
+        plan = {
+            "schema_version": 1,
+            "plan_revision": task_id.lower() + "-plan",
+            "tasks": [{
+                "id": task_id,
+                "goal": "retention race fixture",
+                "workspace": str(workspace),
+                "dependencies": [],
+                "allowed_paths": ["out.json"],
+                "protected_paths": {},
+                "checks": [],
+                "publication": {"kind": "none"},
+                "max_attempts": 2,
+            }],
+        }
+        path = self.root / (task_id.lower() + "-plan.json")
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        self.orch.load_plan(path)
+        claim = self.orch.claim("retention-worker")
+        self.orch.abort(claim["run_id"], "terminal fixture", retry=False)
+        logs = self.orch.runtime / "logs"
+        receipts = self.orch.runtime / "worker_receipts"
+        exports = self.orch.runtime / "review_exports"
+        log = logs / f"{claim['run_id']}-scope.json"
+        receipt = receipts / f"{claim['run_id']}.json"
+        export = exports / claim["run_id"]
+        log.write_text('{"old":true}\n', encoding="utf-8")
+        receipt.write_text('{"old":true}\n', encoding="utf-8")
+        export.mkdir(parents=True)
+        (export / "review.json").write_text(
+            '{"old":true}\n', encoding="utf-8"
+        )
+        return {
+            "claim": claim,
+            "log": log,
+            "receipt": receipt,
+            "export": export,
+        }
+
     def test_retention_prunes_terminal_evidence_but_preserves_active_run(self):
         ws1 = Path(self.tmp.name) / "retention-ws1"
         ws2 = Path(self.tmp.name) / "retention-ws2"
@@ -1226,6 +1268,667 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertTrue(owner.exists())
         self.assertEqual(result["pruned"]["backup_count"], 1)
         self.assertEqual(Path(result["backups"]["unmanaged"][0]["path"]).resolve(), owner.resolve())
+
+    def test_retention_preserves_replaced_run_artifact_after_inventory(self):
+        fixture = self._terminal_retention_fixture("RETENTION-REPLACED")
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_replace(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                replacement = fixture["log"].with_name("owner-replacement.tmp")
+                replacement.write_text(
+                    '{"owner":"preserve"}\n', encoding="utf-8"
+                )
+                os.replace(replacement, fixture["log"])
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_replace,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=0,
+                max_evidence_bytes=1024 * 1024,
+                keep_recent_runs=20,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["run_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 1)
+        self.assertEqual(
+            fixture["log"].read_text(encoding="utf-8"),
+            '{"owner":"preserve"}\n',
+        )
+        self.assertTrue(fixture["receipt"].exists())
+        self.assertTrue(fixture["export"].exists())
+
+    def test_retention_preserves_review_tree_mutated_after_inventory(self):
+        fixture = self._terminal_retention_fixture("RETENTION-TREE-RACE")
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_mutate_tree(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                (fixture["export"] / "owner-note.txt").write_text(
+                    "owner preserve\n", encoding="utf-8"
+                )
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_mutate_tree,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=0,
+                max_evidence_bytes=1024 * 1024,
+                keep_recent_runs=20,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["pruned"]["run_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 1)
+        self.assertEqual(
+            (fixture["export"] / "owner-note.txt").read_text(
+                encoding="utf-8"
+            ),
+            "owner preserve\n",
+        )
+        self.assertTrue(fixture["log"].exists())
+        self.assertTrue(fixture["receipt"].exists())
+
+    def test_retention_rejects_symlinked_managed_anchor_after_inventory(self):
+        fixture = self._terminal_retention_fixture("RETENTION-ANCHOR-RACE")
+        original_inventory = state_module._retention_inventory
+        logs = self.orch.runtime / "logs"
+        moved_logs = self.orch.runtime / "logs-before-race"
+        external = Path(self.tmp.name) / "external-logs"
+        external.mkdir()
+        external_log = external / fixture["log"].name
+        external_log.write_text(
+            '{"owner":"outside"}\n', encoding="utf-8"
+        )
+        raced = False
+
+        def inventory_then_swap_anchor(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                logs.rename(moved_logs)
+                logs.symlink_to(external, target_is_directory=True)
+                raced = True
+            return inventory
+
+        try:
+            with mock.patch.object(
+                state_module,
+                "_retention_inventory",
+                side_effect=inventory_then_swap_anchor,
+            ):
+                result = prune_retention(
+                    self.orch,
+                    older_than_days=0,
+                    max_evidence_bytes=1024 * 1024,
+                    keep_recent_runs=20,
+                    keep_backups=5,
+                    max_backup_bytes=1024 * 1024,
+                )
+            self.assertEqual(result["status"], "ATTENTION")
+            self.assertEqual(result["pruned"]["run_count"], 0)
+            self.assertGreaterEqual(
+                result["pruned"]["skipped_changed_count"], 1
+            )
+            self.assertEqual(
+                external_log.read_text(encoding="utf-8"),
+                '{"owner":"outside"}\n',
+            )
+        finally:
+            if logs.is_symlink():
+                logs.unlink()
+            if moved_logs.exists():
+                moved_logs.rename(logs)
+
+    def test_retention_reconciles_missing_backup_without_deleting_next(self):
+        backups = self.root / "backups"
+        backups.mkdir()
+        oldest = backups / "orch-state-20260101.zip"
+        middle = backups / "orch-state-20260102.zip"
+        newest = backups / "orch-state-20260103.zip"
+        oldest.write_bytes(b"a" * 100)
+        middle.write_bytes(b"b" * 10)
+        newest.write_bytes(b"c" * 10)
+        for index, item in enumerate((oldest, middle, newest)):
+            os.utime(item, (100 + index, 100 + index))
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_remove_oldest(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                oldest.unlink()
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_remove_oldest,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=30,
+                max_evidence_bytes=1024,
+                keep_recent_runs=20,
+                keep_backups=2,
+                max_backup_bytes=20,
+            )
+        self.assertTrue(middle.exists())
+        self.assertTrue(newest.exists())
+        self.assertEqual(result["pruned"]["backup_count"], 0)
+        self.assertEqual(result["pruned"]["already_missing_count"], 1)
+        self.assertTrue(result["bounded"])
+
+    def test_retention_preserves_changed_backup_and_stops_backup_prune(self):
+        backups = self.root / "backups"
+        backups.mkdir()
+        items = []
+        for index in range(3):
+            item = backups / f"orch-state-2026020{index + 1}.zip"
+            item.write_bytes(bytes([index + 1]) * 10)
+            os.utime(item, (200 + index, 200 + index))
+            items.append(item)
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_replace_oldest(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                replacement = backups / "owner-backup.tmp"
+                replacement.write_bytes(b"owner-data")
+                os.replace(replacement, items[0])
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_replace_oldest,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=30,
+                max_evidence_bytes=1024,
+                keep_recent_runs=20,
+                keep_backups=2,
+                max_backup_bytes=1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["backup_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 1)
+        self.assertEqual(items[0].read_bytes(), b"owner-data")
+        self.assertTrue(items[1].exists())
+        self.assertTrue(items[2].exists())
+
+    def test_retention_reconciles_missing_newest_before_backup_delete(self):
+        backups = self.root / "backups"
+        backups.mkdir()
+        items = []
+        for index in range(3):
+            item = backups / f"orch-state-2026021{index + 1}.zip"
+            item.write_bytes(bytes([index + 1]) * 10)
+            os.utime(item, (250 + index, 250 + index))
+            items.append(item)
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_remove_newest(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                items[2].unlink()
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_remove_newest,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=30,
+                max_evidence_bytes=1024,
+                keep_recent_runs=20,
+                keep_backups=2,
+                max_backup_bytes=1024,
+            )
+        self.assertTrue(items[0].exists())
+        self.assertTrue(items[1].exists())
+        self.assertFalse(items[2].exists())
+        self.assertEqual(result["pruned"]["backup_count"], 0)
+        self.assertEqual(result["pruned"]["already_missing_count"], 1)
+        self.assertTrue(result["bounded"])
+
+    def test_retention_never_deletes_last_bound_backup_after_race(self):
+        backups = self.root / "backups"
+        backups.mkdir()
+        items = []
+        for index in range(3):
+            item = backups / f"orch-state-2026030{index + 1}.zip"
+            item.write_bytes(bytes([index + 1]) * 10)
+            os.utime(item, (300 + index, 300 + index))
+            items.append(item)
+        original_quarantine_name = state_module._quarantine_name_at
+        raced = False
+
+        def remove_other_backups(parent_fd):
+            nonlocal raced
+            if not raced:
+                items[1].unlink()
+                items[2].unlink()
+                raced = True
+            return original_quarantine_name(parent_fd)
+
+        with mock.patch.object(
+            state_module,
+            "_quarantine_name_at",
+            side_effect=remove_other_backups,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=30,
+                max_evidence_bytes=1024,
+                keep_recent_runs=20,
+                keep_backups=2,
+                max_backup_bytes=1024,
+            )
+        self.assertTrue(items[0].exists())
+        self.assertFalse(items[1].exists())
+        self.assertFalse(items[2].exists())
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["backup_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 1)
+        self.assertEqual(
+            result["pruned"]["skipped_changed"][0]["reason"],
+            "last_backup_guard",
+        )
+
+    def test_retention_prunes_nested_review_export_tree(self):
+        fixture = self._terminal_retention_fixture("RETENTION-NESTED")
+        nested = fixture["export"] / "nested" / "deeper"
+        nested.mkdir(parents=True)
+        (nested / "evidence.json").write_text(
+            '{"nested":true}\n', encoding="utf-8"
+        )
+
+        result = prune_retention(
+            self.orch,
+            older_than_days=0,
+            max_evidence_bytes=1024 * 1024,
+            keep_recent_runs=20,
+            keep_backups=5,
+            max_backup_bytes=1024 * 1024,
+        )
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertEqual(result["pruned"]["failed_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 0)
+        self.assertFalse(fixture["export"].exists())
+        self.assertFalse(fixture["log"].exists())
+        self.assertFalse(fixture["receipt"].exists())
+
+    def test_retention_quarantine_detects_swap_before_rename(self):
+        fixture = self._terminal_retention_fixture("RETENTION-QUARANTINE")
+        inventory = state_module._retention_inventory(self.orch)
+        run_id = fixture["claim"]["run_id"]
+        artifact = next(
+            item for item in inventory["runs"][run_id]["artifacts"]
+            if item["kind"] == "log"
+        )
+        logs = self.orch.runtime / "logs"
+        replacement = logs / ".race-owner"
+        replacement.write_text(
+            '{"owner":"quarantine-race"}\n', encoding="utf-8"
+        )
+        saved_original = ".race-original"
+        original_rename = os.rename
+        raced = False
+
+        def swap_before_quarantine(src, dst, *args, **kwargs):
+            nonlocal raced
+            if (
+                not raced
+                and src == fixture["log"].name
+                and isinstance(dst, str)
+                and dst.startswith(".orch-prune-")
+            ):
+                source_fd = kwargs.get("src_dir_fd")
+                target_fd = kwargs.get("dst_dir_fd")
+                original_rename(
+                    src, saved_original,
+                    src_dir_fd=source_fd, dst_dir_fd=target_fd,
+                )
+                original_rename(
+                    replacement.name, src,
+                    src_dir_fd=source_fd, dst_dir_fd=target_fd,
+                )
+                raced = True
+            return original_rename(src, dst, *args, **kwargs)
+
+        with mock.patch.object(
+            state_module.os, "rename", side_effect=swap_before_quarantine
+        ):
+            result = state_module._delete_bound_artifact(
+                self.orch, artifact
+            )
+        self.assertEqual(result["status"], "CHANGED")
+        self.assertEqual(
+            result["reason"], "identity_changed_during_quarantine"
+        )
+        self.assertTrue(result["restored"])
+        self.assertEqual(
+            fixture["log"].read_text(encoding="utf-8"),
+            '{"owner":"quarantine-race"}\n',
+        )
+        self.assertTrue((logs / saved_original).exists())
+
+    def test_retention_reports_partial_delete_failure_accounting(self):
+        fixture = self._terminal_retention_fixture("RETENTION-PARTIAL")
+        log_bytes = fixture["log"].stat().st_size
+        original_delete = state_module._delete_bound_artifact
+        calls = 0
+
+        def fail_second_delete(orch, artifact):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return {
+                    "status": "FAILED",
+                    "reason": "synthetic_delete_failure",
+                }
+            return original_delete(orch, artifact)
+
+        with mock.patch.object(
+            state_module,
+            "_delete_bound_artifact",
+            side_effect=fail_second_delete,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=0,
+                max_evidence_bytes=1024 * 1024,
+                keep_recent_runs=20,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertEqual(result["pruned"]["evidence_bytes"], log_bytes)
+        self.assertEqual(result["pruned"]["failed_count"], 1)
+        self.assertFalse(fixture["log"].exists())
+        self.assertTrue(fixture["receipt"].exists())
+        self.assertTrue(fixture["export"].exists())
+
+    def test_retention_accounts_partial_failure_inside_review_tree(self):
+        fixture = self._terminal_retention_fixture("RETENTION-TREE-PARTIAL")
+        nested = fixture["export"] / "nested"
+        nested.mkdir()
+        first = nested / "a.json"
+        second = nested / "b.json"
+        first.write_bytes(b"a" * 11)
+        second.write_bytes(b"b" * 13)
+        inventory = state_module._retention_inventory(self.orch)
+        run_id = fixture["claim"]["run_id"]
+        inventoried_bytes = inventory["runs"][run_id]["bytes"]
+        base_deleted = (
+            fixture["log"].stat().st_size + fixture["receipt"].stat().st_size
+        )
+        original_unlink = state_module.os.unlink
+        tree_calls = 0
+
+        def fail_second_tree_file(name, *args, **kwargs):
+            nonlocal tree_calls
+            if name in {"a.json", "b.json"}:
+                tree_calls += 1
+                if tree_calls == 2:
+                    raise OSError("synthetic tree unlink failure")
+            return original_unlink(name, *args, **kwargs)
+
+        with mock.patch.object(
+            state_module.os, "unlink", side_effect=fail_second_tree_file
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=0,
+                max_evidence_bytes=1024 * 1024,
+                keep_recent_runs=20,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["failed_count"], 1)
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertGreater(
+            result["pruned"]["evidence_bytes"], base_deleted
+        )
+        self.assertLess(
+            result["pruned"]["evidence_bytes"], inventoried_bytes
+        )
+        failure = result["pruned"]["failed"][0]
+        self.assertGreater(failure["deleted_bytes"], 0)
+        self.assertTrue(failure["deleted_paths"])
+        self.assertTrue(Path(failure["quarantine_path"]).exists())
+
+    def test_retention_rechecks_budget_after_missing_artifacts(self):
+        fixture = self._terminal_retention_fixture("RETENTION-BUDGET-RECHECK")
+        fixture["log"].write_bytes(b"x" * 100)
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_remove_large_artifacts(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                fixture["log"].unlink()
+                import shutil as shutil_module
+                shutil_module.rmtree(fixture["export"])
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_remove_large_artifacts,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=3650,
+                max_evidence_bytes=20,
+                keep_recent_runs=0,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertTrue(fixture["receipt"].exists())
+        self.assertEqual(result["pruned"]["run_count"], 0)
+        self.assertEqual(result["pruned"]["already_missing_count"], 2)
+        self.assertTrue(result["bounded"])
+
+    def test_retention_rechecks_budget_after_delete_boundary_missing(self):
+        fixture = self._terminal_retention_fixture(
+            "RETENTION-LATE-MISSING"
+        )
+        fixture["log"].write_bytes(b"x" * 100)
+        original_delete = state_module._delete_bound_artifact
+        removed = False
+
+        def disappear_at_delete(orch, artifact, **kwargs):
+            nonlocal removed
+            if not removed and artifact["kind"] == "log":
+                Path(artifact["path"]).unlink()
+                removed = True
+                return {
+                    "status": "MISSING",
+                    "name": Path(artifact["path"]).name,
+                }
+            return original_delete(orch, artifact, **kwargs)
+
+        with mock.patch.object(
+            state_module,
+            "_delete_bound_artifact",
+            side_effect=disappear_at_delete,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=3650,
+                max_evidence_bytes=30,
+                keep_recent_runs=0,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertFalse(fixture["log"].exists())
+        self.assertTrue(fixture["receipt"].exists())
+        self.assertTrue(fixture["export"].exists())
+        self.assertEqual(result["pruned"]["run_count"], 0)
+        self.assertEqual(result["pruned"]["already_missing_count"], 1)
+        self.assertTrue(result["bounded"])
+
+    def test_retention_late_missing_counts_bytes_already_removed(self):
+        fixture = self._terminal_retention_fixture(
+            "RETENTION-LATE-MISSING-AFTER-DELETE"
+        )
+        fixture["log"].write_bytes(b"l" * 10)
+        fixture["receipt"].write_bytes(b"r" * 100)
+        original_delete = state_module._delete_bound_artifact
+        removed_receipt = False
+
+        def receipt_disappears_after_log_delete(orch, artifact, **kwargs):
+            nonlocal removed_receipt
+            if (
+                not removed_receipt
+                and artifact["kind"] == "worker_receipt"
+            ):
+                Path(artifact["path"]).unlink()
+                removed_receipt = True
+                return {
+                    "status": "MISSING",
+                    "name": Path(artifact["path"]).name,
+                }
+            return original_delete(orch, artifact, **kwargs)
+
+        with mock.patch.object(
+            state_module,
+            "_delete_bound_artifact",
+            side_effect=receipt_disappears_after_log_delete,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=3650,
+                max_evidence_bytes=20,
+                keep_recent_runs=0,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertFalse(fixture["log"].exists())
+        self.assertFalse(fixture["receipt"].exists())
+        self.assertTrue(fixture["export"].exists())
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertEqual(result["pruned"]["evidence_bytes"], 10)
+        self.assertEqual(result["pruned"]["already_missing_count"], 1)
+        self.assertTrue(result["bounded"])
+
+    def test_retention_fifo_substitution_fails_closed_without_blocking(self):
+        fixture = self._terminal_retention_fixture("RETENTION-FIFO")
+        original_inventory = state_module._retention_inventory
+        raced = False
+
+        def inventory_then_fifo(orch):
+            nonlocal raced
+            inventory = original_inventory(orch)
+            if not raced:
+                fixture["log"].unlink()
+                os.mkfifo(fixture["log"])
+                raced = True
+            return inventory
+
+        with mock.patch.object(
+            state_module,
+            "_retention_inventory",
+            side_effect=inventory_then_fifo,
+        ):
+            result = prune_retention(
+                self.orch,
+                older_than_days=0,
+                max_evidence_bytes=1024 * 1024,
+                keep_recent_runs=20,
+                keep_backups=5,
+                max_backup_bytes=1024 * 1024,
+            )
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertFalse(result["bounded"])
+        self.assertEqual(result["pruned"]["run_count"], 0)
+        self.assertEqual(result["pruned"]["skipped_changed_count"], 1)
+        self.assertTrue(fixture["log"].exists())
+
+    def test_retention_content_hash_detects_same_inode_mutation(self):
+        fixture = self._terminal_retention_fixture("RETENTION-CONTENT-RACE")
+        inventory = state_module._retention_inventory(self.orch)
+        run_id = fixture["claim"]["run_id"]
+        artifact = next(
+            item for item in inventory["runs"][run_id]["artifacts"]
+            if item["kind"] == "log"
+        )
+        original_stat = fixture["log"].stat()
+        original_quarantine_name = state_module._quarantine_name_at
+        mutated = False
+
+        def mutate_before_rename(parent_fd):
+            nonlocal mutated
+            if not mutated:
+                fixture["log"].write_text(
+                    '{"new":true}\n', encoding="utf-8"
+                )
+                os.utime(
+                    fixture["log"],
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                mutated = True
+            return original_quarantine_name(parent_fd)
+
+        with mock.patch.object(
+            state_module,
+            "_quarantine_name_at",
+            side_effect=mutate_before_rename,
+        ):
+            result = state_module._delete_bound_artifact(
+                self.orch, artifact
+            )
+        self.assertEqual(result["status"], "CHANGED")
+        self.assertEqual(
+            result["reason"], "identity_changed_during_quarantine"
+        )
+        self.assertTrue(result["restored"])
+        self.assertEqual(
+            fixture["log"].read_text(encoding="utf-8"),
+            '{"new":true}\n',
+        )
 
     def test_future_state_schema_is_rejected(self):
         other = Path(self.tmp.name) / "future"; runtime = other / ".runtime"

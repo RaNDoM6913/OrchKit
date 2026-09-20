@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import stat as statmod
 import sqlite3
 import shutil
@@ -337,22 +338,737 @@ def _parse_utc(value: Optional[str]) -> Optional[float]:
         return None
 
 
-def _regular_file_size(path: Path) -> Optional[int]:
-    if not path.is_file() or path.is_symlink():
+def _stat_identity(info: os.stat_result) -> List[int]:
+    return [
+        int(info.st_dev), int(info.st_ino), int(info.st_mode),
+        int(info.st_size), int(info.st_mtime_ns), int(info.st_ctime_ns),
+    ]
+
+
+def _regular_file_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return flags
+
+
+def _record_open_regular_fd(fd: int) -> Optional[Dict[str, Any]]:
+    before = os.fstat(fd)
+    if not statmod.S_ISREG(before.st_mode):
         return None
-    return path.stat().st_size
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    after = os.fstat(fd)
+    if _stat_identity(after) != _stat_identity(before):
+        return None
+    return {
+        "bytes": int(before.st_size),
+        "identity": _stat_identity(before),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _regular_file_record(path: Path) -> Optional[Dict[str, Any]]:
+    target = Path(os.path.abspath(str(path)))
+    if not hasattr(os, "O_NOFOLLOW") and target.is_symlink():
+        return None
+    try:
+        fd = os.open(str(target), _regular_file_flags())
+    except OSError:
+        return None
+    try:
+        return _record_open_regular_fd(fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _regular_file_size(path: Path) -> Optional[int]:
+    record = _regular_file_record(path)
+    return record["bytes"] if record is not None else None
+
+
+def _safe_tree_record(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        root_info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not statmod.S_ISDIR(root_info.st_mode):
+        return None
+    total = 0
+    identity: List[Dict[str, Any]] = [
+        {"path": ".", "stat": _stat_identity(root_info)}
+    ]
+    for item in sorted(path.rglob("*")):
+        try:
+            info = item.lstat()
+        except FileNotFoundError:
+            return None
+        if statmod.S_ISLNK(info.st_mode):
+            return None
+        if not (statmod.S_ISREG(info.st_mode) or statmod.S_ISDIR(info.st_mode)):
+            return None
+        relative = item.relative_to(path).as_posix()
+        if statmod.S_ISREG(info.st_mode):
+            record = _regular_file_record(item)
+            if record is None:
+                return None
+            identity.append({
+                "path": relative,
+                "stat": record["identity"],
+                "sha256": record["sha256"],
+            })
+            total += int(record["bytes"])
+        else:
+            identity.append({
+                "path": relative, "stat": _stat_identity(info)
+            })
+    return {"bytes": total, "identity": identity}
 
 
 def _safe_tree_size(path: Path) -> Optional[int]:
-    if not path.is_dir() or path.is_symlink():
+    record = _safe_tree_record(path)
+    return record["bytes"] if record is not None else None
+
+
+def _directory_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _validate_child_name(name: str) -> None:
+    if (
+        not isinstance(name, str)
+        or name in {"", ".", ".."}
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise ValueError("retention_entry_name_unsafe")
+
+
+def _open_directory_path(path: Path) -> int:
+    if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():
+        raise ValueError("retention_anchor_unsafe")
+    try:
+        fd = os.open(str(path), _directory_flags())
+    except OSError as exc:
+        raise ValueError("retention_anchor_unsafe") from exc
+    info = os.fstat(fd)
+    if not statmod.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise ValueError("retention_anchor_unsafe")
+    return fd
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    _validate_child_name(name)
+    try:
+        fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError("retention_anchor_unsafe") from exc
+    info = os.fstat(fd)
+    if not statmod.S_ISDIR(info.st_mode):
+        os.close(fd)
+        raise ValueError("retention_anchor_unsafe")
+    return fd
+
+
+def _regular_file_record_at(
+    parent_fd: int, name: str,
+) -> Optional[Dict[str, Any]]:
+    _validate_child_name(name)
+    try:
+        fd = os.open(
+            name, _regular_file_flags(), dir_fd=parent_fd
+        )
+    except OSError:
         return None
+    try:
+        return _record_open_regular_fd(fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _tree_record_from_fd(root_fd: int) -> Optional[Dict[str, Any]]:
+    root_info = os.fstat(root_fd)
+    if not statmod.S_ISDIR(root_info.st_mode):
+        return None
+    identity: List[Dict[str, Any]] = [
+        {"path": ".", "stat": _stat_identity(root_info)}
+    ]
     total = 0
-    for item in path.rglob("*"):
-        if item.is_symlink():
-            return None
-        if item.is_file():
-            total += item.stat().st_size
-    return total
+
+    def walk(directory_fd: int, prefix: str) -> bool:
+        nonlocal total
+        try:
+            with os.scandir(directory_fd) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            return False
+        for entry in entries:
+            name = entry.name
+            try:
+                _validate_child_name(name)
+                info = entry.stat(follow_symlinks=False)
+            except (OSError, ValueError):
+                return False
+            if statmod.S_ISLNK(info.st_mode):
+                return False
+            relative = name if not prefix else prefix + "/" + name
+            if statmod.S_ISREG(info.st_mode):
+                record = _regular_file_record_at(directory_fd, name)
+                if record is None:
+                    return False
+                identity.append({
+                    "path": relative,
+                    "stat": record["identity"],
+                    "sha256": record["sha256"],
+                })
+                total += int(record["bytes"])
+                continue
+            if not statmod.S_ISDIR(info.st_mode):
+                return False
+            try:
+                child_fd = _open_directory_at(directory_fd, name)
+            except ValueError:
+                return False
+            try:
+                child_info = os.fstat(child_fd)
+                identity.append({
+                    "path": relative,
+                    "stat": _stat_identity(child_info),
+                })
+                if not walk(child_fd, relative):
+                    return False
+            finally:
+                os.close(child_fd)
+        return True
+
+    if not walk(root_fd, ""):
+        return None
+    return {"bytes": total, "identity": identity}
+
+
+def _tree_record_at(
+    parent_fd: int, name: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        fd = _open_directory_at(parent_fd, name)
+    except ValueError:
+        return None
+    try:
+        return _tree_record_from_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _retention_anchor_path(orch: Orchestrator, kind: str) -> Path:
+    if kind == "log":
+        return orch.logs
+    if kind == "worker_receipt":
+        return orch.runtime / "worker_receipts"
+    if kind == "review_export":
+        return orch.runtime / "review_exports"
+    if kind == "backup":
+        return orch.root / "backups"
+    raise ValueError("retention_artifact_kind_invalid")
+
+
+def _open_retention_anchor(orch: Orchestrator, kind: str) -> int:
+    root_fd = _open_directory_path(orch.root)
+    try:
+        if kind == "backup":
+            return _open_directory_at(root_fd, "backups")
+        runtime_fd = _open_directory_at(root_fd, ".runtime")
+        try:
+            child = {
+                "log": "logs",
+                "worker_receipt": "worker_receipts",
+                "review_export": "review_exports",
+            }.get(kind)
+            if child is None:
+                raise ValueError("retention_artifact_kind_invalid")
+            return _open_directory_at(runtime_fd, child)
+        finally:
+            os.close(runtime_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _entry_exists_at(parent_fd: int, name: str) -> bool:
+    _validate_child_name(name)
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _artifact_expected_record(artifact: Dict[str, Any]) -> Dict[str, Any]:
+    record = {
+        "bytes": artifact.get("bytes"),
+        "identity": artifact.get("identity"),
+    }
+    if "sha256" in artifact:
+        record["sha256"] = artifact.get("sha256")
+    return record
+
+
+def _artifact_record_at(
+    anchor_fd: int, kind: str, name: str,
+) -> Optional[Dict[str, Any]]:
+    if kind == "review_export":
+        return _tree_record_at(anchor_fd, name)
+    return _regular_file_record_at(anchor_fd, name)
+
+
+def _artifact_binding(
+    orch: Orchestrator, artifact: Dict[str, Any],
+) -> Dict[str, Any]:
+    kind = artifact.get("kind")
+    path_value = artifact.get("path")
+    if not isinstance(kind, str) or not isinstance(path_value, str):
+        return {"status": "CHANGED", "reason": "invalid_binding"}
+    try:
+        anchor_path = _retention_anchor_path(orch, kind)
+    except ValueError:
+        return {"status": "CHANGED", "reason": "invalid_kind"}
+    path = Path(path_value)
+    if (
+        Path(os.path.abspath(str(path.parent)))
+        != Path(os.path.abspath(str(anchor_path)))
+    ):
+        return {"status": "CHANGED", "reason": "anchor_mismatch"}
+    name = path.name
+    try:
+        _validate_child_name(name)
+        anchor_fd = _open_retention_anchor(orch, kind)
+    except ValueError:
+        return {"status": "CHANGED", "reason": "unsafe_anchor"}
+    try:
+        exists = _entry_exists_at(anchor_fd, name)
+        if not exists:
+            return {"status": "MISSING", "name": name}
+        current = _artifact_record_at(anchor_fd, kind, name)
+    finally:
+        os.close(anchor_fd)
+    expected = _artifact_expected_record(artifact)
+    if current is None or current != expected:
+        return {
+            "status": "CHANGED",
+            "name": name,
+            "reason": "identity_mismatch",
+        }
+    return {"status": "MATCH", "name": name}
+
+
+def _record_matches_after_quarantine(
+    kind: str,
+    expected: Dict[str, Any],
+    observed: Optional[Dict[str, Any]],
+) -> bool:
+    if observed is None or observed.get("bytes") != expected.get("bytes"):
+        return False
+    expected_identity = expected.get("identity")
+    observed_identity = observed.get("identity")
+    if kind != "review_export":
+        if (
+            not isinstance(expected_identity, list)
+            or not isinstance(observed_identity, list)
+            or len(expected_identity) != 6
+            or len(observed_identity) != 6
+        ):
+            return False
+        return (
+            expected_identity[:5] == observed_identity[:5]
+            and observed.get("sha256") == expected.get("sha256")
+        )
+    if (
+        not isinstance(expected_identity, list)
+        or not isinstance(observed_identity, list)
+        or len(expected_identity) != len(observed_identity)
+    ):
+        return False
+    for before, after in zip(expected_identity, observed_identity):
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return False
+        if before.get("path") != after.get("path"):
+            return False
+        if before.get("sha256") != after.get("sha256"):
+            return False
+        before_stat = before.get("stat")
+        after_stat = after.get("stat")
+        if (
+            not isinstance(before_stat, list)
+            or not isinstance(after_stat, list)
+            or len(before_stat) != 6
+            or len(after_stat) != 6
+        ):
+            return False
+        if before.get("path") == ".":
+            if before_stat[:5] != after_stat[:5]:
+                return False
+        elif before_stat != after_stat:
+            return False
+    return True
+
+
+def _quarantine_name_at(parent_fd: int) -> str:
+    for _ in range(32):
+        name = ".orch-prune-" + secrets.token_hex(16)
+        if not _entry_exists_at(parent_fd, name):
+            return name
+    raise ValueError("retention_quarantine_name_exhausted")
+
+
+def _restore_quarantine_at(
+    parent_fd: int, quarantine: str, original: str,
+) -> bool:
+    if _entry_exists_at(parent_fd, original):
+        return False
+    try:
+        os.rename(
+            quarantine, original,
+            src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _same_directory_object(
+    info: os.stat_result, expected_stat: List[int],
+) -> bool:
+    if not isinstance(expected_stat, list) or len(expected_stat) != 6:
+        return False
+    current = _stat_identity(info)
+    return current[:3] == expected_stat[:3]
+
+
+def _open_relative_directory(
+    root_fd: int, parts: Tuple[str, ...],
+) -> int:
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            child_fd = _open_directory_at(fd, part)
+            os.close(fd)
+            fd = child_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _delete_tree_from_record(
+    anchor_fd: int,
+    name: str,
+    expected: Dict[str, Any],
+) -> Dict[str, Any]:
+    deleted_bytes = 0
+    deleted_paths: List[str] = []
+
+    def outcome(
+        status: str,
+        reason: Optional[str] = None,
+        relative: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"status": status}
+        if reason is not None:
+            result["reason"] = reason
+        if relative is not None:
+            result["relative"] = relative
+        if deleted_bytes:
+            result["deleted_bytes"] = deleted_bytes
+        if deleted_paths:
+            result["deleted_paths"] = list(deleted_paths)
+        return result
+
+    try:
+        root_fd = _open_directory_at(anchor_fd, name)
+    except ValueError:
+        return outcome("CHANGED", "tree_root_changed")
+    try:
+        current = _tree_record_from_fd(root_fd)
+        if current != expected:
+            return outcome("CHANGED", "tree_changed")
+        identities = expected.get("identity")
+        if not isinstance(identities, list) or not identities:
+            return outcome("CHANGED", "tree_binding_invalid")
+        entries = []
+        for record in identities:
+            if not isinstance(record, dict):
+                return outcome("CHANGED", "tree_binding_invalid")
+            relative = record.get("path")
+            stat_record = record.get("stat")
+            if relative == ".":
+                continue
+            if (
+                not isinstance(relative, str)
+                or not isinstance(stat_record, list)
+                or len(stat_record) != 6
+            ):
+                return outcome("CHANGED", "tree_binding_invalid")
+            parts = Path(relative).parts
+            if (
+                not parts
+                or Path(relative).is_absolute()
+                or any(part in {"", ".", ".."} for part in parts)
+            ):
+                return outcome("CHANGED", "tree_binding_invalid")
+            entries.append((
+                relative, parts, stat_record, record.get("sha256")
+            ))
+        entries.sort(
+            key=lambda item: (len(item[1]), item[0]), reverse=True
+        )
+        for relative, parts, stat_record, expected_sha in entries:
+            try:
+                parent_fd = _open_relative_directory(root_fd, parts[:-1])
+            except ValueError:
+                return outcome(
+                    "CHANGED", "tree_parent_changed", relative
+                )
+            try:
+                child = parts[-1]
+                mode = int(stat_record[2])
+                if statmod.S_ISREG(mode):
+                    record = _regular_file_record_at(parent_fd, child)
+                    if (
+                        record is None
+                        or record.get("identity") != stat_record
+                        or record.get("sha256") != expected_sha
+                    ):
+                        return outcome(
+                            "CHANGED", "tree_file_changed", relative
+                        )
+                    try:
+                        os.unlink(child, dir_fd=parent_fd)
+                    except OSError:
+                        return outcome(
+                            "FAILED", "tree_file_delete_failed", relative
+                        )
+                    deleted_bytes += int(stat_record[3])
+                    deleted_paths.append(relative)
+                    continue
+                if not statmod.S_ISDIR(mode):
+                    return outcome(
+                        "CHANGED", "tree_entry_type_invalid", relative
+                    )
+                try:
+                    child_fd = _open_directory_at(parent_fd, child)
+                except ValueError:
+                    return outcome(
+                        "CHANGED", "tree_directory_changed", relative
+                    )
+                try:
+                    info = os.fstat(child_fd)
+                    if not _same_directory_object(info, stat_record):
+                        return outcome(
+                            "CHANGED", "tree_directory_changed", relative
+                        )
+                    with os.scandir(child_fd) as iterator:
+                        if next(iterator, None) is not None:
+                            return outcome(
+                                "CHANGED",
+                                "tree_directory_not_empty",
+                                relative,
+                            )
+                finally:
+                    os.close(child_fd)
+                try:
+                    os.rmdir(child, dir_fd=parent_fd)
+                except OSError:
+                    return outcome(
+                        "FAILED", "tree_directory_delete_failed", relative
+                    )
+                deleted_paths.append(relative + "/")
+            finally:
+                os.close(parent_fd)
+        with os.scandir(root_fd) as iterator:
+            if next(iterator, None) is not None:
+                return outcome("CHANGED", "tree_root_not_empty")
+    finally:
+        os.close(root_fd)
+    try:
+        os.rmdir(name, dir_fd=anchor_fd)
+    except OSError:
+        return outcome("FAILED", "tree_root_delete_failed")
+    return outcome("DELETED")
+
+
+def _bound_backup_survivor_exists_at(
+    anchor_fd: int,
+    survivors: List[Dict[str, Any]],
+) -> bool:
+    for artifact in survivors:
+        path_value = artifact.get("path")
+        if not isinstance(path_value, str):
+            continue
+        name = Path(path_value).name
+        try:
+            _validate_child_name(name)
+        except ValueError:
+            continue
+        current = _regular_file_record_at(anchor_fd, name)
+        if current == _artifact_expected_record(artifact):
+            return True
+    return False
+
+
+def _delete_bound_artifact(
+    orch: Orchestrator,
+    artifact: Dict[str, Any],
+    *,
+    backup_survivors: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    binding = _artifact_binding(orch, artifact)
+    if binding["status"] != "MATCH":
+        return binding
+    kind = str(artifact["kind"])
+    path = Path(str(artifact["path"]))
+    name = binding["name"]
+    expected = _artifact_expected_record(artifact)
+    anchor_path = _retention_anchor_path(orch, kind)
+    try:
+        anchor_fd = _open_retention_anchor(orch, kind)
+    except ValueError:
+        return {"status": "CHANGED", "reason": "unsafe_anchor"}
+    quarantine = ""
+    try:
+        current = _artifact_record_at(anchor_fd, kind, name)
+        if current != expected:
+            if not _entry_exists_at(anchor_fd, name):
+                return {"status": "MISSING", "name": name}
+            return {
+                "status": "CHANGED",
+                "reason": "identity_changed_before_quarantine",
+            }
+        try:
+            quarantine = _quarantine_name_at(anchor_fd)
+        except ValueError:
+            return {
+                "status": "FAILED",
+                "reason": "quarantine_name_unavailable",
+            }
+        try:
+            os.rename(
+                name, quarantine,
+                src_dir_fd=anchor_fd, dst_dir_fd=anchor_fd,
+            )
+        except FileNotFoundError:
+            return {"status": "MISSING", "name": name}
+        except OSError:
+            return {
+                "status": "FAILED",
+                "reason": "quarantine_rename_failed",
+            }
+        post = _artifact_record_at(anchor_fd, kind, quarantine)
+        if not _record_matches_after_quarantine(kind, expected, post):
+            restored = _restore_quarantine_at(
+                anchor_fd, quarantine, name
+            )
+            return {
+                "status": "CHANGED",
+                "reason": "identity_changed_during_quarantine",
+                "restored": restored,
+                "quarantine_path": None if restored else str(
+                    anchor_path / quarantine
+                ),
+            }
+        if kind == "backup":
+            if backup_survivors is None:
+                restored = _restore_quarantine_at(
+                    anchor_fd, quarantine, name
+                )
+                return {
+                    "status": "FAILED",
+                    "reason": "backup_survivor_binding_missing",
+                    "restored": restored,
+                    "quarantine_path": None if restored else str(
+                        anchor_path / quarantine
+                    ),
+                }
+            if not _bound_backup_survivor_exists_at(
+                anchor_fd, backup_survivors
+            ):
+                restored = _restore_quarantine_at(
+                    anchor_fd, quarantine, name
+                )
+                return {
+                    "status": "CHANGED",
+                    "reason": "last_backup_guard",
+                    "restored": restored,
+                    "quarantine_path": None if restored else str(
+                        anchor_path / quarantine
+                    ),
+                }
+        if kind == "review_export":
+            removed = _delete_tree_from_record(
+                anchor_fd, quarantine, post
+            )
+            if removed["status"] != "DELETED":
+                removed["quarantine_path"] = str(
+                    anchor_path / quarantine
+                )
+                return removed
+        else:
+            if _regular_file_record_at(anchor_fd, quarantine) != post:
+                restored = _restore_quarantine_at(
+                    anchor_fd, quarantine, name
+                )
+                return {
+                    "status": "CHANGED",
+                    "reason": "identity_changed_after_quarantine",
+                    "restored": restored,
+                    "quarantine_path": None if restored else str(
+                        anchor_path / quarantine
+                    ),
+                }
+            try:
+                os.unlink(quarantine, dir_fd=anchor_fd)
+            except OSError:
+                restored = _restore_quarantine_at(
+                    anchor_fd, quarantine, name
+                )
+                return {
+                    "status": "FAILED",
+                    "reason": "artifact_delete_failed",
+                    "restored": restored,
+                    "quarantine_path": None if restored else str(
+                        anchor_path / quarantine
+                    ),
+                }
+        try:
+            os.fsync(anchor_fd)
+        except OSError:
+            pass
+        return {
+            "status": "DELETED",
+            "path": str(path),
+            "bytes": int(artifact["bytes"]),
+        }
+    finally:
+        os.close(anchor_fd)
 
 
 def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
@@ -372,18 +1088,26 @@ def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
         run_id = row["run_id"]
         artifacts = []
         for log in sorted(orch.logs.glob(f"{run_id}-*.json")):
-            size = _regular_file_size(log)
-            if size is None:
+            record = _regular_file_record(log)
+            if record is None:
                 continue
-            artifacts.append({"kind": "log", "path": str(log), "bytes": size})
+            artifacts.append({
+                "kind": "log", "path": str(log), **record,
+            })
         receipt = orch.runtime / "worker_receipts" / f"{run_id}.json"
-        receipt_size = _regular_file_size(receipt)
-        if receipt_size is not None:
-            artifacts.append({"kind": "worker_receipt", "path": str(receipt), "bytes": receipt_size})
+        receipt_record = _regular_file_record(receipt)
+        if receipt_record is not None:
+            artifacts.append({
+                "kind": "worker_receipt", "path": str(receipt),
+                **receipt_record,
+            })
         export = orch.runtime / "review_exports" / run_id
-        export_size = _safe_tree_size(export)
-        if export_size is not None:
-            artifacts.append({"kind": "review_export", "path": str(export), "bytes": export_size})
+        export_record = _safe_tree_record(export)
+        if export_record is not None:
+            artifacts.append({
+                "kind": "review_export", "path": str(export),
+                **export_record,
+            })
         managed[run_id] = {
             **row,
             "protected": (
@@ -437,11 +1161,18 @@ def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
         unmanaged_backups.append({"path": str(backups_dir), "reason": "unsafe_backup_directory"})
     elif backups_dir.is_dir():
         for item in sorted(backups_dir.iterdir()):
-            if item.name.startswith("orch-state-") and item.suffix == ".zip" and item.is_file() and not item.is_symlink():
+            if item.name.startswith("orch-state-") and item.suffix == ".zip":
+                record = _regular_file_record(item)
+                if record is None:
+                    unmanaged_backups.append({
+                        "path": str(item),
+                        "reason": "unmanaged_backup_artifact",
+                    })
+                    continue
                 backups.append({
                     "path": str(item),
-                    "bytes": item.stat().st_size,
-                    "mtime": item.stat().st_mtime,
+                    **record,
+                    "mtime": record["identity"][4] / 1_000_000_000,
                 })
             elif item.exists():
                 unmanaged_backups.append({"path": str(item), "reason": "unmanaged_backup_artifact"})
@@ -519,50 +1250,199 @@ def prune_retention(
     total = sum(item["bytes"] for item in runs)
     cutoff = time.time() - older_than_days * 86400
     deleted_runs: List[Dict[str, Any]] = []
+    deleted_backups: List[Dict[str, Any]] = []
+    skipped_changed: List[Dict[str, Any]] = []
+    failed_deletions: List[Dict[str, Any]] = []
+    already_missing: List[Dict[str, Any]] = []
+    budget_pruning_allowed = True
+
+    def issue_record(
+        scope: str,
+        artifact: Dict[str, Any],
+        result: Dict[str, Any],
+        *,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        record = {
+            "scope": scope,
+            "kind": artifact["kind"],
+            "path": artifact["path"],
+            "status": result["status"],
+        }
+        if run_id is not None:
+            record["run_id"] = run_id
+        for field in (
+            "reason", "relative", "restored", "quarantine_path",
+            "deleted_bytes", "deleted_paths",
+        ):
+            if field in result:
+                record[field] = result[field]
+        return record
+
     for item in terminal:
         age_due = item["reference_ts"] <= cutoff
-        budget_due = total > max_evidence_bytes and item["run_id"] not in newest_keep
+        budget_due = (
+            budget_pruning_allowed
+            and total > max_evidence_bytes
+            and item["run_id"] not in newest_keep
+        )
         if not age_due and not budget_due:
             continue
-        removed = 0
-        paths = []
+
+        matched: List[Dict[str, Any]] = []
+        changed: List[Dict[str, Any]] = []
         for artifact in item["artifacts"]:
-            path = Path(artifact["path"])
-            if artifact["kind"] == "review_export":
-                if _safe_tree_size(path) is None:
-                    continue
-                removed += artifact["bytes"]
-                paths.append(str(path))
-                shutil.rmtree(path)
-            else:
-                if _regular_file_size(path) is None:
-                    continue
-                removed += artifact["bytes"]
-                paths.append(str(path))
-                path.unlink()
-        if removed:
-            total -= removed
-            deleted_runs.append({"run_id": item["run_id"], "bytes": removed, "paths": paths})
-    backups = sorted(inventory["backups"], key=lambda item: (item["mtime"], item["path"]))
-    backup_total = sum(item["bytes"] for item in backups)
-    deleted_backups: List[Dict[str, Any]] = []
-    while len(backups) > keep_backups or backup_total > max_backup_bytes:
-        if len(backups) <= 1:
-            break
-        item = backups.pop(0)
-        path = Path(item["path"])
-        if _regular_file_size(path) is None:
+            binding = _artifact_binding(orch, artifact)
+            if binding["status"] == "MATCH":
+                matched.append(artifact)
+                continue
+            if binding["status"] == "MISSING":
+                total = max(0, total - int(artifact["bytes"]))
+                already_missing.append(issue_record(
+                    "run", artifact, binding, run_id=item["run_id"]
+                ))
+                continue
+            changed.append(issue_record(
+                "run", artifact, binding, run_id=item["run_id"]
+            ))
+        if changed:
+            skipped_changed.extend(changed)
+            budget_pruning_allowed = False
             continue
-        path.unlink()
-        backup_total -= item["bytes"]
-        deleted_backups.append({"path": str(path), "bytes": item["bytes"]})
+        if not age_due and total <= max_evidence_bytes:
+            continue
+
+        removed = 0
+        paths: List[str] = []
+        for artifact in matched:
+            result = _delete_bound_artifact(orch, artifact)
+            if result["status"] == "DELETED":
+                removed += int(artifact["bytes"])
+                paths.append(str(artifact["path"]))
+                continue
+            if result["status"] == "MISSING":
+                total = max(0, total - int(artifact["bytes"]))
+                already_missing.append(issue_record(
+                    "run", artifact, result, run_id=item["run_id"]
+                ))
+                if (
+                    not age_due
+                    and max(0, total - removed) <= max_evidence_bytes
+                ):
+                    break
+                continue
+            partial_bytes = int(result.get("deleted_bytes", 0))
+            if partial_bytes:
+                removed += partial_bytes
+                for relative in result.get("deleted_paths", []):
+                    paths.append(
+                        str(Path(artifact["path"]) / relative.rstrip("/"))
+                    )
+            record = issue_record(
+                "run", artifact, result, run_id=item["run_id"]
+            )
+            if result["status"] == "CHANGED":
+                skipped_changed.append(record)
+            else:
+                failed_deletions.append(record)
+            budget_pruning_allowed = False
+            break
+        if removed:
+            total = max(0, total - removed)
+            deleted_runs.append({
+                "run_id": item["run_id"],
+                "bytes": removed,
+                "paths": paths,
+            })
+
+    backups = sorted(
+        inventory["backups"],
+        key=lambda item: (item["mtime"], item["path"]),
+    )
+    backup_artifacts = [
+        {"kind": "backup", **item} for item in backups
+    ]
+    deleted_backup_paths = set()
+    reported_missing_backup_paths = set()
+    for artifact in backup_artifacts:
+        live_backups: List[Dict[str, Any]] = []
+        backup_total = 0
+        reconciliation_changed: List[Dict[str, Any]] = []
+        for candidate in backup_artifacts:
+            candidate_path = str(candidate["path"])
+            if candidate_path in deleted_backup_paths:
+                continue
+            binding = _artifact_binding(orch, candidate)
+            if binding["status"] == "MATCH":
+                live_backups.append(candidate)
+                backup_total += int(candidate["bytes"])
+                continue
+            if binding["status"] == "MISSING":
+                if candidate_path not in reported_missing_backup_paths:
+                    already_missing.append(issue_record(
+                        "backup", candidate, binding
+                    ))
+                    reported_missing_backup_paths.add(candidate_path)
+                continue
+            reconciliation_changed.append(issue_record(
+                "backup", candidate, binding
+            ))
+        if reconciliation_changed:
+            skipped_changed.extend(reconciliation_changed)
+            break
+        if (
+            len(live_backups) <= keep_backups
+            and backup_total <= max_backup_bytes
+        ):
+            break
+        if len(live_backups) <= 1:
+            break
+        live_paths = {
+            str(candidate["path"]) for candidate in live_backups
+        }
+        if str(artifact["path"]) not in live_paths:
+            continue
+        result = _delete_bound_artifact(
+            orch,
+            artifact,
+            backup_survivors=[
+                candidate
+                for candidate in live_backups
+                if str(candidate["path"]) != str(artifact["path"])
+            ],
+        )
+        if result["status"] == "DELETED":
+            deleted_backup_paths.add(str(artifact["path"]))
+            deleted_backups.append({
+                "path": str(artifact["path"]),
+                "bytes": int(artifact["bytes"]),
+            })
+            continue
+        if result["status"] == "MISSING":
+            candidate_path = str(artifact["path"])
+            if candidate_path not in reported_missing_backup_paths:
+                already_missing.append(issue_record(
+                    "backup", artifact, result
+                ))
+                reported_missing_backup_paths.add(candidate_path)
+            continue
+        record = issue_record("backup", artifact, result)
+        if result["status"] == "CHANGED":
+            skipped_changed.append(record)
+        else:
+            failed_deletions.append(record)
+        break
+
     after = retention_status(
         orch,
         max_evidence_bytes=max_evidence_bytes,
         max_backup_bytes=max_backup_bytes,
         keep_backups=keep_backups,
     )
-    after["status"] = "PRUNED" if deleted_runs or deleted_backups else after["status"]
+    if skipped_changed or failed_deletions:
+        after["status"] = "ATTENTION"
+    elif deleted_runs or deleted_backups:
+        after["status"] = "PRUNED"
     after["pruned"] = {
         "runs": deleted_runs,
         "run_count": len(deleted_runs),
@@ -570,13 +1450,22 @@ def prune_retention(
         "backups": deleted_backups,
         "backup_count": len(deleted_backups),
         "backup_bytes": sum(item["bytes"] for item in deleted_backups),
+        "skipped_changed": skipped_changed,
+        "skipped_changed_count": len(skipped_changed),
+        "failed": failed_deletions,
+        "failed_count": len(failed_deletions),
+        "already_missing": already_missing,
+        "already_missing_count": len(already_missing),
     }
     after["bounded"] = (
-        after["evidence"]["bytes"] + after["evidence"]["unmanaged_bytes"] <= max_evidence_bytes
+        after["evidence"]["bytes"] + after["evidence"]["unmanaged_bytes"]
+        <= max_evidence_bytes
         and after["backups"]["bytes"] <= max_backup_bytes
         and after["backups"]["count"] <= keep_backups
         and not after["evidence"]["unmanaged"]
         and not after["backups"]["unmanaged"]
+        and not skipped_changed
+        and not failed_deletions
     )
     return after
 
