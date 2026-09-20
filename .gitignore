@@ -13,4 +13,25 @@ __pycache__/
 /dist/
 /*.egg-info/
 /dispatcher-prompt.txt
+/dispatcher_prompt.txt
 /backups/
+
+# Local credentials, evidence, and machine-specific state must never enter a
+# public release by accident.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.log
+/docs/14_VARIANT_B_LIVE_EVIDENCE.json
+/docs/DOC_VALIDATION.json
+/docs/FINAL_READONLY_CHECK.json
