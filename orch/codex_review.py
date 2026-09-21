@@ -437,9 +437,12 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
         if len(check_records) != len(checks):
             raise ValueError("review_evidence_binding_invalid:checks")
 
-        evidence_dir = ensure_private_dir(
-            work / "verification_evidence"
-        )
+        evidence_dir = Path(tempfile.mkdtemp(
+            prefix=".orch-review-evidence-",
+            dir=str(work),
+        ))
+        os.chmod(evidence_dir, 0o700)
+        checks_evidence_dir = ensure_private_dir(evidence_dir / "checks")
         scope_target = evidence_dir / "scope.json"
         scope_data = _copy_bound_evidence(
             orch.logs / expected_scope_name,
@@ -490,7 +493,7 @@ def prepare_review(orch: Orchestrator, run_id: str) -> Dict[str, Any]:
                     "review_evidence_binding_invalid:check:" + check_id
                 )
             exported_name = filename[len(run_id) + 1:]
-            target = evidence_dir / exported_name
+            target = checks_evidence_dir / exported_name
             data = _copy_bound_evidence(
                 orch.logs / filename,
                 target,

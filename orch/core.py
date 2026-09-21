@@ -1942,7 +1942,8 @@ class Orchestrator:
                       "stderr": (exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "",
                       "timed_out": True}
         log_path = self.logs / (
-            f"{run_id}-{str(check.get('id','check')).replace('/','_')}.json"
+            f"{run_id}-check-result-"
+            f"{str(check.get('id','check')).replace('/','_')}.json"
         )
         atomic_write_json(log_path, result, mode=0o600)
         result["log_path"] = str(log_path)
@@ -1988,7 +1989,7 @@ class Orchestrator:
             check_id = str(check.get("id", "check"))
             safe_id = check_id.replace("/", "_")
             item = record(
-                self.logs / f"{run_id}-{safe_id}.json",
+                self.logs / f"{run_id}-check-result-{safe_id}.json",
                 error_id="check:" + check_id,
             )
             check_items.append({"id": check_id, **item})

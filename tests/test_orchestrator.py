@@ -939,20 +939,24 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(verified['status'],'REVIEWING')
         prepared=prepare_review(self.orch,claim['run_id'])
         workspace=Path(prepared['workspace'])
-        self.assertTrue((workspace/'checks/check.py').is_file())
-        self.assertTrue((workspace/'verification_evidence/support.json').is_file())
-        self.assertTrue((workspace/'verification_evidence/scope.json').is_file())
         prompt=json.loads(Path(prepared['prompt']).read_text())
+        self.assertTrue((workspace/'checks/check.py').is_file())
+        check_evidence = prompt['verification_evidence'][0]['evidence_file']
+        scope_evidence = prompt['scope_evidence']['evidence_file']
+        authority_evidence = prompt['check_authority_evidence']['evidence_file']
+        self.assertTrue((workspace/check_evidence).is_file())
+        self.assertTrue((workspace/scope_evidence).is_file())
+        self.assertTrue((workspace/authority_evidence).is_file())
+        internal_root = Path(scope_evidence).parts[0]
+        self.assertTrue(internal_root.startswith('.orch-review-evidence-'))
+        self.assertEqual(Path(authority_evidence).parts[0], internal_root)
+        self.assertEqual(Path(check_evidence).parts[0], internal_root)
+        self.assertEqual(Path(check_evidence).parts[1], 'checks')
         self.assertIn('checks/check.py',prompt['support_files'])
         self.assertEqual(prompt['verification_evidence'][0]['exit_code'],0)
         self.assertEqual(prompt['scope_evidence']['status'],'NON_GIT_UNAVAILABLE')
-        self.assertEqual(prompt['scope_evidence']['evidence_file'],'verification_evidence/scope.json')
         self.assertEqual(
             prompt['check_authority_evidence']['status'], 'PASS'
-        )
-        self.assertEqual(
-            prompt['check_authority_evidence']['evidence_file'],
-            'verification_evidence/check-authority.json',
         )
         with self.orch.connect() as conn:
             snap = conn.execute(
@@ -967,6 +971,100 @@ class OrchestratorTests(unittest.TestCase):
                 canonical_json(manifest).encode('utf-8')
             ).hexdigest(),
         )
+
+    def test_review_export_internal_evidence_never_overwrites_project_path(self):
+        relative = 'verification_evidence/scope.json'
+        task = self.task('EVIDENCE-NAMESPACE', review=True)
+        task['allowed_paths'] = [relative]
+        self.load([task], revision='review-evidence-namespace')
+        claim = self.orch.claim('w')
+        project_file = self.ws / relative
+        project_file.parent.mkdir(parents=True)
+        original = b'{"project":"preserve"}\n'
+        project_file.write_bytes(original)
+        receipt = Path(claim['receipt_file'])
+        receipt.write_text(json.dumps({
+            'run_id': claim['run_id'],
+            'task_id': 'EVIDENCE-NAMESPACE',
+            'changed_paths': [relative],
+        }) + '\n', encoding='utf-8')
+        lease = self.orch.lease_from_capability(
+            claim['run_id'], Path(claim['capability_file'])
+        )
+        self.orch.submit(claim['run_id'], lease, receipt)
+        self.orch.quiesce(claim['run_id'], lease)
+        verified = self.orch.verify(claim['run_id'])
+        self.assertEqual(verified['status'], 'REVIEWING')
+
+        prepared = prepare_review(self.orch, claim['run_id'])
+        workspace = Path(prepared['workspace'])
+        prompt = json.loads(Path(prepared['prompt']).read_text())
+        exported_project_file = workspace / relative
+        self.assertEqual(exported_project_file.read_bytes(), original)
+        scope_evidence = prompt['scope_evidence']['evidence_file']
+        self.assertNotEqual(scope_evidence, relative)
+        self.assertTrue((workspace / scope_evidence).is_file())
+        self.assertTrue(
+            Path(scope_evidence).parts[0].startswith(
+                '.orch-review-evidence-'
+            )
+        )
+
+    def test_review_export_check_evidence_cannot_alias_system_evidence(self):
+        checks = [
+            {
+                'id': check_id,
+                'argv': [sys.executable, '-c', 'print("ok")'],
+                'cwd': '.',
+                'timeout_sec': 5,
+            }
+            for check_id in ('scope', 'authority')
+        ]
+        self.load(
+            [self.task('EVIDENCE-CHECK-ID', checks=checks, review=True)],
+            revision='review-evidence-check-id',
+        )
+        claim = self.orch.claim('w')
+        verified = self.write_result(claim, 'EVIDENCE-CHECK-ID')
+        self.assertEqual(verified['status'], 'REVIEWING')
+        prepared = prepare_review(self.orch, claim['run_id'])
+        prompt = json.loads(Path(prepared['prompt']).read_text())
+        workspace = Path(prepared['workspace'])
+
+        scope_path = Path(prompt['scope_evidence']['evidence_file'])
+        authority_path = Path(
+            prompt['check_authority_evidence']['evidence_file']
+        )
+        scope_payload = json.loads(
+            (workspace / scope_path).read_text(encoding='utf-8')
+        )
+        authority_payload = json.loads(
+            (workspace / authority_path).read_text(encoding='utf-8')
+        )
+        self.assertEqual(scope_path.name, 'scope.json')
+        self.assertEqual(authority_path.name, 'check-authority.json')
+        self.assertEqual(
+            scope_payload['status'], 'NON_GIT_UNAVAILABLE'
+        )
+        self.assertEqual(authority_payload['status'], 'PASS')
+
+        by_id = {
+            item['id']: item for item in prompt['verification_evidence']
+        }
+        self.assertEqual(set(by_id), {'scope', 'authority'})
+        for check_id in ('scope', 'authority'):
+            check_path = Path(by_id[check_id]['evidence_file'])
+            self.assertEqual(
+                check_path.name, f'check-result-{check_id}.json'
+            )
+            self.assertEqual(check_path.parent.name, 'checks')
+            self.assertNotIn(check_path, {scope_path, authority_path})
+            check_payload = json.loads(
+                (workspace / check_path).read_text(encoding='utf-8')
+            )
+            self.assertEqual(check_payload['id'], check_id)
+            self.assertEqual(check_payload['exit_code'], 0)
+            self.assertEqual(by_id[check_id]['exit_code'], 0)
 
     def test_review_export_rejects_workspace_drift_after_verify(self):
         self.load([self.task('T1', review=True)], revision='review-drift')
