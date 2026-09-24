@@ -1,32 +1,23 @@
 # OrchKit Documentation
 
-This directory contains the public documentation for OrchKit.
+This is the public documentation set for OrchKit. It describes the implemented workflow and its boundaries without treating internal run history as product documentation.
 
-## Available now
+## Start here
 
-- [Architecture](architecture.md) — the verified high-level system model and component boundaries.
-- [Security model](security-model.md) — what OrchKit protects, what it does not protect, and the cooperative local-control boundary.
+- [README](../README.md) — positioning, source-based Quick Start, status, and limitations.
+- [Workflow guide](workflow.md) — the operator, worker, verifier, review, approval, and publication flow.
+- [Architecture](architecture.md) — durable state and component boundaries.
+- [Security model](security-model.md) — workflow controls, trust boundaries, and what OrchKit does not protect.
+- [Roadmap](../ROADMAP.md) — work that must be completed before broader release or support claims.
 
-## Planned guides
+## Documentation standards
 
-The next documentation slices are intentionally staged rather than published all at once:
+Public documentation must:
 
-- `task-lifecycle.md` — task, attempt, verification, retry, approval, and completion states.
-- `project-setup.md` — project registration, profiles, readiness audit, and dispatcher setup.
-- `verification-and-review.md` — local verification, frozen snapshots, and optional Codex review.
-- `git-publication.md` — guarded staging, commit/push behavior, and publication reconciliation.
-- `recovery.md` — pause, abort/retry, state inspection, and uncertain-outcome recovery.
-- `state-and-backups.md` — local SQLite state, retention, backup, verification, and restore.
+- describe only implemented behavior or clearly labeled limitations;
+- distinguish local workflow controls from operating-system security boundaries;
+- keep raw task/run identifiers, device details, account metadata, private paths, logs, receipts, and generated state out of source control;
+- treat ChatGPT as the primary worker and Codex as an optional review adapter;
+- avoid promises about distributions, platforms, performance, integrations, or release dates until verified.
 
-## Documentation principles
-
-Public documentation should:
-
-- describe only behavior that is implemented and verified;
-- distinguish local workflow guarantees from cooperative security assumptions;
-- avoid machine-specific paths, device identifiers, raw run IDs, account metadata, and private evidence;
-- avoid unsupported platform, performance, integration, or security claims;
-- treat ChatGPT as the primary worker and Codex as an optional reviewer;
-- treat the local OrchKit ledger as durable workflow state rather than relying on previous chat history.
-
-See the repository [README](../README.md) for the project overview and [ROADMAP](../ROADMAP.md) for the staged public-documentation plan.
+For source changes, see [CONTRIBUTING.md](../CONTRIBUTING.md). For security-sensitive reports, see [SECURITY.md](../SECURITY.md).

@@ -1,72 +1,25 @@
-# OrchKit Public Roadmap
+# OrchKit Roadmap
 
-OrchKit's public release is being prepared in small, reviewable stages.
+OrchKit is published as an early source project. This roadmap records the public work still needed to make broader claims; it is not a delivery schedule.
 
-## Milestone 1 — Public-safe baseline
+## Current public baseline
 
-- Keep the public identity consistent as OrchKit with the `orch` CLI.
-- Keep Apache-2.0 licensing.
-- Publish only generalized documentation and public-safe examples.
-- Exclude local runtime state, receipts, logs, backups, generated prompts, build output, machine-specific paths, device identifiers, raw workflow IDs, and unrelated project references.
-- Describe the security boundary accurately: cooperative local control, not an OS sandbox.
-- Describe current validation as macOS-oriented with Python 3.9+.
+- The project is named OrchKit and exposes the `orch` command.
+- Source installation from this repository is documented.
+- The public documentation covers the workflow, architecture, and same-user security boundary.
+- Codex review is optional. The primary worker model remains a fresh ChatGPT conversation for each task or repair attempt.
+- The source is licensed under Apache-2.0.
 
-Status: in progress.
+## Before a versioned release
 
-## Milestone 2 — README v1 and project metadata
+- Select and verify a package name, distribution channel, and release artifact.
+- Define supported operating systems, Python versions, Git versions, and architectures from test evidence.
+- Establish an explicit private vulnerability-reporting channel and response process.
+- Add automated compatibility checks only after their supported environments are defined.
+- Publish upgrade and release notes only for an actual versioned release.
 
-- Refine the public README.
-- Maintain a public documentation index.
-- Publish architecture and security documentation.
-- Add the task-lifecycle guide.
-- Decide the public package name, first release version, installation method, and supported platform matrix.
-- Add repository metadata only when supported by verified project facts.
+## Product boundaries
 
-Status: in progress.
+OrchKit remains a local control plane. It does not claim to be an OS sandbox, and it does not require paid model APIs, third-party AI providers, purchased credits, or a subscription upgrade fallback. Any change to those boundaries requires separate public documentation and verification.
 
-## Milestone 3 — Guides and release workflow
-
-Planned documentation includes:
-
-- project setup and readiness audit;
-- task lifecycle and retries;
-- verification and optional model review;
-- guarded Git publication and reconciliation;
-- recovery and operator controls;
-- local state, retention, backup, and restore;
-- a public security policy;
-- a contribution guide;
-- release notes and upgrade guidance.
-
-Status: planned.
-
-## Source publication gate
-
-Implementation source should be published only after an exact clean source revision is selected and reviewed for public release.
-
-Before that step:
-
-1. Resolve local uncommitted work.
-2. Select the exact source revision.
-3. Run the verification suite against that revision.
-4. Audit the candidate tree for private or generated development material.
-5. Re-check public documentation claims against that revision.
-6. Decide the public version and distribution method.
-
-## Open decisions
-
-The following remain intentionally unresolved until verified:
-
-- first public version;
-- public Python distribution name;
-- installation channel;
-- supported macOS versions and architectures;
-- non-macOS support status;
-- minimum Git version, if required;
-- public ChatGPT/RDC prerequisite wording;
-- contribution policy;
-- security-reporting channel;
-- CI matrix;
-- authoritative release artifact.
-
-Unknowns should remain documented as unknown rather than being filled with assumptions.
+For current behavior and limitations, start with the [README](README.md), [workflow guide](docs/workflow.md), and [security model](docs/security-model.md).
