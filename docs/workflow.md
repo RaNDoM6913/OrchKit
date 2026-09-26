@@ -29,6 +29,19 @@ The OrchKit state directory contains the ledger and private operational artifact
 
 The current workflow uses a connected ChatGPT/RDC bridge for its automated worker path. The connection is an operational prerequisite, not evidence of an OS security boundary.
 
+## Bounded execution and current limits
+
+The current CLI supports scoped tasks and deterministic verification, but it does not yet encode or enforce a complete worker time/context-budget contract.
+
+- A bounded task should state one clear result, explicit allowed paths, acceptance criteria, non-goals, registered checks, and recovery behavior.
+- Context or usage telemetry must be attributed to the active worker with a source and observation time when available; missing telemetry remains `UNKNOWN`.
+- A timeout or context threshold never expires a writer reservation or proves an external/direct-RDC process has stopped.
+- Project/global pause prevents new claims; it does not suspend the current writer. Quiesce is cooperative and requires `RESULT_SUBMITTED`, so safe suspension/resumption of an incomplete attempt remains future work.
+- Dispatcher prompts and RDC markers do not by themselves prove that a fresh ordinary ChatGPT conversation was launched on the intended route. Real route evidence is a separate acceptance gate.
+- The core workflow must not silently substitute ChatGPT Work, Codex execution, paid model APIs, or external providers for the intended worker path.
+
+See the [roadmap](../ROADMAP.md) for the ordered P0 milestones.
+
 ## Review and publication
 
 Review can be disabled, risk-based, or required by policy. Codex is an optional reviewer and must not be used as a prerequisite for the core workflow.
