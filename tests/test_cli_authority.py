@@ -87,6 +87,55 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         self.assertEqual(result["error"], "state_ledger_missing_or_unsafe")
         self.assertFalse(home.exists())
 
+    def test_state_check_reports_missing_claims_without_recreating_directory(self):
+        home = self.base / "missing-claims-state-home"
+        Orchestrator(home)
+        claims = home / ".runtime" / "claims"
+        claims.rmdir()
+
+        rc, result = self.invoke("--root", str(home), "state", "check")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(claims.exists())
+        claim_path = next(
+            item for item in result["permissions"]["paths"]
+            if item["path"] == str(claims.resolve())
+        )
+        self.assertEqual(claim_path["status"], "MISSING")
+
+    def test_state_check_migrates_legacy_schema_without_recreating_claims(self):
+        home = self.base / "legacy-state-check-home"
+        Orchestrator(home)
+        claims = home / ".runtime" / "claims"
+        claims.rmdir()
+        db_path = home / ".runtime" / "orch.sqlite3"
+        with sqlite3.connect(str(db_path)) as db:
+            db.execute("DROP TABLE runs")
+            db.execute(
+                "CREATE TABLE runs ("
+                "run_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, "
+                "attempt INTEGER NOT NULL, worker_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, lease_token TEXT NOT NULL, "
+                "started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, "
+                "submitted_at TEXT, snapshot_id TEXT, receipt_json TEXT, "
+                "verify_status TEXT, review_status TEXT, feedback_json TEXT, "
+                "completed_at TEXT, error TEXT)"
+            )
+            db.execute("PRAGMA user_version=3")
+
+        rc, result = self.invoke("--root", str(home), "state", "check")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["schema_version"], 4)
+        self.assertFalse(claims.exists())
+        with sqlite3.connect(str(db_path)) as db:
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(runs)")
+            }
+        self.assertIn("claim_git_head", columns)
+
     def test_init_refuses_existing_registry_without_ledger(self):
         home = self.base / "registry-init-refusal"
         repo = self.make_repo("registry-init-refusal-repo")
@@ -125,6 +174,51 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         projects = ProjectRegistry(home).list()
         self.assertEqual(len(projects), 1)
         self.assertEqual(projects[0]["project_id"], existing["project_id"])
+
+    def test_project_list_marks_mismatched_config_identity_unsafe(self):
+        home = self.base / "registry-list-identity"
+        repo = self.make_repo("registry-list-repo")
+        registered = ProjectRegistry(home).add(
+            repo, profile="standard", review_mode="off"
+        )
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        altered = json.loads(config_path.read_text(encoding="utf-8"))
+        altered["project_id"] = "spoofed-project"
+        config_path.write_text(json.dumps(altered) + "\n", encoding="utf-8")
+
+        rc, result = self.invoke("--root", str(home), "project", "list")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["projects"], [{
+            "project_id": project_id,
+            "status": "UNSAFE",
+        }])
+
+    def test_project_add_refuses_mismatched_existing_registry_identity(self):
+        home = self.base / "registry-add-identity"
+        registry = ProjectRegistry(home)
+        first_repo = self.make_repo("registry-add-first")
+        second_repo = self.make_repo("registry-add-second")
+        registered = registry.add(
+            first_repo, profile="standard", review_mode="off"
+        )
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        altered = json.loads(config_path.read_text(encoding="utf-8"))
+        altered["project_id"] = "spoofed-project"
+        config_path.write_text(json.dumps(altered) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "project_registry_invalid:" + project_id
+        ):
+            registry.add(
+                second_repo, profile="standard", review_mode="off"
+            )
+        self.assertEqual(
+            sorted(path.name for path in (home / "projects").iterdir()),
+            [f"{project_id}.json"],
+        )
 
     def test_queue_enqueue_registry_without_ledger_does_not_create_runtime(self):
         home = self.base / "registry-only-home"

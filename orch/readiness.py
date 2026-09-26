@@ -13,20 +13,23 @@ from .core import (STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
 from .git_policy import evaluate_project_git_policy
 from .dispatcher import RDC_MARKER_MAX_BYTES, validate_rdc_marker
 from .project import (PROFILE_DEFAULTS, PROJECT_CONFIG_MAX_BYTES,
-                      inspect_project)
+                      inspect_project, project_root_identity_matches,
+                      validate_project_schema)
 from .review_policy import normalize_review_policy
 
 
 _TERMINAL_TASK_STATES = {"DONE", "CANCELLED"}
 _EXPECTED_PRIVATE_PATHS = (
-    (".runtime", 0o700, True),
-    (".runtime/logs", 0o700, True),
-    (".runtime/worker_receipts", 0o700, True),
-    (".runtime/claims", 0o700, True),
-    (".runtime/review_exports", 0o700, True),
-    (".runtime/git-hooks-disabled", 0o700, True),
-    (".runtime/orch.sqlite3", 0o600, True),
-    ("projects", 0o700, True),
+    (".runtime", 0o700, True, "directory"),
+    (".runtime/logs", 0o700, True, "directory"),
+    (".runtime/worker_receipts", 0o700, True, "directory"),
+    (".runtime/claims", 0o700, True, "directory"),
+    (".runtime/review_exports", 0o700, True, "directory"),
+    (".runtime/git-hooks-disabled", 0o700, True, "directory"),
+    (".runtime/orch.sqlite3", 0o600, True, "file"),
+    (".runtime/orch.sqlite3-wal", 0o600, False, "file"),
+    (".runtime/orch.sqlite3-shm", 0o600, False, "file"),
+    ("projects", 0o700, True, "directory"),
 )
 
 
@@ -73,6 +76,10 @@ def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
             raise ValueError(
                 f"project_registry_unreadable:{path.stem}"
             ) from exc
+        try:
+            validate_project_schema(item)
+        except ValueError as exc:
+            raise ValueError(f"project_registry_invalid:{path.stem}") from exc
         root = item.get("root")
         if (
             not isinstance(item.get("project_id"), str)
@@ -91,6 +98,16 @@ def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
     config = selected["config"]
     if config.get("project_id") != project_id:
         raise ValueError("project_config_identity_mismatch")
+    for item in configs:
+        if item["path"] != target and item["meta"]["mode"] != 0o600:
+            raise ValueError(f"project_registry_permission:{item['path'].stem}")
+        if item["config"]["project_id"] != item["path"].stem:
+            raise ValueError(f"project_registry_invalid:{item['path'].stem}")
+        if item["path"] != target:
+            foreign_root = Path(item["config"]["root"]).expanduser()
+            if (not foreign_root.is_absolute()
+                    or not project_root_identity_matches(item["path"].stem, foreign_root)):
+                raise ValueError(f"project_registry_invalid:{item['path'].stem}")
 
     root = Path(config.get("root", "")).expanduser()
     if not root.is_absolute():
@@ -114,8 +131,16 @@ def _registry_snapshot(home: Path, project_id: str) -> Dict[str, Any]:
 
 def _permission_findings(home: Path) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
-    for relative, expected, required in _EXPECTED_PRIVATE_PATHS:
+    for relative, expected, required, kind in _EXPECTED_PRIVATE_PATHS:
         path = home / relative
+        if path.is_symlink():
+            findings.append(_finding(
+                "state_permission",
+                "BLOCKED",
+                {"path": str(path), "reason": "unsafe_symlink"},
+                severity="blocker",
+            ))
+            continue
         if not path.exists():
             if required:
                 findings.append(_finding(
@@ -129,15 +154,26 @@ def _permission_findings(home: Path) -> List[Dict[str, Any]]:
                     severity="blocker",
                 ))
             continue
-        if path.is_symlink():
+        actual = path.stat().st_mode & 0o777
+        if kind == "directory" and not path.is_dir():
+            wrong_type = "not_directory"
+        elif kind == "file" and not path.is_file():
+            wrong_type = "not_file"
+        else:
+            wrong_type = None
+        if wrong_type is not None:
             findings.append(_finding(
                 "state_permission",
                 "BLOCKED",
-                {"path": str(path), "reason": "unsafe_symlink"},
+                {
+                    "path": str(path),
+                    "reason": wrong_type,
+                    "expected_mode": oct(expected),
+                    "actual_mode": oct(actual),
+                },
                 severity="blocker",
             ))
             continue
-        actual = path.stat().st_mode & 0o777
         if actual != expected:
             findings.append(_finding(
                 "state_permission",
@@ -156,7 +192,7 @@ def _permission_findings(home: Path) -> List[Dict[str, Any]]:
 def _open_ledger_read_only(db_path: Path) -> sqlite3.Connection:
     if db_path.is_symlink() or not db_path.is_file():
         raise ValueError("state_ledger_missing_or_unsafe")
-    uri = "file:" + str(db_path.resolve()) + "?mode=ro"
+    uri = db_path.resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import tempfile
 import unittest
 from unittest import mock
@@ -65,12 +66,66 @@ class PlanAdmissionTests(unittest.TestCase):
         self.assertEqual(loaded["plan_bytes"], len(raw))
         self.assertEqual(loaded["digest"], hashlib.sha256(raw).hexdigest())
 
+    def test_review_policy_rejects_string_values_before_admission(self):
+        malformed = (
+            ("risk_tags", "security"),
+            ("trigger_tags", "security"),
+            ("sensitive_patterns", "security/**"),
+            ("review_on_retry", ""),
+        )
+        for index, (field, value) in enumerate(malformed):
+            with self.subTest(field=field):
+                task = self.task(f"BAD-REVIEW-{index}")
+                task["review"] = {
+                    "mode": "risk_based",
+                    "reviewer": "codex",
+                    field: value,
+                }
+                path, _ = self.write_plan(
+                    self.plan(
+                        tasks=[task], revision=f"bad-review-{index}"
+                    ),
+                    name=f"bad-review-{index}.json",
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "invalid_review_" + field
+                ):
+                    self.orch.load_plan(path)
+                self.assert_no_tasks()
+
     def test_symlink_plan_is_rejected_without_state(self):
         target, _ = self.write_plan(self.plan(), name="target.json")
         link = self.base / "plan-link.json"
         link.symlink_to(target)
         with self.assertRaisesRegex(ValueError, "plan_file_missing_or_unsafe"):
             self.orch.load_plan(link)
+        self.assert_no_tasks()
+
+    def test_plan_and_hash_fifo_fail_closed_without_blocking(self):
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO nonblocking open unavailable")
+        fifo = self.base / "authority.fifo"
+        os.mkfifo(fifo)
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError("fifo_open_blocked")
+
+        previous = signal.signal(signal.SIGALRM, timeout_handler)
+        try:
+            signal.alarm(2)
+            with self.assertRaisesRegex(
+                ValueError, "plan_file_missing_or_unsafe"
+            ):
+                self.orch.load_plan(fifo)
+            signal.alarm(0)
+
+            signal.alarm(2)
+            with self.assertRaisesRegex(ValueError, "hash_file_unsafe"):
+                sha256_file(fifo)
+            signal.alarm(0)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
         self.assert_no_tasks()
 
     def test_plan_artifact_symlink_is_never_followed_or_replaced(self):

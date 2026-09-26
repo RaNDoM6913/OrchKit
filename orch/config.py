@@ -33,6 +33,18 @@ def ensure_private_file(path: Path) -> Path:
         os.chmod(target, 0o600)
     return target
 
+
+def regular_file_read_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return flags
+
+
 def read_bounded_regular_file(
     path: Path,
     *,
@@ -42,12 +54,8 @@ def read_bounded_regular_file(
     repair_mode: int | None = None,
 ):
     target = Path(os.path.abspath(os.path.expanduser(str(path))))
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif target.is_symlink():
+    flags = regular_file_read_flags()
+    if not hasattr(os, "O_NOFOLLOW") and target.is_symlink():
         raise ValueError(unsafe_error)
     try:
         fd = os.open(str(target), flags)

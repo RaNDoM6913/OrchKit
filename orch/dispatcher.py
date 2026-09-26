@@ -102,7 +102,7 @@ def render_dispatcher(
     if project_id is not None:
         if re.fullmatch(r"[a-z0-9._-]+", project_id) is None:
             raise ValueError("invalid_project_id")
-        ProjectRegistry(resolved_home).get(project_id)
+        ProjectRegistry.open_readonly(resolved_home).get(project_id)
         worker_id = f"scheduled-variant-b-{project_id}"
         project_arg = " --project " + shlex.quote(project_id)
         scope_boundary = (

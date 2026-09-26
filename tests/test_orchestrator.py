@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -726,6 +728,33 @@ class OrchestratorTests(unittest.TestCase):
             self.orch.submit(claim["run_id"], lease, receipt)
         self.assertTrue(receipt.is_symlink())
 
+    def test_submit_rejects_fifo_receipt_without_blocking(self):
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO nonblocking open unavailable")
+        self.load([self.task("RECEIPT-FIFO")], revision="receipt-fifo")
+        claim = self.orch.claim("worker")
+        receipt = Path(claim["receipt_file"])
+        os.mkfifo(receipt)
+        lease = self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError("fifo_open_blocked")
+
+        previous = signal.signal(signal.SIGALRM, timeout_handler)
+        try:
+            signal.alarm(2)
+            with self.assertRaisesRegex(
+                ValueError, "receipt_file_missing_or_unsafe"
+            ):
+                self.orch.submit(claim["run_id"], lease, receipt)
+            signal.alarm(0)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertTrue(receipt.exists())
+
     def test_submit_rejects_oversized_receipt(self):
         self.load([self.task("RECEIPT-BIG")], revision="receipt-big")
         claim = self.orch.claim("worker")
@@ -1316,6 +1345,113 @@ class OrchestratorTests(unittest.TestCase):
         result = self.write_result(claim, 'T1')
         self.assertEqual(result['status'], 'BLOCKED')
         self.assertEqual(result['reason'], 'snapshot_stale:T1.json')
+
+    def test_verifier_rejects_dangling_symlink_in_declared_output(self):
+        self.load([self.task('T1')], revision='dangling-output-symlink')
+        claim = self.orch.claim('w')
+        (self.ws / 'T1.json').symlink_to(self.ws / 'missing-output.json')
+        receipt = Path(claim['receipt_file'])
+        receipt.write_text(json.dumps({
+            'run_id': claim['run_id'],
+            'task_id': 'T1',
+            'changed_paths': ['T1.json'],
+        }) + '\n', encoding='utf-8')
+        lease = self.orch.lease_from_capability(
+            claim['run_id'], Path(claim['capability_file'])
+        )
+        self.orch.submit(claim['run_id'], lease, receipt)
+        self.orch.quiesce(claim['run_id'], lease)
+
+        result = self.orch.verify(claim['run_id'])
+
+        self.assertEqual(result['status'], 'BLOCKED')
+        self.assertEqual(result['reason'], 'symlink_not_allowed:T1.json')
+
+    def test_completion_rejects_dangling_symlink_after_verified_deletion(self):
+        output = self.ws / 'T1.json'
+        output.write_text('{"value": 1}\n', encoding='utf-8')
+        self.load([self.task('T1')], revision='dangling-after-deletion')
+        claim = self.orch.claim('w')
+        output.unlink()
+        receipt = Path(claim['receipt_file'])
+        receipt.write_text(json.dumps({
+            'run_id': claim['run_id'],
+            'task_id': 'T1',
+            'changed_paths': ['T1.json'],
+        }) + '\n', encoding='utf-8')
+        lease = self.orch.lease_from_capability(
+            claim['run_id'], Path(claim['capability_file'])
+        )
+        self.orch.submit(claim['run_id'], lease, receipt)
+        self.orch.quiesce(claim['run_id'], lease)
+        self.assertEqual(self.orch.verify(claim['run_id'])['status'], 'VERIFIED')
+        output.symlink_to(self.ws / 'missing-output.json')
+
+        with self.assertRaisesRegex(ValueError, 'snapshot_stale:T1.json'):
+            self.orch.complete(claim['run_id'])
+
+    def test_verifier_rejects_dangling_ancestor_symlink_in_declared_output(self):
+        task = self.task('T1')
+        task['allowed_paths'] = ['outputs/']
+        self.load([task], revision='dangling-output-ancestor-symlink')
+        claim = self.orch.claim('w')
+        (self.ws / 'outputs').symlink_to(
+            self.ws / 'missing-output-dir', target_is_directory=True
+        )
+        receipt = Path(claim['receipt_file'])
+        receipt.write_text(json.dumps({
+            'run_id': claim['run_id'],
+            'task_id': 'T1',
+            'changed_paths': ['outputs/T1.json'],
+        }) + '\n', encoding='utf-8')
+        lease = self.orch.lease_from_capability(
+            claim['run_id'], Path(claim['capability_file'])
+        )
+        self.orch.submit(claim['run_id'], lease, receipt)
+        self.orch.quiesce(claim['run_id'], lease)
+
+        result = self.orch.verify(claim['run_id'])
+
+        self.assertEqual(result['status'], 'BLOCKED')
+        self.assertEqual(
+            result['reason'], 'symlink_not_allowed:outputs/T1.json'
+        )
+
+    def test_completion_rejects_dangling_ancestor_symlink_after_deletion(self):
+        output = self.ws / 'outputs' / 'T1.json'
+        output.parent.mkdir()
+        output.write_text('{"value": 1}\n', encoding='utf-8')
+        task = self.task('T1')
+        task['allowed_paths'] = ['outputs/']
+        self.load([task], revision='dangling-after-ancestor-deletion')
+        claim = self.orch.claim('w')
+        output.unlink()
+        receipt = Path(claim['receipt_file'])
+        receipt.write_text(json.dumps({
+            'run_id': claim['run_id'],
+            'task_id': 'T1',
+            'changed_paths': ['outputs/T1.json'],
+        }) + '\n', encoding='utf-8')
+        lease = self.orch.lease_from_capability(
+            claim['run_id'], Path(claim['capability_file'])
+        )
+        self.orch.submit(claim['run_id'], lease, receipt)
+        self.orch.quiesce(claim['run_id'], lease)
+        self.assertEqual(self.orch.verify(claim['run_id'])['status'], 'VERIFIED')
+        output.parent.rmdir()
+        output.parent.symlink_to(
+            self.ws / 'missing-output-dir', target_is_directory=True
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, 'snapshot_stale:outputs/T1.json'
+        ):
+            self.orch.complete(claim['run_id'])
+        with self.orch.connect() as conn:
+            state = conn.execute(
+                'SELECT state FROM runs WHERE run_id=?', (claim['run_id'],)
+            ).fetchone()['state']
+        self.assertEqual(state, 'VERIFIED')
 
     def test_dependency_cycle_is_rejected_at_plan_load(self):
         one=self.task('T1',deps=['T2']); two=self.task('T2',deps=['T1'])

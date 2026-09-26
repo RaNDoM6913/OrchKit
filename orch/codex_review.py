@@ -13,7 +13,8 @@ import time
 from typing import Any, Dict, Optional
 
 from .config import (atomic_write_bytes, atomic_write_json,
-                     ensure_private_dir, read_bounded_regular_file)
+                     ensure_private_dir, read_bounded_regular_file,
+                     regular_file_read_flags)
 from .core import (VERIFICATION_EVIDENCE_MAX_BYTES, Orchestrator,
                    safe_workspace_path, sha256_bytes, utc_now)
 
@@ -87,12 +88,8 @@ def _copy_bound_review_file(
         or any(char not in "0123456789abcdef" for char in expected_sha256)
     ):
         raise ValueError(error_prefix + "_binding_invalid:" + relative)
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif source.is_symlink():
+    flags = regular_file_read_flags()
+    if not hasattr(os, "O_NOFOLLOW") and source.is_symlink():
         raise ValueError(error_prefix + ":" + relative)
     try:
         fd = os.open(str(source), flags)
