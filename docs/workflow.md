@@ -31,9 +31,10 @@ The current workflow uses a connected ChatGPT/RDC bridge for its automated worke
 
 ## Bounded execution and current limits
 
-The current CLI supports scoped tasks and deterministic verification, but it does not yet encode or enforce a complete worker time/context-budget contract.
+The current CLI admits and displays a versioned bounded-execution contract, but its time/context budget remains advisory and does not enforce worker suspension or termination.
 
-- A bounded task should state one clear result, explicit allowed paths, acceptance criteria, non-goals, registered checks, and recovery behavior.
+- A bounded task records one clear goal, explicit allowed paths, acceptance criteria, non-goals, registered checks, and recovery metadata. Generated tasks receive conservative defaults, while admitted legacy plans remain compatible.
+- `orch queue list` exposes a bounded operator-facing summary before claim: goal, acceptance, non-goals, allowed paths, advisory execution budget, and each check's timeout, output-tail bound, and timeout action. Executable bindings and check-authority evidence are not included in that summary.
 - Context or usage telemetry must be attributed to the active worker with a source and observation time when available; missing telemetry remains `UNKNOWN`.
 - A timeout or context threshold never expires a writer reservation or proves an external/direct-RDC process has stopped.
 - Project/global pause prevents new claims; it does not suspend the current writer. Quiesce is cooperative and requires `RESULT_SUBMITTED`, so safe suspension/resumption of an incomplete attempt remains future work.
