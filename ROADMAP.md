@@ -14,9 +14,9 @@ OrchKit is published as an early source project. This roadmap records the public
 
 The next capability work is intentionally split into small, dependency-ordered milestones. The runtime/test hardening already integrated on `main` is the baseline; this section describes what is still planned.
 
-1. **Plan admission budgets and visible CLI.** Admit and display a bounded execution contract with acceptance criteria, non-goals, owned paths, check deadlines/output bounds, and explicit context/usage provenance or `UNKNOWN`. Failed admission must create no run/capability side effects.
-2. **Checkpoint/pause recovery with writer/process safety.** Preserve incomplete work without releasing an uncertain writer. Timeouts or missing telemetry must not expire leases. Recovery must remain visibly blocked when process inactivity cannot be proven.
-3. **Ordinary Chat/RDC route acceptance.** Demonstrate a real fresh ordinary ChatGPT conversation executing a bounded task through RDC with review off, deterministic local verification, truthful route/usage evidence, and no Work/Codex/API fallback.
+1. **P0-1 — complete: plan admission budgets and visible CLI.** The runtime admits a versioned advisory execution-budget contract, preserves legacy plans, generates bounded defaults, records acceptance/non-goals and per-check deadline/output/recovery metadata, and exposes a safe contract summary through `orch queue list` before claim. Invalid contracts fail before task admission.
+2. **P0-2 — next: checkpoint/pause recovery with writer/process safety.** Preserve incomplete work without releasing an uncertain writer. Timeouts or missing telemetry must not expire leases. Recovery must remain visibly blocked when process inactivity cannot be proven.
+3. **P0-3: ordinary Chat/RDC route acceptance.** Demonstrate a real fresh ordinary ChatGPT conversation executing a bounded task through RDC with review off, deterministic local verification, truthful route/usage evidence, and no Work/Codex/API fallback.
 
 Current dispatcher and RDC support are useful building blocks, but they do not by themselves prove ordinary-Chat creation/continuation. Safe suspension/resumption of an incomplete attempt is also not yet an implemented guarantee.
 
