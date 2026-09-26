@@ -1,7 +1,7 @@
 # ORCH working rules
 
 - This project is independent from `<protected-project>`. Never modify that project unless <separately-authorized-integration> receives a separate explicit approval.
-- Primary worker target is a fresh ordinary ChatGPT conversation using the connected RDC path. Actual ordinary-Chat launch/continuation acceptance is still pending; dispatcher templates do not prove it. Codex is an optional review-only adapter selected by explicit policy; ORCH must work with review mode off. Never silently fall back to ChatGPT Work, Codex execution, paid model APIs, external AI providers, purchased credits, or subscription upgrades.
+- Primary worker target is a fresh ordinary ChatGPT conversation using the connected RDC path. A disposable end-to-end ordinary-Chat/RDC acceptance trace has completed; route evidence remains per-run observation and must not be treated as self-certifying future launches. Codex is an optional review-only adapter selected by explicit policy; ORCH must work with review mode off. Never silently fall back to ChatGPT Work, Codex execution, paid model APIs, external AI providers, purchased credits, or subscription upgrades.
 - Variant B is authoritative: each task/repair attempt runs in a new ChatGPT conversation. Durable context and feedback come from the local ledger, not prior chat history.
 - One active writer run. Never expire a lease by time alone. `RESULT_SUBMITTED` is not completion.
 - Use task `allowed_paths`; protect recorded sentinel hashes; verifier checks actual bytes and registered commands.
@@ -13,7 +13,7 @@
 
 ## Immediate P0: bounded execution
 
-- Prioritize a visible bounded-task admission contract first, then checkpoint/pause recovery with writer/process safety, then actual ordinary-Chat/RDC route acceptance.
+- The immediate P0 sequence is complete: bounded-task admission, cooperative checkpoint/recovery with writer/process safety, and actual ordinary-Chat/RDC route acceptance. Preserve these boundaries before adding broader automation.
 - Treat time and context budgets as planning and recovery inputs, never as lease expiry, proof of process inactivity, or permission to skip verification.
 - Record worker context telemetry with its source and observation time when available; otherwise report `UNKNOWN` rather than inventing a count.
 - Current pause behavior blocks new claims only. A `RUNNING` attempt may persist a durable checkpoint without releasing its writer reservation/capability; recovery must stay blocked while external process activity is unknown. Releasing a checkpointed attempt requires explicit independent process-inactivity confirmation, recorded as an operator assertion rather than OS/process fencing. Quiesce still requires `RESULT_SUBMITTED`; automatic fencing and transparent cross-conversation resume of the same `RUNNING` attempt are not implemented.
