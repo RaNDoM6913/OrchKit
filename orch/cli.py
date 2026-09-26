@@ -170,6 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True); claim.add_argument("--project")
     context = sub.add_parser("context"); context.add_argument("--run-id", required=True)
     heartbeat = sub.add_parser("heartbeat"); heartbeat.add_argument("--run-id", required=True); heartbeat.add_argument("--lease"); heartbeat.add_argument("--cap")
+    checkpoint = sub.add_parser("checkpoint")
+    checkpoint.add_argument("--run-id", required=True)
+    checkpoint.add_argument("--reason", required=True)
+    checkpoint.add_argument("--process-state", choices=["active", "unknown"], default="unknown")
+    checkpoint.add_argument("--lease")
+    checkpoint.add_argument("--cap")
     submit = sub.add_parser("submit"); submit.add_argument("--run-id", required=True); submit.add_argument("--lease"); submit.add_argument("--cap"); submit.add_argument("--receipt", required=True)
     quiesce = sub.add_parser("quiesce"); quiesce.add_argument("--run-id", required=True); quiesce.add_argument("--lease"); quiesce.add_argument("--cap")
     verify = sub.add_parser("verify"); verify.add_argument("--run-id", required=True)
@@ -611,6 +617,13 @@ def main(argv=None) -> int:
         elif args.command == "heartbeat":
             lease = args.lease or orch.lease_from_capability(args.run_id, Path(args.cap).expanduser())
             result = orch.heartbeat(args.run_id, lease)
+        elif args.command == "checkpoint":
+            lease = args.lease or orch.lease_from_capability(
+                args.run_id, Path(args.cap).expanduser()
+            )
+            result = orch.checkpoint(
+                args.run_id, lease, args.reason, args.process_state
+            )
         elif args.command == "submit":
             lease = args.lease or orch.lease_from_capability(args.run_id, Path(args.cap).expanduser())
             result = orch.submit(args.run_id, lease, Path(args.receipt).expanduser())

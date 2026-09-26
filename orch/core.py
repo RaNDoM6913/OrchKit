@@ -1658,6 +1658,71 @@ class Orchestrator:
             conn.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", (now, run_id))
             return {"status": "OK", "heartbeat_at": now}
 
+    def checkpoint(
+        self, run_id: str, lease_token: str, reason: str,
+        process_state: str = "unknown",
+    ) -> Dict[str, Any]:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("checkpoint_reason_required")
+        if process_state not in {"active", "unknown"}:
+            raise ValueError("invalid_checkpoint_process_state")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT task_id,state,lease_token FROM runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not row or not secrets.compare_digest(row["lease_token"], lease_token):
+                conn.execute("ROLLBACK")
+                raise ValueError("invalid_lease")
+            if row["state"] != "RUNNING":
+                conn.execute("ROLLBACK")
+                raise ValueError("run_not_running")
+            recorded_at = utc_now()
+            details = {
+                "run_id": run_id,
+                "task_id": row["task_id"],
+                "reason": reason.strip()[:500],
+                "process_state": process_state,
+                "recorded_at": recorded_at,
+                "writer_reservation_released": False,
+                "capability_revoked": False,
+                "safe_to_resume_elsewhere": False,
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key,value_json,updated_at) VALUES(?,?,?)",
+                (
+                    f"run_checkpoint:{run_id}",
+                    canonical_json(details),
+                    recorded_at,
+                ),
+            )
+            conn.execute(
+                "UPDATE runs SET heartbeat_at=? WHERE run_id=?",
+                (recorded_at, run_id),
+            )
+            self._event(
+                conn, "WORKER_CHECKPOINT_RECORDED",
+                task_id=row["task_id"], run_id=run_id,
+                payload={
+                    "reason": details["reason"],
+                    "process_state": process_state,
+                    "writer_reservation_released": False,
+                    "capability_revoked": False,
+                    "safe_to_resume_elsewhere": False,
+                },
+            )
+            conn.execute("COMMIT")
+        return {
+            "status": "CHECKPOINTED",
+            "run_id": run_id,
+            "details": details,
+            "rule": (
+                "Checkpoint persistence does not suspend or terminate the worker, "
+                "release the writer reservation, revoke capability, or prove process inactivity."
+            ),
+        }
+
     def submit(self, run_id: str, lease_token: str, receipt_path: Path) -> Dict[str, Any]:
         receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
             run_id, receipt_path
