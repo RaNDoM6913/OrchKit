@@ -248,17 +248,35 @@ def recovery_inspect(
             except (TypeError, json.JSONDecodeError):
                 checkpoints[checkpoint_run_id] = {"status": "INVALID"}
                 continue
+            reason = (
+                checkpoint_value.get("reason")
+                if isinstance(checkpoint_value, dict) else None
+            )
+            process_state = (
+                checkpoint_value.get("process_state")
+                if isinstance(checkpoint_value, dict) else None
+            )
+            recorded_at = (
+                checkpoint_value.get("recorded_at")
+                if isinstance(checkpoint_value, dict) else None
+            )
             if (
                 not isinstance(checkpoint_value, dict)
                 or checkpoint_value.get("run_id") != checkpoint_run_id
+                or not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason) > 500
+                or process_state not in {"active", "unknown"}
+                or not isinstance(recorded_at, str)
+                or not recorded_at
             ):
                 checkpoints[checkpoint_run_id] = {"status": "INVALID"}
                 continue
             checkpoints[checkpoint_run_id] = {
                 "status": "RECORDED",
-                "reason": checkpoint_value.get("reason"),
-                "process_state": checkpoint_value.get("process_state"),
-                "recorded_at": checkpoint_value.get("recorded_at"),
+                "reason": reason,
+                "process_state": process_state,
+                "recorded_at": recorded_at,
                 "writer_reservation_released": False,
                 "capability_revoked": False,
                 "safe_to_resume_elsewhere": False,

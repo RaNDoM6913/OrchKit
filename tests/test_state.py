@@ -250,6 +250,38 @@ class StateMaintenanceTests(unittest.TestCase):
             next(iter(locks.values()))["run_id"], claim["run_id"]
         )
 
+    def test_recovery_inspect_tampered_checkpoint_fails_closed(self):
+        self._load_recovery_task("RECOVERY-CHECKPOINT-TAMPER")
+        claim = self.orch.claim("worker")
+        tampered = {
+            "run_id": claim["run_id"],
+            "reason": {"private": "do-not-echo"},
+            "process_state": "stopped",
+            "recorded_at": 123,
+            "unexpected": "sensitive-marker",
+        }
+        with self.orch.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key,value_json,updated_at) "
+                "VALUES(?,?,?)",
+                (
+                    f"run_checkpoint:{claim['run_id']}",
+                    json.dumps(tampered),
+                    "2026-09-26T00:00:00+00:00",
+                ),
+            )
+
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        item = result["items"][0]
+        self.assertEqual(
+            item["classification"], "CHECKPOINTED_PROCESS_STATE_UNKNOWN"
+        )
+        self.assertEqual(item["checkpoint"], {"status": "INVALID"})
+        rendered = json.dumps(result)
+        self.assertNotIn("do-not-echo", rendered)
+        self.assertNotIn("sensitive-marker", rendered)
+        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
+
     def test_recovery_inspect_tracks_submit_quiesce_and_verify_stages(self):
         workspace = self._load_recovery_task("RECOVERY-STAGES")
         claim = self.orch.claim("worker")
