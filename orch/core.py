@@ -3355,19 +3355,70 @@ class Orchestrator:
             self._event(conn, "RESUMED")
         return {"status":"RESUMED"}
 
-    def abort(self, run_id: str, reason: str, retry: bool=False) -> Dict[str, Any]:
+    def abort(
+        self, run_id: str, reason: str, retry: bool = False,
+        process_inactivity_confirmed: bool = False,
+    ) -> Dict[str, Any]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            run=conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
             if not run or run["state"] not in ACTIVE_RUN_STATES:
-                conn.execute("ROLLBACK"); raise ValueError("run_not_active")
-            now=utc_now(); state="NEEDS_FIX" if retry else "BLOCKED"
-            conn.execute("UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?", (reason[:1000],now,run_id))
-            conn.execute("UPDATE tasks SET status=?,updated_at=? WHERE task_id=?", (state,now,run["task_id"]))
-            self._event(conn, "RUN_ABORTED", task_id=run["task_id"], run_id=run_id, payload={"reason":reason[:500],"retry":retry})
+                conn.execute("ROLLBACK")
+                raise ValueError("run_not_active")
+            checkpoint = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (f"run_checkpoint:{run_id}",),
+            ).fetchone()
+            if (
+                run["state"] == "RUNNING"
+                and checkpoint is not None
+                and not process_inactivity_confirmed
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("process_inactivity_confirmation_required")
+            now = utc_now()
+            state = "NEEDS_FIX" if retry else "BLOCKED"
+            conn.execute(
+                "UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?",
+                (reason[:1000], now, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
+                (state, now, run["task_id"]),
+            )
+            payload = {
+                "reason": reason[:500],
+                "retry": retry,
+                "checkpoint_present": checkpoint is not None,
+                "process_inactivity_confirmation": (
+                    "operator_asserted"
+                    if checkpoint is not None and process_inactivity_confirmed
+                    else None
+                ),
+                "process_fencing": False,
+            }
+            self._event(
+                conn, "RUN_ABORTED", task_id=run["task_id"],
+                run_id=run_id, payload=payload,
+            )
             conn.execute("COMMIT")
         self._revoke_capability(run_id)
-        return {"status":"ABORTED", "run_id":run_id, "task_status":state}
+        return {
+            "status": "ABORTED",
+            "run_id": run_id,
+            "task_status": state,
+            "checkpoint_present": checkpoint is not None,
+            "process_inactivity_confirmation": payload[
+                "process_inactivity_confirmation"
+            ],
+            "process_fencing": False,
+            "rule": (
+                "Process inactivity confirmation is an operator assertion; "
+                "it is not OS/process fencing."
+            ),
+        }
 
     def next_work(self, project_id: Optional[str] = None) -> Dict[str, Any]:
         if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:

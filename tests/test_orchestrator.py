@@ -1021,6 +1021,48 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.orch.resume()['status'],'RESUMED')
         self.assertEqual(self.orch.claim('w')['status'],'CLAIMED')
 
+    def test_checkpointed_abort_requires_process_inactivity_confirmation(self):
+        self.load([self.task("CHECKPOINT-ABORT")], revision="checkpoint-abort")
+        first = self.orch.claim("worker-one")
+        cap = Path(first["capability_file"])
+        lease = self.orch.lease_from_capability(first["run_id"], cap)
+        self.orch.checkpoint(
+            first["run_id"], lease, "worker handoff requested", "unknown"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "process_inactivity_confirmation_required"
+        ):
+            self.orch.abort(
+                first["run_id"], "handoff", retry=True
+            )
+        self.assertTrue(cap.is_file())
+        with self.orch.connect() as conn:
+            run = conn.execute(
+                "SELECT state FROM runs WHERE run_id=?", (first["run_id"],)
+            ).fetchone()
+            locks = self.orch._active_writer_locks(conn)
+        self.assertEqual(run["state"], "RUNNING")
+        self.assertEqual(
+            next(iter(locks.values()))["run_id"], first["run_id"]
+        )
+
+        aborted = self.orch.abort(
+            first["run_id"], "external process independently confirmed stopped",
+            retry=True, process_inactivity_confirmed=True,
+        )
+        self.assertEqual(aborted["status"], "ABORTED")
+        self.assertEqual(aborted["task_status"], "NEEDS_FIX")
+        self.assertTrue(aborted["checkpoint_present"])
+        self.assertEqual(
+            aborted["process_inactivity_confirmation"], "operator_asserted"
+        )
+        self.assertFalse(aborted["process_fencing"])
+        self.assertFalse(cap.exists())
+        second = self.orch.claim("worker-two")
+        self.assertEqual(second["status"], "CLAIMED")
+        self.assertEqual(second["attempt"], 2)
+
     def test_abort_retry_releases_writer_and_creates_new_attempt(self):
         self.load([self.task('T1')])
         first=self.orch.claim('w1')
