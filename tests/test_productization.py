@@ -697,6 +697,110 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(conflict["error"], "plan_artifact_conflict")
         self.assertEqual(plan1.read_text(), original)
 
+    def test_queue_list_exposes_bounded_contract_without_check_authority_details(self):
+        orch = Orchestrator(self.home)
+        budget = {
+            "schema_version": 1,
+            "enforcement": "advisory",
+            "estimated_work_minutes": {"min": 10, "max": 20},
+            "context_budget_tokens": None,
+            "capacity_source": "UNKNOWN",
+            "usage_source": "UNKNOWN",
+            "observed_at": "UNKNOWN",
+            "checkpoint_action": "Persist a checkpoint before handoff.",
+        }
+        current = {
+            "id": "READBACK-CURRENT",
+            "goal": "produce a bounded result",
+            "acceptance": ["result is verified"],
+            "non_goals": ["no publication"],
+            "workspace": str(self.repo),
+            "dependencies": [],
+            "allowed_paths": ["result.json"],
+            "protected_paths": {},
+            "checks": [{
+                "id": "bounded-check",
+                "argv": ["/usr/bin/true"],
+                "cwd": ".",
+                "timeout_sec": 7,
+                "output_tail_chars": 64,
+                "timeout_action": "needs_fix",
+            }],
+            "required_review": False,
+            "owner_acceptance": False,
+            "publication": {"kind": "none"},
+            "max_attempts": 2,
+            "execution_budget": budget,
+        }
+        current_path = self.home / "contract-readback.json"
+        current_path.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "contract-readback",
+            "tasks": [current],
+        }))
+        orch.load_plan(current_path)
+
+        legacy = {
+            "id": "READBACK-LEGACY",
+            "goal": "legacy task",
+            "non_goals": [],
+            "workspace": str(self.repo),
+            "dependencies": [],
+            "allowed_paths": ["legacy.json"],
+            "protected_paths": {},
+            "checks": [{
+                "id": "legacy-check",
+                "argv": ["/usr/bin/true"],
+                "cwd": ".",
+            }],
+            "required_review": False,
+            "owner_acceptance": False,
+            "publication": {"kind": "none"},
+            "max_attempts": 2,
+        }
+        legacy_path = self.home / "legacy-readback.json"
+        legacy_path.write_text(json.dumps({
+            "schema_version": 1,
+            "plan_revision": "legacy-readback",
+            "tasks": [legacy],
+        }))
+        orch.load_plan(legacy_path)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home), "queue", "list",
+            ])
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        by_id = {item["task_id"]: item for item in result["tasks"]}
+
+        contract = by_id["READBACK-CURRENT"]["contract"]
+        self.assertEqual(contract["goal"], current["goal"])
+        self.assertEqual(contract["acceptance"], current["acceptance"])
+        self.assertEqual(contract["non_goals"], current["non_goals"])
+        self.assertEqual(contract["allowed_paths"], ["result.json"])
+        self.assertEqual(contract["execution_budget"], budget)
+        self.assertEqual(contract["checks"], [{
+            "id": "bounded-check",
+            "timeout_sec": 7,
+            "output_tail_chars": 64,
+            "timeout_action": "needs_fix",
+        }])
+        self.assertNotIn("argv", contract["checks"][0])
+        self.assertNotIn("executable_path", contract["checks"][0])
+        self.assertNotIn("authority_files", contract["checks"][0])
+
+        legacy_contract = by_id["READBACK-LEGACY"]["contract"]
+        self.assertEqual(legacy_contract["acceptance"], [])
+        self.assertIsNone(legacy_contract["execution_budget"])
+        self.assertEqual(legacy_contract["checks"], [{
+            "id": "legacy-check",
+            "timeout_sec": 30,
+            "output_tail_chars": 8000,
+            "timeout_action": "needs_fix",
+        }])
+
     def test_queue_project_pause_resume_cli(self):
         config = ProjectRegistry(self.home).add(
             self.repo, profile="standard", review_mode="off"

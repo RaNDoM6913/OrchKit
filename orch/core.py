@@ -2992,6 +2992,26 @@ class Orchestrator:
                 "writer_key": row["writer_key"],
                 "waiting_dependencies": waiting_dependencies,
                 "execution_budget": payload.get("execution_budget"),
+                "contract": {
+                    "goal": payload.get("goal"),
+                    "acceptance": payload.get("acceptance", []),
+                    "non_goals": payload.get("non_goals", []),
+                    "allowed_paths": payload.get("allowed_paths", []),
+                    "execution_budget": payload.get("execution_budget"),
+                    "checks": [
+                        {
+                            "id": check.get("id", "unnamed"),
+                            "timeout_sec": check.get("timeout_sec", 30),
+                            "output_tail_chars": check.get(
+                                "output_tail_chars", 8000
+                            ),
+                            "timeout_action": check.get(
+                                "timeout_action", "needs_fix"
+                            ),
+                        }
+                        for check in payload.get("checks", [])
+                    ],
+                },
             }
             if lock and queue_state == "WAITING_WRITER":
                 item["writer_lock"] = {
