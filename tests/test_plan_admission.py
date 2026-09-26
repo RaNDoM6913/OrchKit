@@ -9,7 +9,8 @@ from unittest import mock
 
 from orch.config import atomic_write_json
 from orch.core import PLAN_MAX_BYTES, Orchestrator, sha256_file
-from orch.plan import existing_plan_initial_base_binding, write_plan
+from orch.plan import (build_single_task_plan,
+                       existing_plan_initial_base_binding, write_plan)
 
 
 class PlanAdmissionTests(unittest.TestCase):
@@ -220,6 +221,178 @@ class PlanAdmissionTests(unittest.TestCase):
 
         self.assertEqual(loaded["status"], "OK")
         self.assertEqual(loaded["queued_count"], 1)
+
+    def test_acceptance_and_check_contract_are_admitted_and_persisted(self):
+        task = self.task("CONTRACT-VALID")
+        task["acceptance"] = [
+            "Produce result.json and pass the registered bounded check."
+        ]
+        task["checks"] = [{
+            "id": "bounded-check",
+            "argv": ["/usr/bin/true"],
+            "cwd": ".",
+            "output_tail_chars": 32,
+            "timeout_action": "needs_fix",
+        }]
+        path, _ = self.write_plan(
+            self.plan(tasks=[task], revision="contract-valid"),
+            name="contract-valid.json",
+        )
+
+        loaded = self.orch.load_plan(path)
+
+        self.assertEqual(loaded["status"], "OK")
+        with self.orch.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM tasks WHERE task_id=?",
+                ("CONTRACT-VALID",),
+            ).fetchone()
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["acceptance"], task["acceptance"])
+        self.assertEqual(payload["checks"][0]["output_tail_chars"], 32)
+        self.assertEqual(payload["checks"][0]["timeout_action"], "needs_fix")
+
+    def test_acceptance_and_check_contract_reject_invalid_values(self):
+        cases = []
+
+        task = self.task("BAD-ACCEPTANCE-TYPE")
+        task["acceptance"] = "pass"
+        cases.append(("acceptance-type", task, "invalid_acceptance"))
+
+        task = self.task("BAD-ACCEPTANCE-COUNT")
+        task["acceptance"] = ["pass"] * 129
+        cases.append(("acceptance-count", task, "invalid_acceptance"))
+
+        task = self.task("BAD-ACCEPTANCE-EMPTY")
+        task["acceptance"] = [""]
+        cases.append((
+            "acceptance-empty", task, "invalid_acceptance_item"
+        ))
+
+        task = self.task("BAD-ACCEPTANCE-LARGE")
+        task["acceptance"] = ["x" * 4097]
+        cases.append((
+            "acceptance-large", task,
+            "invalid_acceptance_item_too_large",
+        ))
+
+        for index, value in enumerate((0, True, 1.5, 64 * 1024 + 1)):
+            task = self.task(f"BAD-OUTPUT-{index}")
+            task["checks"] = [{
+                "id": "bounded-check",
+                "argv": ["/usr/bin/true"],
+                "cwd": ".",
+                "output_tail_chars": value,
+            }]
+            cases.append((
+                f"output-{index}", task,
+                "invalid_check_output_tail_chars",
+            ))
+
+        task = self.task("BAD-TIMEOUT-ACTION")
+        task["checks"] = [{
+            "id": "bounded-check",
+            "argv": ["/usr/bin/true"],
+            "cwd": ".",
+            "timeout_action": "retry",
+        }]
+        cases.append((
+            "timeout-action", task, "invalid_check_timeout_action"
+        ))
+
+        for index, (name, task, error) in enumerate(cases):
+            with self.subTest(name=name):
+                path, _ = self.write_plan(
+                    self.plan(
+                        tasks=[task],
+                        revision=f"contract-bad-{index}",
+                    ),
+                    name=f"contract-bad-{index}.json",
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    self.orch.load_plan(path)
+                self.assert_no_tasks()
+
+    def test_generated_plan_has_acceptance_and_check_contract_defaults(self):
+        project = {
+            "project_id": "fixture-project-12345678",
+            "root": str(self.workspace),
+            "writer_key": None,
+            "git": {},
+            "review": {
+                "mode": "off",
+                "reviewer": "none",
+                "placement": "pre_publish",
+            },
+            "protected_paths": {},
+            "checks": [{
+                "id": "generated-check",
+                "argv": ["/usr/bin/true"],
+                "cwd": ".",
+            }],
+        }
+        with mock.patch(
+            "orch.plan.evaluate_project_git_policy",
+            return_value={
+                "status": "READY",
+                "can_push": False,
+                "can_commit": False,
+                "safety_blockers": [],
+            },
+        ):
+            plan = build_single_task_plan(
+                project,
+                task_id="GENERATED-CONTRACT",
+                goal="generate a bounded result",
+                allowed_paths=["result.json"],
+            )
+
+        task = plan["tasks"][0]
+        self.assertEqual(task["acceptance"], [
+            "Complete the stated goal within allowed paths and pass all registered checks."
+        ])
+        self.assertEqual(task["checks"][0]["output_tail_chars"], 8000)
+        self.assertEqual(task["checks"][0]["timeout_action"], "needs_fix")
+
+    def test_run_check_applies_output_tail_and_timeout_metadata(self):
+        tail = self.orch._run_check(
+            self.workspace,
+            "TAIL-RUN",
+            {
+                "id": "tail",
+                "argv": ["/usr/bin/printf", "abcdefghij"],
+                "cwd": ".",
+                "timeout_sec": 30,
+                "output_tail_chars": 4,
+                "timeout_action": "needs_fix",
+                "executable_path": "/usr/bin/printf",
+            },
+        )
+        self.assertEqual(tail["exit_code"], 0)
+        self.assertEqual(tail["stdout"], "ghij")
+        self.assertEqual(tail["output_tail_chars"], 4)
+        self.assertEqual(tail["timeout_action"], "needs_fix")
+
+        timed = self.orch._run_check(
+            self.workspace,
+            "TIMEOUT-RUN",
+            {
+                "id": "timeout",
+                "argv": [
+                    "/usr/bin/python3", "-c",
+                    "import time; time.sleep(2)",
+                ],
+                "cwd": ".",
+                "timeout_sec": 1,
+                "output_tail_chars": 16,
+                "timeout_action": "needs_fix",
+                "executable_path": "/usr/bin/python3",
+            },
+        )
+        self.assertTrue(timed["timed_out"])
+        self.assertIsNone(timed["exit_code"])
+        self.assertEqual(timed["output_tail_chars"], 16)
+        self.assertEqual(timed["timeout_action"], "needs_fix")
 
     def test_review_policy_rejects_string_values_before_admission(self):
         malformed = (

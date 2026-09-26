@@ -30,6 +30,18 @@ def default_execution_budget() -> Dict[str, Any]:
     }
 
 
+def _checks_with_execution_contract(
+    checks: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for raw in checks:
+        check = dict(raw)
+        check.setdefault("output_tail_chars", 8000)
+        check.setdefault("timeout_action", "needs_fix")
+        normalized.append(check)
+    return normalized
+
+
 def build_single_task_plan(
     project: Dict[str, Any], *, task_id: str, goal: str, allowed_paths: Iterable[str],
     risk_tags: Iterable[str] = (), owner_acceptance: bool = False,
@@ -124,12 +136,15 @@ def build_single_task_plan(
         "project_id": project["project_id"],
         "writer_key": project.get("writer_key"),
         "goal": goal.strip(),
+        "acceptance": [
+            "Complete the stated goal within allowed paths and pass all registered checks."
+        ],
         "non_goals": [],
         "workspace": project["root"],
         "dependencies": deps,
         "allowed_paths": allowed,
         "protected_paths": project.get("protected_paths", {}),
-        "checks": project.get("checks", []),
+        "checks": _checks_with_execution_contract(project.get("checks", [])),
         "review": review,
         "owner_acceptance": bool(owner_acceptance),
         "publication": publication,
