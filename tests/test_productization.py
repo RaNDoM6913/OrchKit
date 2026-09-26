@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -205,6 +206,41 @@ class ProductizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reviewer_required"):
             ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="required", reviewer="none")
 
+    def test_project_schema_versions_gate_get_list_and_add(self):
+        registry = ProjectRegistry(self.home)
+        registered = registry.add(self.repo, profile="standard", review_mode="off")
+        project_id = registered["project"]["project_id"]
+        path = Path(registered["config_path"])
+        original = path.read_bytes()
+        self.assertEqual(registry.get(project_id)["schema_version"], 1)
+        self.assertNotIn("status", registry.list()[0])
+        other = self.base / "other-repo"
+        subprocess.run(["git", "clone", str(self.repo), str(other)],
+                       check=True, capture_output=True)
+        for version in (2, True, "1", None, [], {}):
+            with self.subTest(version=version):
+                config = json.loads(original)
+                config["schema_version"] = version
+                path.write_text(json.dumps(config) + "\n", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    registry.get(project_id)
+                self.assertEqual(registry.list()[0]["status"], "UNSAFE")
+                with self.assertRaises(ValueError):
+                    registry.add(other, profile="standard", review_mode="off")
+                self.assertEqual(list(registry.projects_dir.glob("*.json")), [path])
+        config = json.loads(original)
+        del config["schema_version"]
+        path.write_text(json.dumps(config) + "\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            registry.get(project_id)
+        self.assertEqual(registry.list()[0]["status"], "UNSAFE")
+        with self.assertRaises(ValueError):
+            registry.add(other, profile="standard", review_mode="off")
+        self.assertEqual(path.read_text(encoding="utf-8"), json.dumps(config) + "\n")
+        path.write_bytes(original)
+        self.assertEqual(registry.get(project_id)["schema_version"], 1)
+        self.assertEqual(registry.add(other, profile="standard", review_mode="off")["status"], "REGISTERED")
+
     def test_project_registry_rejects_exact_root_alias(self):
         registry = ProjectRegistry(self.home)
         first = registry.add(
@@ -219,6 +255,19 @@ class ProductizationTests(unittest.TestCase):
             )
         self.assertEqual(len(registry.list()), 1)
 
+    def test_project_registry_rejects_name_that_exceeds_queue_id_limit(self):
+        registry = ProjectRegistry(self.home)
+        long_name = "a" * 152
+
+        with self.assertRaisesRegex(ValueError, "invalid_project_name"):
+            registry.add(
+                self.repo, name=long_name,
+                profile="standard", review_mode="off",
+            )
+
+        self.assertEqual(list(registry.projects_dir.glob("*.json")), [])
+        self.assertFalse((self.home / ".runtime" / "orch.sqlite3").exists())
+
     def test_project_registry_replace_same_identity_still_allowed(self):
         registry = ProjectRegistry(self.home)
         first = registry.add(
@@ -230,6 +279,41 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(replaced["project_id"], first["project_id"])
         self.assertEqual(replaced["profile"], "safe")
         self.assertEqual(len(registry.list()), 1)
+
+    def test_project_registry_get_rejects_config_identity_mismatch(self):
+        registry = ProjectRegistry(self.home)
+        registered = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        altered = json.loads(config_path.read_text(encoding="utf-8"))
+        altered["project_id"] = "different-project"
+        config_path.write_text(json.dumps(altered) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "project_config_identity_mismatch"
+        ):
+            registry.get(project_id)
+
+    def test_project_dispatcher_rejects_config_identity_mismatch(self):
+        registry = ProjectRegistry(self.home)
+        registered = registry.add(
+            self.repo, profile="standard", review_mode="off"
+        )
+        project_id = registered["project"]["project_id"]
+        config_path = Path(registered["config_path"])
+        altered = json.loads(config_path.read_text(encoding="utf-8"))
+        altered["project_id"] = "different-project"
+        config_path.write_text(json.dumps(altered) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "project_config_identity_mismatch"
+        ):
+            render_dispatcher(self.home, project_id=project_id)
+        self.assertFalse(
+            (self.home / "dispatchers" / f"{project_id}.txt").exists()
+        )
 
     def test_project_registry_allows_distinct_linked_worktree_root(self):
         linked = self.base / "linked-worktree"
@@ -338,6 +422,33 @@ class ProductizationTests(unittest.TestCase):
             registry.get(project_id)
         listed = {item["project_id"]: item for item in registry.list()}
         self.assertEqual(listed[project_id]["status"], "UNSAFE")
+
+    def test_relative_registered_root_blocks_get_list_and_add(self):
+        registry = ProjectRegistry(self.home)
+        first = registry.add(self.repo, profile="standard", review_mode="off")
+        other = self.base / "other-repo"
+        subprocess.run(["git", "clone", str(self.repo), str(other)],
+                       check=True, capture_output=True)
+        second = registry.add(other, profile="standard", review_mode="off")
+        second_id = second["project"]["project_id"]
+        config_path = Path(second["config_path"])
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["root"] = "relative-repo-b"
+        config_path.write_text(json.dumps(config) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "project_root_not_absolute"):
+            registry.get(second_id)
+        listed = {item["project_id"]: item for item in registry.list()}
+        self.assertEqual(listed[second_id]["status"], "UNSAFE")
+        self.assertEqual(registry.get(first["project"]["project_id"])["root"],
+                         str(self.repo.resolve()))
+        third = self.base / "third-repo"
+        subprocess.run(["git", "clone", str(self.repo), str(third)],
+                       check=True, capture_output=True)
+        before = sorted(path.name for path in registry.projects_dir.iterdir())
+        with self.assertRaisesRegex(ValueError, f"project_registry_invalid:{second_id}"):
+            registry.add(third, profile="standard", review_mode="off")
+        self.assertEqual(before, sorted(path.name for path in registry.projects_dir.iterdir()))
 
     def test_project_registry_rejects_oversized_config(self):
         registry = ProjectRegistry(self.home)
@@ -690,6 +801,60 @@ class ProductizationTests(unittest.TestCase):
             config["project_id"],
         )
 
+    def test_generated_revision_with_maximum_ids_loads_and_preserves_overrides(self):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        long_project = "P" * 160
+        long_task = "T" * 160
+        config = {**config, "project_id": long_project}
+        plan = build_single_task_plan(
+            config, task_id=long_task, goal="long IDs",
+            allowed_paths=["result.json"],
+        )
+        revision = plan["plan_revision"]
+        self.assertIsNotNone(re.fullmatch(r"[A-Za-z0-9._-]{1,200}", revision))
+        self.assertIn(long_project[:16], revision)
+        self.assertIn(long_task[:16].lower(), revision)
+        plan_path = self.home / (revision + ".json")
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        result = Orchestrator(self.home).load_plan(plan_path)
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["queued_count"], 1)
+        self.assertEqual(result["plan_revision"], revision)
+
+        with mock.patch("orch.plan.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "12345678" + "0" * 24
+            other = build_single_task_plan(
+                {**config, "project_id": "P" * 159 + "Q"},
+                task_id=long_task, goal="long IDs",
+                allowed_paths=["result.json"],
+            )
+            original = build_single_task_plan(
+                config, task_id=long_task, goal="long IDs",
+                allowed_paths=["result.json"],
+            )
+            self.assertNotEqual(other["plan_revision"], original["plan_revision"])
+            short_default = build_single_task_plan(
+                config, task_id="SHORT", goal="short",
+                allowed_paths=["result.json"],
+            )
+        self.assertEqual(
+            short_default["plan_revision"],
+            f"{long_project}-short-12345678",
+        )
+
+        short = build_single_task_plan(
+            config, task_id="SHORT", goal="short", allowed_paths=["result.json"],
+            plan_revision="explicit_revision-1",
+        )
+        self.assertEqual(short["plan_revision"], "explicit_revision-1")
+        with self.assertRaisesRegex(ValueError, "invalid_plan_revision"):
+            build_single_task_plan(
+                config, task_id="SHORT", goal="short",
+                allowed_paths=["result.json"], plan_revision="x" * 201,
+            )
+
     def test_generated_plan_uses_git_local_when_commit_allowed_without_remote(self):
         config = ProjectRegistry(self.home).add(self.repo, profile="standard", review_mode="off")["project"]
         plan = build_single_task_plan(config, task_id="TASK-1", goal="create result", allowed_paths=["result.json"])
@@ -729,6 +894,141 @@ class ProductizationTests(unittest.TestCase):
         orch.quiesce(claim["run_id"], lease)
         self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
         self.assertEqual(orch.publish(claim["run_id"])["status"], "COMPLETE")
+
+    def _verified_mode_script_publication(self, task_id):
+        config = ProjectRegistry(self.home).add(
+            self.repo, profile="standard", review_mode="off"
+        )["project"]
+        plan = build_single_task_plan(
+            config, task_id=task_id, goal="add script",
+            allowed_paths=["script.sh"],
+        )
+        orch = Orchestrator(self.home)
+        plan_path = self.home / f"{task_id}-plan.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        orch.load_plan(plan_path)
+        claim = orch.claim("fixture")
+        script = self.repo / "script.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o644)
+        receipt = Path(claim["receipt_file"])
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": task_id,
+            "changed_paths": ["script.sh"],
+        }), encoding="utf-8")
+        lease = orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+        orch.submit(claim["run_id"], lease, receipt)
+        orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(orch.verify(claim["run_id"])["status"], "VERIFIED")
+        return orch, claim, script
+
+    def test_git_local_publication_rejects_executable_bit_drift(self):
+        orch, claim, script = self._verified_mode_script_publication("MODE-1")
+        base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        script.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "snapshot_stale:script.sh"):
+            orch.publish(claim["run_id"])
+
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, base)
+        task = next(
+            row for row in orch.status()["tasks"]
+            if row["task_id"] == "MODE-1"
+        )
+        self.assertEqual(task["status"], "READY_TO_PUBLISH")
+
+    def test_publication_reconcile_blocks_staged_mode_drift(self):
+        orch, claim, script = self._verified_mode_script_publication("MODE-STAGED")
+        base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "--", "script.sh"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "update-index", "--chmod=+x", "--", "script.sh"],
+            check=True,
+        )
+        self.assertEqual(script.stat().st_mode & 0o777, 0o644)
+        index_entry = subprocess.run(
+            ["git", "-C", str(self.repo), "ls-files", "-s", "--", "script.sh"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertTrue(index_entry.startswith("100755 "))
+        orch._publication_update(
+            claim["run_id"], status="STAGED", operation_id="mode-stage-gap",
+            kind="git_local", expected_base=base, staged_paths=["script.sh"],
+        )
+
+        reconciled = orch.reconcile_publication(claim["run_id"])
+
+        self.assertEqual(reconciled["status"], "BLOCKED")
+        self.assertEqual(reconciled["reason"], "unexpected_staging_state")
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, base)
+
+    def test_publication_reconcile_rejects_committed_mode_drift(self):
+        orch, claim, script = self._verified_mode_script_publication("MODE-COMMIT")
+        base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "add", "--", "script.sh"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "update-index", "--chmod=+x", "--", "script.sh"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "mode drift fixture"],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(script.stat().st_mode & 0o777, 0o644)
+        committed = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertNotEqual(committed, base)
+        tree_entry = subprocess.run(
+            ["git", "-C", str(self.repo), "ls-tree", committed, "--", "script.sh"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertTrue(tree_entry.startswith("100755 "))
+        orch._publication_update(
+            claim["run_id"], status="STAGED", operation_id="mode-commit-gap",
+            kind="git_local", expected_base=base, staged_paths=["script.sh"],
+        )
+
+        reconciled = orch.reconcile_publication(claim["run_id"])
+
+        self.assertEqual(reconciled["status"], "BLOCKED")
+        self.assertEqual(reconciled["reason"], "commit_not_proven")
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head, committed)
+        task = next(
+            row for row in orch.status()["tasks"]
+            if row["task_id"] == "MODE-COMMIT"
+        )
+        self.assertEqual(task["status"], "READY_TO_PUBLISH")
 
     def test_verifier_neutralizes_clean_filter_and_publication_blocks_filtered_path(self):
         attributes = self.repo / ".gitattributes"

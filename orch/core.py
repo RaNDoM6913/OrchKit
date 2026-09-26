@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import (atomic_write_json, ensure_private_dir,
                      ensure_private_file, read_bounded_json_object,
-                     read_bounded_regular_file)
+                     read_bounded_regular_file, regular_file_read_flags)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .review_policy import decide_review, normalize_review_policy
 
@@ -38,6 +38,7 @@ PLAN_MAX_ALLOWED_PATHS = 512
 PLAN_MAX_PROTECTED_PATHS = 512
 PLAN_MAX_DEPENDENCIES = 128
 PLAN_MAX_CHECKS = 64
+CHECK_MAX_TIMEOUT_SEC = 300
 PLAN_MAX_ARGV = 64
 PLAN_MAX_NON_GOALS = 128
 
@@ -57,12 +58,8 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     target = Path(os.path.abspath(os.path.expanduser(str(path))))
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif target.is_symlink():
+    flags = regular_file_read_flags()
+    if not hasattr(os, "O_NOFOLLOW") and target.is_symlink():
         raise ValueError("hash_file_unsafe")
     try:
         fd = os.open(str(target), flags)
@@ -120,6 +117,19 @@ def safe_workspace_path(workspace: Path, relative: str, *, must_exist: bool = Fa
     if must_exist and not raw.exists():
         raise ValueError("missing_path")
     return raw
+
+
+def workspace_path_has_symlink_component(workspace: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        raise ValueError("path_escape")
+    current = workspace
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def normalize_relative_path(relative: str) -> str:
@@ -341,12 +351,8 @@ def prepare_task_payload(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def read_plan_document(plan_path: Path) -> Tuple[Dict[str, Any], str, int]:
     supplied = Path(os.path.abspath(os.path.expanduser(str(plan_path))))
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif supplied.is_symlink():
+    flags = regular_file_read_flags()
+    if not hasattr(os, "O_NOFOLLOW") and supplied.is_symlink():
         raise ValueError("plan_file_missing_or_unsafe")
     try:
         fd = os.open(str(supplied), flags)
@@ -516,7 +522,7 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         if (
             not isinstance(timeout, int)
             or isinstance(timeout, bool)
-            or not 1 <= timeout <= 120
+            or not 1 <= timeout <= CHECK_MAX_TIMEOUT_SEC
         ):
             raise ValueError("invalid_check_timeout")
         for field in ("authority_paths", "authority_absent_paths"):
@@ -642,19 +648,23 @@ def validate_dependency_graph(tasks: List[Dict[str, Any]]) -> None:
 
 
 class Orchestrator:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, initialize_directories: bool = True):
         self.root = root.resolve()
-        self.runtime = ensure_private_dir(self.root / ".runtime")
+        self.runtime = self.root / ".runtime"
+        if initialize_directories:
+            self.runtime = ensure_private_dir(self.runtime)
         self.db_path = self.runtime / "orch.sqlite3"
-        self.logs = ensure_private_dir(self.runtime / "logs")
-        ensure_private_dir(self.runtime / "worker_receipts")
-        ensure_private_dir(self.runtime / "claims")
-        ensure_private_dir(self.runtime / "review_exports")
-        ensure_private_dir(self.runtime / "git-hooks-disabled")
-        for optional_state_dir in ("projects", "plans", "backups"):
-            candidate = self.root / optional_state_dir
-            if candidate.exists():
-                ensure_private_dir(candidate)
+        self.logs = self.runtime / "logs"
+        if initialize_directories:
+            self.logs = ensure_private_dir(self.logs)
+            ensure_private_dir(self.runtime / "worker_receipts")
+            ensure_private_dir(self.runtime / "claims")
+            ensure_private_dir(self.runtime / "review_exports")
+            ensure_private_dir(self.runtime / "git-hooks-disabled")
+            for optional_state_dir in ("projects", "plans", "backups"):
+                candidate = self.root / optional_state_dir
+                if candidate.exists():
+                    ensure_private_dir(candidate)
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
@@ -702,11 +712,7 @@ class Orchestrator:
         )
         if supplied != expected:
             raise ValueError(invalid_path_error)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = regular_file_read_flags()
         try:
             fd = os.open(str(expected), flags)
         except OSError as exc:
@@ -1801,6 +1807,8 @@ class Orchestrator:
         files: Dict[str, Any] = {}
         for relative in sorted(set(changed_paths)):
             path = safe_workspace_path(workspace, relative, must_exist=False)
+            if workspace_path_has_symlink_component(workspace, path):
+                raise ValueError(f"symlink_not_allowed:{relative}")
             if not path.exists():
                 files[relative] = {"deleted": True, "sha256": None, "bytes": 0, "mode": None}
                 continue
@@ -1920,7 +1928,7 @@ class Orchestrator:
         cwd = workspace if cwd_rel == "." else safe_workspace_path(workspace, cwd_rel, must_exist=True)
         if not cwd.is_dir():
             raise ValueError("invalid_check_cwd")
-        timeout = min(max(int(check.get("timeout_sec", 30)), 1), 120)
+        timeout = min(max(int(check.get("timeout_sec", 30)), 1), CHECK_MAX_TIMEOUT_SEC)
         executable = check.get("executable_path")
         if not isinstance(executable, str) or not Path(executable).is_absolute():
             raise ValueError("check_executable_not_bound")
@@ -2262,11 +2270,17 @@ class Orchestrator:
         workspace = Path(payload["workspace"]).resolve()
         for relative, recorded in manifest.get("files", {}).items():
             path = safe_workspace_path(workspace, relative, must_exist=False)
+            if workspace_path_has_symlink_component(workspace, path):
+                raise ValueError(f"snapshot_stale:{relative}")
             if recorded.get("deleted"):
                 if path.exists():
                     raise ValueError(f"snapshot_stale:{relative}")
                 continue
-            if not path.is_file() or sha256_file(path) != recorded["sha256"]:
+            if (
+                not path.is_file()
+                or sha256_file(path) != recorded["sha256"]
+                or oct(path.stat().st_mode & 0o777) != recorded.get("mode")
+            ):
                 raise ValueError(f"snapshot_stale:{relative}")
         for relative, recorded in manifest.get("protected", {}).items():
             path = safe_workspace_path(workspace, relative, must_exist=True)
@@ -2449,6 +2463,25 @@ class Orchestrator:
             relative, driver = filtered[0]
             raise ValueError(f"publication_filtered_path_not_supported:{relative}:{driver}")
 
+    @staticmethod
+    def _expected_git_mode(recorded: Dict[str, Any]) -> Optional[bytes]:
+        value = recorded.get("mode")
+        if not isinstance(value, str) or re.fullmatch(r"0o[0-7]{1,3}", value) is None:
+            return None
+        return b"100755" if int(value, 8) & 0o111 else b"100644"
+
+    @staticmethod
+    def _git_entry_mode(result: subprocess.CompletedProcess, relative: str) -> Optional[bytes]:
+        if result.returncode or not isinstance(result.stdout, bytes):
+            return None
+        entries = [item for item in result.stdout.split(b"\0") if item]
+        if len(entries) != 1:
+            return None
+        header, separator, name = entries[0].partition(b"\t")
+        if separator != b"\t" or name != os.fsencode(relative):
+            return None
+        return header.split(b" ", 1)[0]
+
     def _staged_matches_snapshot(self, workspace: Path, manifest: Dict[str, Any]) -> bool:
         gitb = self._publication_git(workspace, binary=True)
         changed = sorted(manifest.get("files", {}))
@@ -2461,8 +2494,13 @@ class Orchestrator:
             if recorded.get("deleted"):
                 if blob.returncode == 0:
                     return False
-            elif blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
-                return False
+            else:
+                if blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
+                    return False
+                mode = gitb("ls-files", "--stage", "-z", "--", f":(literal){relative}")
+                expected_mode = self._expected_git_mode(recorded)
+                if expected_mode is None or self._git_entry_mode(mode, relative) != expected_mode:
+                    return False
         return True
 
     def _commit_matches_snapshot(self, workspace: Path, commit_id: str, expected_base: Optional[str],
@@ -2483,8 +2521,13 @@ class Orchestrator:
             if recorded.get("deleted"):
                 if blob.returncode == 0:
                     return False
-            elif blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
-                return False
+            else:
+                if blob.returncode or sha256_bytes(blob.stdout) != recorded["sha256"]:
+                    return False
+                mode = gitb("ls-tree", "-z", commit_id, "--", relative)
+                expected_mode = self._expected_git_mode(recorded)
+                if expected_mode is None or self._git_entry_mode(mode, relative) != expected_mode:
+                    return False
         return True
 
     def _prepare_snapshot_commit(self, workspace: Path, *, expected_base: str,

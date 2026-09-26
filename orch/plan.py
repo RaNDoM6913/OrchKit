@@ -89,7 +89,21 @@ def build_single_task_plan(
         or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", plan_revision) is None
     ):
         raise ValueError("invalid_plan_revision")
-    revision = plan_revision or f"{project['project_id']}-{task_id.lower()}-{uuid.uuid4().hex[:8]}"
+    if plan_revision is None:
+        project_id = project["project_id"]
+        normalized_task_id = task_id.lower()
+        nonce = uuid.uuid4().hex[:8]
+        revision = f"{project_id}-{normalized_task_id}-{nonce}"
+        if len(revision) > 200:
+            identity_hash = hashlib.sha256(
+                f"{project_id}\0{task_id}".encode("utf-8")
+            ).hexdigest()[:16]
+            revision = (
+                f"{project_id[:86]}-{normalized_task_id[:87]}"
+                f"-{identity_hash}-{nonce}"
+            )
+    else:
+        revision = plan_revision
     task = {
         "id": task_id,
         "project_id": project["project_id"],

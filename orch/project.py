@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,11 @@ from .review_policy import MODES, REVIEWERS
 
 PROJECT_CONFIG_MAX_BYTES = 2 * 1024 * 1024
 PACKAGE_JSON_MAX_BYTES = 2 * 1024 * 1024
+
+
+def validate_project_schema(config: Dict[str, Any]) -> None:
+    if type(config.get("schema_version")) is not int or config["schema_version"] != 1:
+        raise ValueError("project_config_schema_unsupported")
 
 
 PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -174,6 +180,7 @@ def _detect_commands(root: Path) -> Dict[str, Any]:
     if (root / "pyproject.toml").is_file() and (root / "tests").is_dir():
         detected["suggested_checks"].append({
             "id": "python-tests",
+            "timeout_sec": 180,
             "argv": [
                 "python3", "-m", "unittest",
                 "discover", "-s", "tests", "-v",
@@ -229,10 +236,29 @@ def inspect_project(path: Path) -> Dict[str, Any]:
     }
 
 
+def project_root_identity_matches(project_id: str, root: Path) -> bool:
+    digest = hashlib.sha256(str(root.expanduser().resolve()).encode("utf-8")).hexdigest()[:8]
+    return project_id.rsplit("-", 1)[-1] == digest if "-" in project_id else False
+
+
 class ProjectRegistry:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, *, create: bool = True):
         self.home = home.expanduser().resolve()
-        self.projects_dir = ensure_private_dir(self.home / "projects")
+        projects_dir = self.home / "projects"
+        if create:
+            self.projects_dir = ensure_private_dir(projects_dir)
+        else:
+            try:
+                info = projects_dir.lstat()
+            except FileNotFoundError as exc:
+                raise ValueError("unknown_project") from exc
+            if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError("private_directory_unsafe")
+            self.projects_dir = projects_dir
+
+    @classmethod
+    def open_readonly(cls, home: Path) -> "ProjectRegistry":
+        return cls(home, create=False)
 
     def _path(self, project_id: str) -> Path:
         if not re.fullmatch(r"[a-z0-9._-]+", project_id):
@@ -264,6 +290,8 @@ class ProjectRegistry:
         display_name = name or root.name
         digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
         project_id = f"{_slug(display_name)}-{digest}"
+        if len(project_id) > 160:
+            raise ValueError("invalid_project_name")
         target = self._path(project_id)
         if target.exists() and not replace:
             raise ValueError("project_already_registered")
@@ -291,8 +319,13 @@ class ProjectRegistry:
                 raise ValueError(
                     f"project_registry_unreadable:{candidate.stem}"
                 ) from exc
+            validate_project_schema(existing_config)
+            if existing_config.get("project_id") != candidate.stem:
+                raise ValueError(f"project_registry_invalid:{candidate.stem}")
             existing_root = existing_config.get("root")
-            if not isinstance(existing_root, str) or not existing_root:
+            if not isinstance(existing_root, str) or not existing_root or not Path(existing_root).expanduser().is_absolute():
+                raise ValueError(f"project_registry_invalid:{candidate.stem}")
+            if not project_root_identity_matches(candidate.stem, Path(existing_root)):
                 raise ValueError(f"project_registry_invalid:{candidate.stem}")
             if Path(existing_root).expanduser().resolve() == root:
                 owner = existing_config.get("project_id") or candidate.stem
@@ -357,6 +390,15 @@ class ProjectRegistry:
                     invalid_error="project_config_invalid_json",
                     repair_mode=0o600,
                 )
+                validate_project_schema(item)
+                if (item.get("project_id") != path.stem
+                        or not isinstance(item.get("root"), str)
+                        or not Path(item["root"]).expanduser().is_absolute()
+                        or not project_root_identity_matches(path.stem, Path(item["root"]))):
+                    rows.append({
+                        "project_id": path.stem, "status": "UNSAFE",
+                    })
+                    continue
                 rows.append({
                     "project_id": item.get("project_id"),
                     "name": item.get("name"),
@@ -368,7 +410,7 @@ class ProjectRegistry:
             except ValueError as exc:
                 status = (
                     "UNSAFE"
-                    if str(exc) == "project_config_unsafe"
+                    if str(exc) in {"project_config_unsafe", "project_config_schema_unsupported"}
                     else "UNREADABLE"
                 )
                 rows.append({"project_id": path.stem, "status": status})
@@ -387,6 +429,14 @@ class ProjectRegistry:
             )
         except FileNotFoundError as exc:
             raise ValueError("unknown_project") from exc
+        validate_project_schema(config)
+        if config.get("project_id") != project_id:
+            raise ValueError("project_config_identity_mismatch")
+        root_value = config.get("root")
+        if isinstance(root_value, str) and not Path(root_value).expanduser().is_absolute():
+            raise ValueError("project_root_not_absolute")
+        if isinstance(root_value, str) and root_value and not project_root_identity_matches(project_id, Path(root_value)):
+            raise ValueError("project_root_identity_mismatch")
         if not config.get("writer_key") and config.get("root"):
             root = Path(config["root"]).expanduser().resolve()
             try:

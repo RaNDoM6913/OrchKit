@@ -218,7 +218,9 @@ def _command_requires_existing_ledger(args: argparse.Namespace) -> bool:
     return True
 
 
-def _open_existing_orchestrator(root: Path) -> Orchestrator:
+def _open_existing_orchestrator(
+    root: Path, *, inspect_only: bool = False
+) -> Orchestrator:
     runtime = root / ".runtime"
     db = runtime / "orch.sqlite3"
     if (
@@ -228,7 +230,9 @@ def _open_existing_orchestrator(root: Path) -> Orchestrator:
         or not db.is_file()
     ):
         raise ValueError("state_ledger_missing_or_unsafe")
-    return Orchestrator(root)
+    return Orchestrator(
+        root, initialize_directories=not inspect_only
+    )
 
 
 def _initialize_fresh_or_existing_orchestrator(root: Path) -> Orchestrator:
@@ -262,7 +266,12 @@ def main(argv=None) -> int:
         if args.command == "init":
             orch = _initialize_fresh_or_existing_orchestrator(root)
         elif _command_requires_existing_ledger(args):
-            orch = _open_existing_orchestrator(root)
+            orch = _open_existing_orchestrator(
+                root,
+                inspect_only=(
+                    args.command == "state" and args.state_command == "check"
+                ),
+            )
 
         if args.command == "setup":
             result = configure_home(root, profile=args.profile)

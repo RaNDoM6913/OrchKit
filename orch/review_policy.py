@@ -13,6 +13,7 @@ DEFAULT_RISK_TAGS = {
 }
 DEFAULT_SENSITIVE_PATTERNS = (
     "**/auth/**", "**/security/**", "**/migrations/**", "**/.github/**",
+    "**/auth.*", "**/security.*",
     "**/workflows/**", "workflows/**", "**/tests/**", "tests/**",
     "**/test_*", "test_*", "**/*_test.*", "*_test.*",
     "AGENTS.md", ".codex/**", ".github/**",
@@ -26,6 +27,11 @@ def normalize_review_policy(payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = {"mode": "required" if required else "off"}
     if not isinstance(raw, dict):
         raise ValueError("invalid_review_policy")
+    for field in ("risk_tags", "trigger_tags", "sensitive_patterns"):
+        if field in raw and not isinstance(raw[field], list):
+            raise ValueError("invalid_review_" + field)
+    if "review_on_retry" in raw and not isinstance(raw["review_on_retry"], bool):
+        raise ValueError("invalid_review_review_on_retry")
     mode = raw.get("mode", "off")
     if mode not in MODES:
         raise ValueError("invalid_review_mode")

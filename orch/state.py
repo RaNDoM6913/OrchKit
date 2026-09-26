@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 
 from .config import (atomic_write_json, ensure_private_dir,
-                     read_bounded_json_object)
+                     read_bounded_json_object, regular_file_read_flags)
 from .core import (ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
                    Orchestrator, sha256_file, utc_now)
 
@@ -41,17 +41,56 @@ def migration_history(orch: Orchestrator) -> Dict[str, Any]:
 
 def capability_health(orch: Orchestrator) -> Dict[str, Any]:
     claims = orch.runtime / "claims"
-    claims.mkdir(parents=True, exist_ok=True)
+    file_identities: Dict[str, List[int]] = {}
+    directory_identity: Optional[List[int]] = None
+    if claims.is_symlink():
+        directory_status = "UNSAFE_SYMLINK"
+    elif not claims.exists():
+        directory_status = "MISSING"
+    elif not claims.is_dir():
+        directory_status = "NOT_DIRECTORY"
+    else:
+        try:
+            claims_fd = _open_claims_directory(orch)
+        except ValueError:
+            directory_status = "CHANGED"
+        else:
+            try:
+                info = os.fstat(claims_fd)
+                with os.scandir(claims_fd) as entries:
+                    for entry in entries:
+                        if not entry.name.endswith(".json"):
+                            continue
+                        file_info = os.stat(
+                            entry.name, dir_fd=claims_fd,
+                            follow_symlinks=False,
+                        )
+                        if statmod.S_ISREG(file_info.st_mode):
+                            file_identities[Path(entry.name).stem] = (
+                                _stat_identity(file_info)
+                            )
+                directory_identity = [int(info.st_dev), int(info.st_ino)]
+                directory_status = "READY"
+            except OSError:
+                file_identities = {}
+                directory_status = "CHANGED"
+            finally:
+                os.close(claims_fd)
     with orch.connect() as conn:
         rows = conn.execute("SELECT run_id,state FROM runs").fetchall()
     states = {row["run_id"]: row["state"] for row in rows}
     expected = {rid for rid, state in states.items() if state in {"RUNNING", "RESULT_SUBMITTED"}}
-    present = {path.stem for path in claims.glob("*.json") if path.is_file() and not path.is_symlink()}
+    present = set(file_identities)
     orphan = sorted(rid for rid in present if states.get(rid) not in {"RUNNING", "RESULT_SUBMITTED"})
     missing = sorted(expected - present)
     return {
-        "status": "ATTENTION" if orphan or missing else "READY",
+        "status": "ATTENTION" if orphan or missing or directory_status != "READY" else "READY",
+        "directory_status": directory_status,
+        "directory_identity": directory_identity,
         "orphan_capabilities": orphan,
+        "orphan_file_identities": {
+            run_id: file_identities[run_id] for run_id in orphan
+        },
         "missing_capabilities": missing,
         "expected_live_capabilities": sorted(expected),
     }
@@ -59,22 +98,29 @@ def capability_health(orch: Orchestrator) -> Dict[str, Any]:
 
 def permission_health(orch: Orchestrator) -> Dict[str, Any]:
     targets = [
-        (orch.runtime, 0o700, True),
-        (orch.runtime / "logs", 0o700, True),
-        (orch.runtime / "worker_receipts", 0o700, True),
-        (orch.runtime / "claims", 0o700, True),
-        (orch.runtime / "review_exports", 0o700, True),
-        (orch.runtime / "git-hooks-disabled", 0o700, True),
-        (orch.db_path, 0o600, True),
-        (orch.db_path.with_name(orch.db_path.name + "-wal"), 0o600, False),
-        (orch.db_path.with_name(orch.db_path.name + "-shm"), 0o600, False),
-        (orch.root / "projects", 0o700, False),
-        (orch.root / "plans", 0o700, False),
-        (orch.root / "backups", 0o700, False),
+        (orch.runtime, 0o700, True, "directory"),
+        (orch.runtime / "logs", 0o700, True, "directory"),
+        (orch.runtime / "worker_receipts", 0o700, True, "directory"),
+        (orch.runtime / "claims", 0o700, True, "directory"),
+        (orch.runtime / "review_exports", 0o700, True, "directory"),
+        (orch.runtime / "git-hooks-disabled", 0o700, True, "directory"),
+        (orch.db_path, 0o600, True, "file"),
+        (orch.db_path.with_name(orch.db_path.name + "-wal"), 0o600, False, "file"),
+        (orch.db_path.with_name(orch.db_path.name + "-shm"), 0o600, False, "file"),
+        (orch.root / "projects", 0o700, False, "directory"),
+        (orch.root / "plans", 0o700, False, "directory"),
+        (orch.root / "backups", 0o700, False, "directory"),
     ]
     rows: List[Dict[str, Any]] = []
     blocked = False
-    for path, expected, required in targets:
+    for path, expected, required, kind in targets:
+        if path.is_symlink():
+            blocked = True
+            rows.append({
+                "path": str(path), "status": "UNSAFE_SYMLINK",
+                "expected_mode": oct(expected), "actual_mode": None,
+            })
+            continue
         if not path.exists():
             if required:
                 blocked = True
@@ -83,15 +129,13 @@ def permission_health(orch: Orchestrator) -> Dict[str, Any]:
                     "expected_mode": oct(expected), "actual_mode": None,
                 })
             continue
-        if path.is_symlink():
-            blocked = True
-            rows.append({
-                "path": str(path), "status": "UNSAFE_SYMLINK",
-                "expected_mode": oct(expected), "actual_mode": None,
-            })
-            continue
         actual = path.stat().st_mode & 0o777
-        status = "PASS" if actual == expected else "MODE_MISMATCH"
+        if kind == "directory" and not path.is_dir():
+            status = "NOT_DIRECTORY"
+        elif kind == "file" and not path.is_file():
+            status = "NOT_FILE"
+        else:
+            status = "PASS" if actual == expected else "MODE_MISMATCH"
         blocked = blocked or status != "PASS"
         rows.append({
             "path": str(path), "status": status,
@@ -126,7 +170,12 @@ def check_state(orch: Orchestrator) -> Dict[str, Any]:
     quick_values = [row[0] for row in quick]
     caps = capability_health(orch)
     permissions = permission_health(orch)
-    blocked = quick_values != ["ok"] or bool(foreign) or permissions["status"] != "READY"
+    blocked = (
+        quick_values != ["ok"] or bool(foreign)
+        or user_version != STATE_SCHEMA_VERSION
+        or permissions["status"] != "READY"
+        or caps["directory_status"] != "READY"
+    )
     attention = bool(writer_locks) or caps["status"] != "READY" or bool(pending_publications)
     history = migration_history(orch)["migrations"]
     return {
@@ -190,6 +239,8 @@ def recovery_inspect(
             for row in conn.execute("SELECT run_id,snapshot_id FROM approvals").fetchall()
         }
 
+    caps = capability_health(orch)
+    claims_ready = caps["directory_status"] == "READY"
     now = time.time()
     items: List[Dict[str, Any]] = []
     for row in rows:
@@ -208,7 +259,8 @@ def recovery_inspect(
         payload = json.loads(row["payload_json"])
         capability = orch.runtime / "claims" / f"{row['run_id']}.json"
         capability_present = (
-            capability.exists() and capability.is_file() and not capability.is_symlink()
+            claims_ready and capability.exists()
+            and capability.is_file() and not capability.is_symlink()
         )
         heartbeat_ts = _parse_utc(row["heartbeat_at"])
         heartbeat_age = (
@@ -294,7 +346,6 @@ def recovery_inspect(
         }
         items.append(item)
 
-    caps = capability_health(orch)
     attention = any(
         item["classification"] != "TERMINAL" for item in items
     ) or caps["status"] != "READY"
@@ -316,14 +367,79 @@ def prune_capabilities(orch: Orchestrator) -> Dict[str, Any]:
     health = check_state(orch)
     if health["active_runs"]:
         raise ValueError("active_runs_present")
-    claims = orch.runtime / "claims"
+    directory_status = health["capabilities"]["directory_status"]
+    if directory_status != "READY":
+        raise ValueError("capability_directory_unsafe:" + directory_status)
+    try:
+        claims_fd = _open_claims_directory(orch)
+    except ValueError as exc:
+        raise ValueError("capability_directory_unsafe:CHANGED") from exc
     pruned: List[str] = []
-    for run_id in health["capabilities"]["orphan_capabilities"]:
-        path = claims / f"{run_id}.json"
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"invalid_capability_artifact:{run_id}")
-        path.unlink()
-        pruned.append(run_id)
+    try:
+        info = os.fstat(claims_fd)
+        if health["capabilities"]["directory_identity"] != [
+            int(info.st_dev), int(info.st_ino)
+        ]:
+            raise ValueError("capability_directory_unsafe:CHANGED")
+        for run_id in health["capabilities"]["orphan_capabilities"]:
+            name = f"{run_id}.json"
+            expected_identity = health["capabilities"][
+                "orphan_file_identities"
+            ].get(run_id)
+            try:
+                _validate_child_name(name)
+                info = os.stat(
+                    name, dir_fd=claims_fd, follow_symlinks=False
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"capability_artifact_changed:{run_id}"
+                ) from exc
+            if (
+                not statmod.S_ISREG(info.st_mode)
+                or _stat_identity(info) != expected_identity
+            ):
+                raise ValueError(f"capability_artifact_changed:{run_id}")
+            for _ in range(32):
+                quarantine = ".orch-cap-prune-" + secrets.token_hex(16) + ".json"
+                if not _entry_exists_at(claims_fd, quarantine):
+                    break
+            else:
+                raise ValueError("capability_quarantine_name_unavailable")
+            try:
+                os.rename(
+                    name, quarantine,
+                    src_dir_fd=claims_fd, dst_dir_fd=claims_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"capability_artifact_changed:{run_id}"
+                ) from exc
+            try:
+                quarantined = os.stat(
+                    quarantine, dir_fd=claims_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"capability_artifact_changed:{run_id}"
+                ) from exc
+            if (
+                not statmod.S_ISREG(quarantined.st_mode)
+                or _stat_identity(quarantined)[:5] != expected_identity[:5]
+            ):
+                _restore_quarantine_at(claims_fd, quarantine, name)
+                raise ValueError(f"capability_artifact_changed:{run_id}")
+            try:
+                os.unlink(quarantine, dir_fd=claims_fd)
+            except OSError as exc:
+                _restore_quarantine_at(claims_fd, quarantine, name)
+                raise ValueError(
+                    f"capability_delete_failed:{run_id}"
+                ) from exc
+            pruned.append(run_id)
+    finally:
+        os.close(claims_fd)
     return {"status": "PRUNED", "count": len(pruned), "run_ids": pruned}
 
 
@@ -346,14 +462,7 @@ def _stat_identity(info: os.stat_result) -> List[int]:
 
 
 def _regular_file_flags() -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-    return flags
+    return regular_file_read_flags()
 
 
 def _record_open_regular_fd(fd: int) -> Optional[Dict[str, Any]]:
@@ -486,6 +595,18 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
         os.close(fd)
         raise ValueError("retention_anchor_unsafe")
     return fd
+
+
+def _open_claims_directory(orch: Orchestrator) -> int:
+    root_fd = _open_directory_path(orch.root)
+    try:
+        runtime_fd = _open_directory_at(root_fd, ".runtime")
+        try:
+            return _open_directory_at(runtime_fd, "claims")
+        finally:
+            os.close(runtime_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _regular_file_record_at(
@@ -1130,7 +1251,7 @@ def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
     unmanaged: List[Dict[str, Any]] = []
     for log in sorted(orch.logs.glob("*")):
         if not log.is_file() or log.is_symlink():
-            if log.exists():
+            if log.exists() or log.is_symlink():
                 unmanaged.append({"path": str(log), "reason": "non_regular_or_symlink"})
             continue
         if not any(log.name.startswith(run_id + "-") for run_id in known_run_ids):
@@ -1174,7 +1295,7 @@ def _retention_inventory(orch: Orchestrator) -> Dict[str, Any]:
                     **record,
                     "mtime": record["identity"][4] / 1_000_000_000,
                 })
-            elif item.exists():
+            elif item.exists() or item.is_symlink():
                 unmanaged_backups.append({"path": str(item), "reason": "unmanaged_backup_artifact"})
     return {
         "runs": managed,
@@ -1507,17 +1628,26 @@ def _stream_backup_member(
     except ValueError as exc:
         raise ValueError("backup_member_outside_root") from exc
     arcname = "files/" + relative
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif path.is_symlink():
+    flags = regular_file_read_flags()
+    parts = Path(relative).parts
+    if not hasattr(os, "O_NOFOLLOW"):
         raise ValueError("backup_member_unsafe:" + relative)
+    parent_fd = -1
     try:
-        fd = os.open(str(path), flags)
-    except OSError as exc:
+        for name in parts:
+            _validate_child_name(name)
+        parent_fd = _open_directory_path(Path(orch.root.anchor))
+        root_parts = orch.root.relative_to(orch.root.anchor).parts
+        for name in root_parts + parts[:-1]:
+            child_fd = _open_directory_at(parent_fd, name)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+    except (OSError, ValueError, IndexError) as exc:
         raise ValueError("backup_member_unsafe:" + relative) from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
     try:
         before = os.fstat(fd)
         if not statmod.S_ISREG(before.st_mode):
@@ -1557,12 +1687,8 @@ def _stream_backup_member(
 @contextmanager
 def _frozen_backup_source(path: Path, *, max_archive_bytes: int):
     source = Path(os.path.abspath(os.path.expanduser(str(path))))
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif source.is_symlink():
+    flags = regular_file_read_flags()
+    if not hasattr(os, "O_NOFOLLOW") and source.is_symlink():
         raise ValueError("backup_not_regular_file")
     try:
         fd = os.open(str(source), flags)
@@ -1676,6 +1802,7 @@ def _verify_frozen_backup_archive(
                     or pure.is_absolute()
                     or ".." in pure.parts
                     or name.startswith("/")
+                    or name != pure.as_posix()
                 ):
                     unsafe.append(name)
                     continue
@@ -2318,6 +2445,157 @@ def _old_home_identity_matches(path: Path, data: Dict[str, Any]) -> bool:
     return int(stat.st_dev) == expected_dev and int(stat.st_ino) == expected_ino
 
 
+def _bind_replacement_discard(
+    data: Dict[str, Any], path: Path, *, role: str,
+) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    data["discard_source_role"] = role
+    data["discard_root_device"] = int(info.st_dev)
+    data["discard_root_inode"] = int(info.st_ino)
+    return True
+
+
+def _path_entry_exists_no_follow(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _replacement_discard_identity_matches(
+    path: Path, data: Dict[str, Any], *, role: str,
+) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        info = path.stat()
+        expected_role = data["discard_source_role"]
+        expected_dev = int(data["discard_root_device"])
+        expected_ino = int(data["discard_root_inode"])
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return (
+        expected_role == role
+        and int(info.st_dev) == expected_dev
+        and int(info.st_ino) == expected_ino
+    )
+
+
+def _delete_open_directory_contents(directory_fd: int) -> bool:
+    try:
+        with os.scandir(directory_fd) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+    except OSError:
+        return False
+    for entry in entries:
+        name = entry.name
+        try:
+            _validate_child_name(name)
+            info = entry.stat(follow_symlinks=False)
+        except (OSError, ValueError):
+            return False
+        if statmod.S_ISDIR(info.st_mode):
+            try:
+                child_fd = _open_directory_at(directory_fd, name)
+            except ValueError:
+                return False
+            try:
+                child_info = os.fstat(child_fd)
+                child_identity = (
+                    int(child_info.st_dev), int(child_info.st_ino)
+                )
+                if not _delete_open_directory_contents(child_fd):
+                    return False
+                try:
+                    current = os.stat(
+                        name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    return False
+                if (
+                    not statmod.S_ISDIR(current.st_mode)
+                    or (int(current.st_dev), int(current.st_ino))
+                    != child_identity
+                ):
+                    return False
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError:
+                return False
+            continue
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            return False
+    return True
+
+
+def _delete_bound_replacement_discard(
+    path: Path, data: Dict[str, Any], *, role: str,
+) -> bool:
+    try:
+        parent_fd = _open_directory_path(path.parent)
+    except ValueError:
+        return False
+    try:
+        try:
+            discard_fd = _open_directory_at(parent_fd, path.name)
+        except ValueError:
+            return False
+        try:
+            info = os.fstat(discard_fd)
+            expected_role = data.get("discard_source_role")
+            try:
+                expected_dev = int(data["discard_root_device"])
+                expected_ino = int(data["discard_root_inode"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            root_identity = (int(info.st_dev), int(info.st_ino))
+            if (
+                expected_role != role
+                or root_identity != (expected_dev, expected_ino)
+            ):
+                return False
+            if not _delete_open_directory_contents(discard_fd):
+                return False
+            try:
+                current = os.stat(
+                    path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            if (
+                not statmod.S_ISDIR(current.st_mode)
+                or (int(current.st_dev), int(current.st_ino))
+                != root_identity
+            ):
+                return False
+        finally:
+            os.close(discard_fd)
+        try:
+            os.rmdir(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError:
+            return False
+        return True
+    finally:
+        os.close(parent_fd)
+
+
 def reconcile_home_replacement(
     destination: Path, *, resume: bool = False, finalize: bool = False,
     rollback: bool = False,
@@ -2411,6 +2689,14 @@ def reconcile_home_replacement(
             dest_is_new and not prepared.exists()
             and not rollback_home.exists() and discard_exists
         ):
+            if not _replacement_discard_identity_matches(
+                discard, data, role="rollback_old"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_identity_mismatch",
+                    "journal_status": status,
+                }
             status = "FINALIZE_PENDING_DELETE"
             data["status"] = status
             _replacement_write(journal, data)
@@ -2452,11 +2738,22 @@ def reconcile_home_replacement(
             }
         else:
             rollback_inventory = _standalone_home_inventory(rollback_home)
-            if rollback_inventory["status"] != "SAFE":
+            if (
+                rollback_inventory["status"] != "SAFE"
+                or not _old_home_identity_matches(rollback_home, data)
+            ):
                 return {
                     "status": "BLOCKED",
-                    "reason": "replacement_rollback_home_not_standalone",
+                    "reason": "replacement_rollback_home_not_proven",
                 }
+            if not _bind_replacement_discard(
+                data, rollback_home, role="rollback_old"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_binding_failed",
+                }
+            _replacement_write(journal, data)
             _replacement_rename(rollback_home, discard)
             _fsync_directory(parent)
             status = "FINALIZE_PENDING_DELETE"
@@ -2562,6 +2859,14 @@ def reconcile_home_replacement(
             and discard.is_dir()
             and not discard.is_symlink()
         ):
+            if not _replacement_discard_identity_matches(
+                discard, data, role="failed_new"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_identity_mismatch",
+                    "journal_status": status,
+                }
             status = "ROLLBACK_FINALIZE_PENDING_DELETE"
             data["status"] = status
             _replacement_write(journal, data)
@@ -2586,6 +2891,14 @@ def reconcile_home_replacement(
                     "journal": str(journal),
                     "finalize_available": True,
                 }
+            if not _bind_replacement_discard(
+                data, failed, role="failed_new"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_binding_failed",
+                }
+            _replacement_write(journal, data)
             _replacement_rename(failed, discard)
             _fsync_directory(parent)
             status = "ROLLBACK_FINALIZE_PENDING_DELETE"
@@ -2604,11 +2917,13 @@ def reconcile_home_replacement(
                 "reason": "replacement_rollback_finalize_state_ambiguous",
                 "journal_status": status,
             }
-        if discard.exists():
-            if discard.is_symlink() or not discard.is_dir():
+        if _path_entry_exists_no_follow(discard):
+            if not _replacement_discard_identity_matches(
+                discard, data, role="failed_new"
+            ):
                 return {
                     "status": "BLOCKED",
-                    "reason": "replacement_discard_home_unsafe",
+                    "reason": "replacement_discard_identity_mismatch",
                 }
             if not finalize:
                 return {
@@ -2617,7 +2932,13 @@ def reconcile_home_replacement(
                     "discard_home": str(discard),
                     "journal": str(journal),
                 }
-            shutil.rmtree(discard)
+            if not _delete_bound_replacement_discard(
+                discard, data, role="failed_new"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_delete_failed",
+                }
             _fsync_directory(parent)
         elif not finalize:
             return {
@@ -2661,11 +2982,13 @@ def reconcile_home_replacement(
                 "reason": "replacement_finalize_state_ambiguous",
                 "journal_status": status,
             }
-        if discard.exists():
-            if discard.is_symlink() or not discard.is_dir():
+        if _path_entry_exists_no_follow(discard):
+            if not _replacement_discard_identity_matches(
+                discard, data, role="rollback_old"
+            ):
                 return {
                     "status": "BLOCKED",
-                    "reason": "replacement_discard_home_unsafe",
+                    "reason": "replacement_discard_identity_mismatch",
                 }
             if not finalize:
                 return {
@@ -2674,7 +2997,13 @@ def reconcile_home_replacement(
                     "discard_home": str(discard),
                     "journal": str(journal),
                 }
-            shutil.rmtree(discard)
+            if not _delete_bound_replacement_discard(
+                discard, data, role="rollback_old"
+            ):
+                return {
+                    "status": "BLOCKED",
+                    "reason": "replacement_discard_delete_failed",
+                }
             _fsync_directory(parent)
         elif not finalize:
             return {

@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import signal
 import sqlite3
 import tempfile
 import unittest
@@ -37,6 +38,126 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertIn(result["migration_history"][-1]["details"]["kind"], {
             "transactional_upgrade", "observed_existing_schema",
         })
+
+    def test_schema_version_drift_blocks_state_check(self):
+        with self.orch.connect() as conn:
+            conn.execute("PRAGMA user_version=99")
+
+        result = check_state(self.orch)
+
+        self.assertEqual(result["schema_version"], 99)
+        self.assertEqual(result["expected_schema_version"], 4)
+        self.assertEqual(result["quick_check"], ["ok"])
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_backup_refuses_schema_version_drift_before_output(self):
+        with self.orch.connect() as conn:
+            conn.execute("PRAGMA user_version=99")
+
+        with self.assertRaisesRegex(ValueError, "state_integrity_blocked"):
+            backup_state(self.orch)
+
+        self.assertFalse((self.root / "backups").exists())
+
+    def test_state_check_reports_missing_claims_without_recreating_it(self):
+        claims = self.orch.runtime / "claims"
+        claims.rmdir()
+        prior_umask = os.umask(0o077)
+        try:
+            result = check_state(self.orch)
+        finally:
+            os.umask(prior_umask)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["capabilities"]["directory_status"], "MISSING")
+        self.assertFalse(claims.exists())
+        claim_path = next(
+            item for item in result["permissions"]["paths"]
+            if item["path"] == str(claims)
+        )
+        self.assertEqual(claim_path["status"], "MISSING")
+
+    def test_state_check_rejects_file_in_required_directory(self):
+        logs = self.orch.runtime / "logs"
+        logs.rmdir()
+        logs.write_text("wrong object type\n", encoding="utf-8")
+        os.chmod(logs, 0o700)
+
+        result = check_state(self.orch)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        log_path = next(
+            item for item in result["permissions"]["paths"]
+            if item["path"] == str(logs)
+        )
+        self.assertEqual(log_path["status"], "NOT_DIRECTORY")
+
+    def test_state_check_rejects_file_in_optional_directory(self):
+        projects = self.root / "projects"
+        projects.write_text("wrong object type\n", encoding="utf-8")
+        os.chmod(projects, 0o700)
+
+        result = check_state(self.orch)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        project_path = next(
+            item for item in result["permissions"]["paths"]
+            if item["path"] == str(projects.resolve())
+        )
+        self.assertEqual(project_path["status"], "NOT_DIRECTORY")
+
+    def test_state_check_reports_dangling_optional_directory_symlink(self):
+        projects = self.orch.root / "projects"
+        projects.symlink_to(
+            self.orch.root / "missing-projects", target_is_directory=True
+        )
+
+        result = check_state(self.orch)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        project_path = next(
+            item for item in result["permissions"]["paths"]
+            if item["path"] == str(projects)
+        )
+        self.assertEqual(project_path["status"], "UNSAFE_SYMLINK")
+
+    def test_recovery_inspect_does_not_read_symlinked_claims_directory(self):
+        claims = self.orch.runtime / "claims"
+        external = Path(self.tmp.name) / "foreign-claims"
+        external.mkdir()
+        (external / "FOREIGN.json").write_text("foreign\n", encoding="utf-8")
+        claims.rmdir()
+        claims.symlink_to(external, target_is_directory=True)
+
+        result = recovery_inspect(self.orch)
+
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["capabilities"]["orphan_capabilities"], [])
+        self.assertEqual(
+            result["capabilities"]["directory_status"], "UNSAFE_SYMLINK"
+        )
+        self.assertTrue((external / "FOREIGN.json").is_file())
+
+    def test_recovery_inspect_ignores_matching_external_capability(self):
+        self._load_recovery_task("RECOVERY-SYMLINK")
+        claim = self.orch.claim("worker")
+        claims = self.orch.runtime / "claims"
+        external = Path(self.tmp.name) / "external-claims"
+        external.mkdir()
+        external_capability = external / f"{claim['run_id']}.json"
+        Path(claim["capability_file"]).rename(external_capability)
+        claims.rmdir()
+        claims.symlink_to(external, target_is_directory=True)
+
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["items"][0]["classification"], "CAPABILITY_MISSING")
+        self.assertFalse(result["items"][0]["capability_present"])
+        self.assertEqual(
+            result["capabilities"]["missing_capabilities"], [claim["run_id"]]
+        )
+        self.assertTrue(external_capability.is_file())
 
     def _load_recovery_task(self, task_id="RECOVERY-1", publication=None):
         workspace = Path(self.tmp.name) / f"ws-{task_id.lower()}"
@@ -205,6 +326,126 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertEqual(check_state(self.orch)["status"], "READY")
 
+    def test_prune_capabilities_refuses_missing_claims_directory(self):
+        claims = self.orch.runtime / "claims"
+        claims.rmdir()
+
+        with self.assertRaisesRegex(
+            ValueError, "capability_directory_unsafe:MISSING"
+        ):
+            prune_capabilities(self.orch)
+
+        self.assertFalse(claims.exists())
+
+    def test_prune_capabilities_refuses_symlinked_claims_directory(self):
+        claims = self.orch.runtime / "claims"
+        external = Path(self.tmp.name) / "external-claims-prune"
+        external.mkdir()
+        foreign = external / "FOREIGN.json"
+        foreign.write_text("owner data\n", encoding="utf-8")
+        claims.rmdir()
+        claims.symlink_to(external, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            ValueError, "capability_directory_unsafe:UNSAFE_SYMLINK"
+        ):
+            prune_capabilities(self.orch)
+
+        self.assertTrue(claims.is_symlink())
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "owner data\n")
+
+    def test_prune_capabilities_does_not_follow_swapped_claims_directory(self):
+        claims = self.orch.runtime / "claims"
+        orphan = claims / "ORPHAN.json"
+        orphan.write_text("orphan data\n", encoding="utf-8")
+        moved_claims = self.orch.runtime / "claims-original"
+        external = Path(self.tmp.name) / "external-claims-race"
+        external.mkdir()
+        foreign = external / orphan.name
+        foreign.write_text("owner data\n", encoding="utf-8")
+        original_check = state_module.check_state
+
+        def swap_after_health(orch):
+            result = original_check(orch)
+            claims.rename(moved_claims)
+            claims.symlink_to(external, target_is_directory=True)
+            return result
+
+        with mock.patch.object(
+            state_module, "check_state", side_effect=swap_after_health
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "capability_directory_unsafe:CHANGED"
+            ):
+                prune_capabilities(self.orch)
+
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "owner data\n")
+        self.assertEqual(
+            (moved_claims / orphan.name).read_text(encoding="utf-8"),
+            "orphan data\n",
+        )
+
+    def test_prune_capabilities_rejects_replaced_regular_directory(self):
+        claims = self.orch.runtime / "claims"
+        orphan = claims / "ORPHAN.json"
+        orphan.write_text("orphan data\n", encoding="utf-8")
+        moved_claims = self.orch.runtime / "claims-original"
+        replacement = Path(self.tmp.name) / "replacement-claims"
+        replacement.mkdir()
+        (replacement / orphan.name).write_text(
+            "owner data\n", encoding="utf-8"
+        )
+        original_check = state_module.check_state
+
+        def replace_after_health(orch):
+            result = original_check(orch)
+            claims.rename(moved_claims)
+            replacement.rename(claims)
+            return result
+
+        with mock.patch.object(
+            state_module, "check_state", side_effect=replace_after_health
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "capability_directory_unsafe:CHANGED"
+            ):
+                prune_capabilities(self.orch)
+
+        self.assertEqual(
+            (claims / orphan.name).read_text(encoding="utf-8"),
+            "owner data\n",
+        )
+        self.assertEqual(
+            (moved_claims / orphan.name).read_text(encoding="utf-8"),
+            "orphan data\n",
+        )
+
+    def test_prune_capabilities_rejects_replaced_orphan_file(self):
+        claims = self.orch.runtime / "claims"
+        orphan = claims / "ORPHAN.json"
+        orphan.write_text("orphan data\n", encoding="utf-8")
+        moved_orphan = claims / "ORPHAN-original.json"
+        original_check = state_module.check_state
+
+        def replace_after_health(orch):
+            result = original_check(orch)
+            orphan.rename(moved_orphan)
+            orphan.write_text("owner data\n", encoding="utf-8")
+            return result
+
+        with mock.patch.object(
+            state_module, "check_state", side_effect=replace_after_health
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "capability_artifact_changed:ORPHAN"
+            ):
+                prune_capabilities(self.orch)
+
+        self.assertEqual(orphan.read_text(encoding="utf-8"), "owner data\n")
+        self.assertEqual(
+            moved_orphan.read_text(encoding="utf-8"), "orphan data\n"
+        )
+
     def test_backup_excludes_claims_and_contains_consistent_database(self):
         (self.root / "config.json").write_text('{"schema_version":1}\n')
         (self.orch.runtime / "logs" / "event.json").write_text('{"ok":true}\n')
@@ -259,6 +500,137 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(
             victim.read_text(encoding="utf-8"), "external secret\n"
         )
+
+    def test_backup_member_ancestor_symlink_swap_fails_closed(self):
+        plans = self.root / "plans"
+        plans.mkdir(mode=0o700, exist_ok=True)
+        ancestor = plans / "sub"
+        ancestor.mkdir(mode=0o700)
+        (ancestor / "file.json").write_text(
+            '{"source":"orch"}\n', encoding="utf-8"
+        )
+        external = Path(self.tmp.name) / "external-plans"
+        external.mkdir()
+        external_file = external / "file.json"
+        external_file.write_text(
+            '{"source":"external secret"}\n', encoding="utf-8"
+        )
+        output = Path(self.tmp.name) / "ancestor-race.zip"
+        original = state_module._backup_members
+
+        def swap_ancestor_after_census(orch):
+            members = original(orch)
+            ancestor.rename(ancestor.with_name("sub-original"))
+            ancestor.symlink_to(external, target_is_directory=True)
+            return members
+
+        with mock.patch.object(
+            state_module,
+            "_backup_members",
+            side_effect=swap_ancestor_after_census,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "backup_member_unsafe:plans/sub/file.json"
+            ):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            external_file.read_text(encoding="utf-8"),
+            '{"source":"external secret"}\n',
+        )
+
+    def test_backup_member_home_parent_symlink_swap_fails_closed(self):
+        live_parent = Path(self.tmp.name) / "nested-live"
+        root = live_parent / "orch"
+        root.mkdir(parents=True, mode=0o700)
+        orch = Orchestrator(root)
+        plans = root / "plans"
+        plans.mkdir(mode=0o700)
+        source = plans / "sub"
+        source.mkdir(mode=0o700)
+        (source / "file.json").write_text(
+            '{"source":"orch"}\n', encoding="utf-8"
+        )
+
+        external_parent = Path(self.tmp.name) / "external-parent"
+        external = external_parent / "orch" / "plans" / "sub"
+        external.mkdir(parents=True)
+        external_file = external / "file.json"
+        external_file.write_text(
+            '{"source":"external secret"}\n', encoding="utf-8"
+        )
+        output = Path(self.tmp.name) / "home-parent-race.zip"
+        moved_parent = Path(self.tmp.name) / "nested-live-original"
+        original = state_module._backup_members
+
+        def swap_home_parent_after_census(current_orch):
+            members = original(current_orch)
+
+            def swapped_members():
+                live_parent.rename(moved_parent)
+                live_parent.symlink_to(external_parent, target_is_directory=True)
+                try:
+                    yield from members
+                finally:
+                    live_parent.unlink()
+                    moved_parent.rename(live_parent)
+
+            return swapped_members()
+
+        with mock.patch.object(
+            state_module,
+            "_backup_members",
+            side_effect=swap_home_parent_after_census,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "backup_member_unsafe:plans/sub/file.json"
+            ):
+                backup_state(orch, output)
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            external_file.read_text(encoding="utf-8"),
+            '{"source":"external secret"}\n',
+        )
+
+    def test_backup_member_fifo_fails_closed_without_blocking(self):
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO nonblocking open unavailable")
+        config = self.root / "config.json"
+        config.write_text('{"profile":"safe"}\n', encoding="utf-8")
+        output = Path(self.tmp.name) / "fifo-member-backup.zip"
+        original = state_module._backup_members
+        swapped = False
+
+        def swap_after_census(orch):
+            nonlocal swapped
+            members = original(orch)
+            if not swapped:
+                config.unlink()
+                os.mkfifo(config)
+                swapped = True
+            return members
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError("fifo_open_blocked")
+
+        previous = signal.signal(signal.SIGALRM, timeout_handler)
+        try:
+            signal.alarm(2)
+            with mock.patch.object(
+                state_module,
+                "_backup_members",
+                side_effect=swap_after_census,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "backup_member_unsafe:config.json"
+                ):
+                    backup_state(self.orch, output)
+            signal.alarm(0)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertFalse(output.exists())
+        self.assertTrue(config.exists())
 
     def test_backup_output_is_symlink_safe_and_temp_name_is_exclusive(self):
         victim = Path(self.tmp.name) / "backup-victim.bin"
@@ -349,6 +721,27 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(checked["errors"], ["backup_not_regular_file"])
         self.assertEqual(Path(checked["path"]), link)
 
+    def test_backup_verifier_rejects_fifo_source_without_blocking(self):
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO nonblocking open unavailable")
+        fifo = Path(self.tmp.name) / "backup-source.fifo"
+        os.mkfifo(fifo)
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError("fifo_open_blocked")
+
+        previous = signal.signal(signal.SIGALRM, timeout_handler)
+        try:
+            signal.alarm(2)
+            checked = verify_backup_archive(fifo)
+            signal.alarm(0)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertEqual(checked["errors"], ["backup_not_regular_file"])
+        self.assertEqual(Path(checked["path"]), fifo)
+
     def test_restore_blocks_source_change_after_verification(self):
         source_path = Path(backup_state(self.orch)["path"])
         destination = Path(self.tmp.name) / "changed-source-restore"
@@ -424,6 +817,29 @@ class StateMaintenanceTests(unittest.TestCase):
             checked["nonrestorable_members"],
             ["files/manual-owner-note.json"],
         )
+
+    def test_backup_verifier_rejects_noncanonical_file_member(self):
+        source_path = Path(backup_state(self.orch)["path"])
+        legacy = Path(self.tmp.name) / "legacy-noncanonical-member.zip"
+        with zipfile.ZipFile(source_path, "r") as source, zipfile.ZipFile(
+            legacy, "w", compression=zipfile.ZIP_DEFLATED
+        ) as target:
+            for info in source.infolist():
+                data = source.read(info.filename)
+                if info.filename == "state/manifest.json":
+                    manifest = json.loads(data.decode("utf-8"))
+                    manifest.pop("file_evidence")
+                    data = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+                target.writestr(info, data)
+
+        self.assertEqual(verify_backup_archive(legacy)["status"], "VERIFIED")
+        with zipfile.ZipFile(legacy, "a") as archive:
+            archive.writestr("files/plans/.", b"not a plan file")
+
+        checked = verify_backup_archive(legacy)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("unsafe_backup_member", checked["errors"])
+        self.assertIn("files/plans/.", checked["unsafe_members"])
 
     def test_backup_verifier_rejects_invalid_zip(self):
         invalid = self.root / "invalid-backup.zip"
@@ -751,7 +1167,7 @@ class StateMaintenanceTests(unittest.TestCase):
 
         def flaky(path, data):
             calls["count"] += 1
-            if calls["count"] == 1:
+            if calls["count"] == 2:
                 raise OSError("synthetic finalize journal gap")
             return original_write(path, data)
 
@@ -765,6 +1181,84 @@ class StateMaintenanceTests(unittest.TestCase):
         finished = reconcile_home_replacement(live, finalize=True)
         self.assertEqual(finished["status"], "COMPLETE")
         self.assertTrue((live / "replacement-receipt.json").is_file())
+
+    def test_replace_finalize_preserves_replaced_discard_after_crash(self):
+        live, _source, archive = self._replacement_fixture(
+            "replace-finalize-discard-swap"
+        )
+        replaced = replace_home_from_backup(archive, live)
+        journal = Path(replaced["journal"])
+        original_write = state_module._replacement_write
+        calls = {"count": 0}
+
+        def fail_after_discard_rename(path, data):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("synthetic finalize identity gap")
+            return original_write(path, data)
+
+        with mock.patch.object(
+            state_module,
+            "_replacement_write",
+            side_effect=fail_after_discard_rename,
+        ):
+            with self.assertRaisesRegex(
+                OSError, "synthetic finalize identity gap"
+            ):
+                reconcile_home_replacement(live, finalize=True)
+
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        discard = Path(data["discard_home"])
+        original_discard = discard.with_name(discard.name + "-original")
+        discard.rename(original_discard)
+        discard.mkdir()
+        owner = discard / "owner.txt"
+        owner.write_text("preserve owner bytes\n", encoding="utf-8")
+
+        blocked = reconcile_home_replacement(live)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["reason"], "replacement_discard_identity_mismatch"
+        )
+        self.assertEqual(
+            owner.read_text(encoding="utf-8"), "preserve owner bytes\n"
+        )
+        self.assertTrue(original_discard.is_dir())
+        self.assertTrue(journal.is_file())
+
+    def test_replace_finalize_blocks_dangling_discard_symlink(self):
+        live, _source, archive = self._replacement_fixture(
+            "replace-finalize-dangling-discard"
+        )
+        replaced = replace_home_from_backup(archive, live)
+        journal = Path(replaced["journal"])
+        with mock.patch.object(
+            state_module,
+            "_delete_bound_replacement_discard",
+            side_effect=OSError("synthetic delete interruption"),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "synthetic delete interruption"
+            ):
+                reconcile_home_replacement(live, finalize=True)
+
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "FINALIZE_PENDING_DELETE")
+        discard = Path(data["discard_home"])
+        original_discard = discard.with_name(discard.name + "-original")
+        discard.rename(original_discard)
+        missing = discard.with_name(discard.name + "-missing")
+        discard.symlink_to(missing, target_is_directory=True)
+
+        blocked = reconcile_home_replacement(live, finalize=True)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["reason"], "replacement_discard_identity_mismatch"
+        )
+        self.assertTrue(discard.is_symlink())
+        self.assertFalse(discard.exists())
+        self.assertTrue(original_discard.is_dir())
+        self.assertTrue(journal.is_file())
 
     def test_replace_rollback_restores_old_home_and_retains_new_copy(self):
         live, _source, archive = self._replacement_fixture("rollback-happy")
@@ -851,7 +1345,7 @@ class StateMaintenanceTests(unittest.TestCase):
 
         def flaky(path, data):
             calls["count"] += 1
-            if calls["count"] == 1:
+            if calls["count"] == 2:
                 raise OSError("synthetic rollback finalize gap")
             return original_write(path, data)
 
@@ -865,6 +1359,88 @@ class StateMaintenanceTests(unittest.TestCase):
         finished = reconcile_home_replacement(live, finalize=True)
         self.assertEqual(finished["status"], "COMPLETE")
         self.assertEqual(finished["outcome"], "ROLLED_BACK")
+
+    def test_replace_rollback_finalize_preserves_replaced_discard_after_crash(self):
+        live, _source, archive = self._replacement_fixture(
+            "rollback-finalize-discard-swap"
+        )
+        replaced = replace_home_from_backup(archive, live)
+        journal = Path(replaced["journal"])
+        reconcile_home_replacement(live, rollback=True)
+        original_write = state_module._replacement_write
+        calls = {"count": 0}
+
+        def fail_after_discard_rename(path, data):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("synthetic rollback finalize identity gap")
+            return original_write(path, data)
+
+        with mock.patch.object(
+            state_module,
+            "_replacement_write",
+            side_effect=fail_after_discard_rename,
+        ):
+            with self.assertRaisesRegex(
+                OSError, "synthetic rollback finalize identity gap"
+            ):
+                reconcile_home_replacement(live, finalize=True)
+
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        discard = Path(data["discard_home"])
+        original_discard = discard.with_name(discard.name + "-original")
+        discard.rename(original_discard)
+        discard.mkdir()
+        owner = discard / "owner.txt"
+        owner.write_text("preserve owner bytes\n", encoding="utf-8")
+
+        blocked = reconcile_home_replacement(live)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["reason"], "replacement_discard_identity_mismatch"
+        )
+        self.assertEqual(
+            owner.read_text(encoding="utf-8"), "preserve owner bytes\n"
+        )
+        self.assertTrue(original_discard.is_dir())
+        self.assertTrue(journal.is_file())
+
+    def test_replace_rollback_finalize_blocks_dangling_discard_symlink(self):
+        live, _source, archive = self._replacement_fixture(
+            "rollback-finalize-dangling-discard"
+        )
+        replaced = replace_home_from_backup(archive, live)
+        journal = Path(replaced["journal"])
+        reconcile_home_replacement(live, rollback=True)
+        with mock.patch.object(
+            state_module,
+            "_delete_bound_replacement_discard",
+            side_effect=OSError("synthetic rollback delete interruption"),
+        ):
+            with self.assertRaisesRegex(
+                OSError, "synthetic rollback delete interruption"
+            ):
+                reconcile_home_replacement(live, finalize=True)
+
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(
+            data["status"], "ROLLBACK_FINALIZE_PENDING_DELETE"
+        )
+        discard = Path(data["discard_home"])
+        original_discard = discard.with_name(discard.name + "-original")
+        discard.rename(original_discard)
+        missing = discard.with_name(discard.name + "-missing")
+        discard.symlink_to(missing, target_is_directory=True)
+
+        blocked = reconcile_home_replacement(live, finalize=True)
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["reason"], "replacement_discard_identity_mismatch"
+        )
+        self.assertTrue(discard.is_symlink())
+        self.assertFalse(discard.exists())
+        self.assertTrue(original_discard.is_dir())
+        self.assertTrue(journal.is_file())
 
     def test_replacement_recovery_inspect_is_read_only_for_new_active(self):
         live, _source, archive = self._replacement_fixture("inspect-new-active")
@@ -1246,6 +1822,37 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertTrue(rogue.exists())
         self.assertFalse(result["bounded"])
         self.assertEqual(result["evidence"]["unmanaged"][0]["reason"], "unknown_run")
+
+    def test_retention_reports_dangling_unmanaged_log_symlink(self):
+        link = self.orch.logs / "manual-link.json"
+        link.symlink_to(self.orch.logs / "missing-log.json")
+
+        status = retention_status(self.orch)
+
+        self.assertEqual(status["status"], "ATTENTION")
+        self.assertEqual(status["evidence"]["unmanaged"], [{
+            "path": str(link), "reason": "non_regular_or_symlink",
+        }])
+        pruned = prune_retention(
+            self.orch, older_than_days=0, max_evidence_bytes=0,
+            keep_recent_runs=0, keep_backups=1, max_backup_bytes=0,
+        )
+        self.assertFalse(pruned["bounded"])
+        self.assertTrue(link.is_symlink())
+
+    def test_retention_reports_dangling_unmanaged_backup_symlink(self):
+        backups = self.orch.root / "backups"
+        backups.mkdir()
+        link = backups / "owner-copy.zip"
+        link.symlink_to(backups / "missing-backup.zip")
+
+        status = retention_status(self.orch)
+
+        self.assertEqual(status["status"], "ATTENTION")
+        self.assertEqual(status["backups"]["unmanaged"], [{
+            "path": str(link), "reason": "unmanaged_backup_artifact",
+        }])
+        self.assertTrue(link.is_symlink())
 
     def test_retention_prunes_only_managed_backup_files(self):
         backups = self.root / "backups"
