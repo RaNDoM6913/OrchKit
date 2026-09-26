@@ -223,7 +223,11 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertFalse(item["checkpoint"]["writer_reservation_released"])
         self.assertFalse(item["checkpoint"]["capability_revoked"])
         self.assertFalse(item["checkpoint"]["safe_to_resume_elsewhere"])
-        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
+        steps = " ".join(item["safe_next_steps"])
+        self.assertIn("Do not abort/retry", steps)
+        self.assertIn("--process-inactivity-confirmed", steps)
+        self.assertIn("After inactivity is independently proven", steps)
+        self.assertIn("not OS/process fencing", steps)
         self.assertTrue(cap.is_file())
 
         self.orch.checkpoint(
@@ -235,9 +239,9 @@ class StateMaintenanceTests(unittest.TestCase):
             active_item["classification"], "CHECKPOINTED_WORKER_ACTIVE"
         )
         self.assertEqual(active_item["checkpoint"]["process_state"], "active")
-        self.assertIn(
-            "same observed worker", " ".join(active_item["safe_next_steps"])
-        )
+        active_steps = " ".join(active_item["safe_next_steps"])
+        self.assertIn("same observed worker", active_steps)
+        self.assertNotIn("--process-inactivity-confirmed", active_steps)
 
         with self.orch.connect() as conn:
             run = conn.execute(
