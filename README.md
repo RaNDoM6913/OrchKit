@@ -76,12 +76,13 @@ The current implementation is designed to provide:
 
 - one active writer reservation for a shared project authority;
 - explicit allowed paths and protected pre-existing content;
+- an admitted bounded-task contract with acceptance criteria, non-goals, advisory execution-budget provenance, and per-check timeout/output/recovery metadata visible through queue readback;
 - local verification of the workspace and registered commands after the worker has quiesced;
 - review and owner approval bound to the verified snapshot;
 - guarded Git publication with an expected base, empty pre-existing staging, exact changed-path staging, ordinary non-force push, and remote-ref verification;
 - recovery states for uncertain outcomes instead of silently treating them as success.
 
-These are workflow controls. They do not make a worker trustworthy by assertion, and they do not turn same-user terminal access into a security boundary.
+Execution-budget metadata is currently advisory: it does not stop a worker, expire a writer reservation, or prove that an external/direct-RDC process has stopped. These are workflow controls. They do not make a worker trustworthy by assertion, and they do not turn same-user terminal access into a security boundary.
 
 ## Security boundary
 
