@@ -87,7 +87,8 @@ def read_rdc(home: Path) -> Dict[str, Any]:
 
 def validate_route_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     allowed = {
-        "schema_version", "surface", "transport", "device_id", "device_name",
+        "schema_version", "run_id", "task_id", "surface", "transport",
+        "device_id", "device_name",
         "model", "reasoning", "usage", "observed_at", "source",
         "work_used", "codex_execution_used", "model_api_used",
         "external_provider_used",
@@ -98,6 +99,13 @@ def validate_route_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     version = evidence.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool) or version != 1:
         raise ValueError("route_evidence_invalid_schema")
+    for field in ("run_id", "task_id"):
+        value = evidence.get(field)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", value) is None
+        ):
+            raise ValueError("route_evidence_invalid_" + field)
     if evidence.get("surface") != "ordinary_chat":
         raise ValueError("route_evidence_invalid_surface")
     if evidence.get("transport") != "rdc":
@@ -118,9 +126,9 @@ def validate_route_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def record_route_evidence(
-    home: Path, *, model: str, reasoning: str, usage: str, source: str,
-    work_used: str, codex_execution_used: str, model_api_used: str,
-    external_provider_used: str,
+    home: Path, *, run_id: str, task_id: str, model: str, reasoning: str,
+    usage: str, source: str, work_used: str, codex_execution_used: str,
+    model_api_used: str, external_provider_used: str,
 ) -> Dict[str, Any]:
     rdc = read_rdc(home)
     if rdc.get("status") != "RECORDED":
@@ -128,6 +136,8 @@ def record_route_evidence(
     marker = rdc["rdc"]
     evidence = {
         "schema_version": 1,
+        "run_id": run_id,
+        "task_id": task_id,
         "surface": "ordinary_chat",
         "transport": "rdc",
         "device_id": marker["device_id"],
@@ -145,7 +155,8 @@ def record_route_evidence(
         "external_provider_used": external_provider_used,
     }
     validate_route_evidence(evidence)
-    path = home.resolve() / "worker-route-evidence.json"
+    evidence_dir = ensure_private_dir(home.resolve() / "route-evidence")
+    path = evidence_dir / f"{run_id}.json"
     atomic_write_json(path, evidence)
     return {
         "status": "RECORDED",
@@ -155,8 +166,10 @@ def record_route_evidence(
     }
 
 
-def read_route_evidence(home: Path) -> Dict[str, Any]:
-    path = home.resolve() / "worker-route-evidence.json"
+def read_route_evidence(home: Path, *, run_id: str) -> Dict[str, Any]:
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id) is None:
+        raise ValueError("route_evidence_invalid_run_id")
+    path = home.resolve() / "route-evidence" / f"{run_id}.json"
     try:
         evidence, meta = read_bounded_json_object(
             path,
@@ -169,6 +182,8 @@ def read_route_evidence(home: Path) -> Dict[str, Any]:
     except FileNotFoundError:
         return {"status": "UNVERIFIED", "path": str(path)}
     validate_route_evidence(evidence)
+    if evidence["run_id"] != run_id:
+        raise ValueError("route_evidence_run_binding_mismatch")
     rdc = read_rdc(home)
     binding_matches = (
         rdc.get("status") == "RECORDED"
