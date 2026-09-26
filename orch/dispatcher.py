@@ -17,6 +17,9 @@ from .project import ProjectRegistry
 
 
 RDC_MARKER_MAX_BYTES = 64 * 1024
+ROUTE_EVIDENCE_MAX_BYTES = 64 * 1024
+
+ROUTE_OBSERVATION_VALUES = {"yes", "no", "unknown"}
 
 
 def _bounded_marker_text(value: Any, field: str, *, max_bytes: int) -> str:
@@ -79,6 +82,107 @@ def read_rdc(home: Path) -> Dict[str, Any]:
     return {
         "status": "RECORDED", "path": str(path), "rdc": marker,
         "bytes": meta["bytes"], "mode": oct(meta["mode"]),
+    }
+
+
+def validate_route_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {
+        "schema_version", "surface", "transport", "device_id", "device_name",
+        "model", "reasoning", "usage", "observed_at", "source",
+        "work_used", "codex_execution_used", "model_api_used",
+        "external_provider_used",
+    }
+    unknown = sorted(set(evidence) - allowed)
+    if unknown:
+        raise ValueError("route_evidence_unknown_field:" + unknown[0])
+    version = evidence.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        raise ValueError("route_evidence_invalid_schema")
+    if evidence.get("surface") != "ordinary_chat":
+        raise ValueError("route_evidence_invalid_surface")
+    if evidence.get("transport") != "rdc":
+        raise ValueError("route_evidence_invalid_transport")
+    for field, limit in (
+        ("device_id", 512), ("device_name", 512), ("model", 256),
+        ("reasoning", 128), ("usage", 256), ("observed_at", 128),
+        ("source", 128),
+    ):
+        _bounded_marker_text(evidence.get(field), field, max_bytes=limit)
+    for field in (
+        "work_used", "codex_execution_used", "model_api_used",
+        "external_provider_used",
+    ):
+        if evidence.get(field) not in ROUTE_OBSERVATION_VALUES:
+            raise ValueError("route_evidence_invalid_observation:" + field)
+    return evidence
+
+
+def record_route_evidence(
+    home: Path, *, model: str, reasoning: str, usage: str, source: str,
+    work_used: str, codex_execution_used: str, model_api_used: str,
+    external_provider_used: str,
+) -> Dict[str, Any]:
+    rdc = read_rdc(home)
+    if rdc.get("status") != "RECORDED":
+        raise ValueError("route_evidence_requires_rdc_marker")
+    marker = rdc["rdc"]
+    evidence = {
+        "schema_version": 1,
+        "surface": "ordinary_chat",
+        "transport": "rdc",
+        "device_id": marker["device_id"],
+        "device_name": marker["device_name"],
+        "model": _bounded_marker_text(model, "model", max_bytes=256),
+        "reasoning": _bounded_marker_text(
+            reasoning, "reasoning", max_bytes=128
+        ),
+        "usage": _bounded_marker_text(usage, "usage", max_bytes=256),
+        "observed_at": utc_now(),
+        "source": _bounded_marker_text(source, "source", max_bytes=128),
+        "work_used": work_used,
+        "codex_execution_used": codex_execution_used,
+        "model_api_used": model_api_used,
+        "external_provider_used": external_provider_used,
+    }
+    validate_route_evidence(evidence)
+    path = home.resolve() / "worker-route-evidence.json"
+    atomic_write_json(path, evidence)
+    return {
+        "status": "RECORDED",
+        "path": str(path),
+        "route_evidence": evidence,
+        "acceptance": "NOT_EVALUATED",
+    }
+
+
+def read_route_evidence(home: Path) -> Dict[str, Any]:
+    path = home.resolve() / "worker-route-evidence.json"
+    try:
+        evidence, meta = read_bounded_json_object(
+            path,
+            max_bytes=ROUTE_EVIDENCE_MAX_BYTES,
+            unsafe_error="route_evidence_unsafe",
+            too_large_error="route_evidence_too_large",
+            invalid_error="route_evidence_invalid_json",
+            repair_mode=0o600,
+        )
+    except FileNotFoundError:
+        return {"status": "UNVERIFIED", "path": str(path)}
+    validate_route_evidence(evidence)
+    rdc = read_rdc(home)
+    binding_matches = (
+        rdc.get("status") == "RECORDED"
+        and evidence["device_id"] == rdc["rdc"]["device_id"]
+        and evidence["device_name"] == rdc["rdc"]["device_name"]
+    )
+    return {
+        "status": "RECORDED" if binding_matches else "STALE_DEVICE_BINDING",
+        "path": str(path),
+        "route_evidence": evidence,
+        "rdc_binding_matches": binding_matches,
+        "bytes": meta["bytes"],
+        "mode": oct(meta["mode"]),
+        "acceptance": "NOT_EVALUATED",
     }
 
 
