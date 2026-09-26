@@ -332,6 +332,12 @@ def recovery_inspect(
                     commands = [
                         "Verify the external ChatGPT/RDC process state; checkpoint does not prove inactivity.",
                         "Do not abort/retry or start another worker until process inactivity is independently proven.",
+                        (
+                            "After inactivity is independently proven: "
+                            f"orch abort --run-id {row['run_id']} --reason <reason> "
+                            "--retry --process-inactivity-confirmed"
+                        ),
+                        "The confirmation flag is an operator assertion, not OS/process fencing.",
                     ]
             elif capability_present:
                 classification = "WORKER_MAY_STILL_BE_ACTIVE"
