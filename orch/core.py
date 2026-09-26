@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -41,6 +42,9 @@ PLAN_MAX_CHECKS = 64
 CHECK_MAX_TIMEOUT_SEC = 300
 PLAN_MAX_ARGV = 64
 PLAN_MAX_NON_GOALS = 128
+EXECUTION_BUDGET_SCHEMA_VERSION = 1
+EXECUTION_BUDGET_MAX_MINUTES = 24 * 60
+EXECUTION_BUDGET_MAX_CONTEXT_TOKENS = 10_000_000
 
 
 def utc_now() -> str:
@@ -395,6 +399,90 @@ def _bounded_text(
     return value
 
 
+def _validate_execution_budget(item: Dict[str, Any]) -> None:
+    budget = item.get("execution_budget")
+    if budget is None:
+        return
+    if not isinstance(budget, dict):
+        raise ValueError("invalid_execution_budget")
+    allowed_fields = {
+        "schema_version", "enforcement", "estimated_work_minutes",
+        "context_budget_tokens", "capacity_source", "usage_source",
+        "observed_at", "checkpoint_action",
+    }
+    unknown = sorted(set(budget) - allowed_fields)
+    if unknown:
+        raise ValueError("unknown_execution_budget_field:" + unknown[0])
+    missing = sorted(allowed_fields - set(budget))
+    if missing:
+        raise ValueError("missing_execution_budget_field:" + missing[0])
+    if (
+        type(budget["schema_version"]) is not int
+        or budget["schema_version"] != EXECUTION_BUDGET_SCHEMA_VERSION
+    ):
+        raise ValueError("invalid_execution_budget_schema")
+    if budget["enforcement"] != "advisory":
+        raise ValueError("invalid_execution_budget_enforcement")
+
+    estimate = budget["estimated_work_minutes"]
+    if not isinstance(estimate, dict) or set(estimate) != {"min", "max"}:
+        raise ValueError("invalid_estimated_work_minutes")
+    lower = estimate["min"]
+    upper = estimate["max"]
+    for value in (lower, upper):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError("invalid_estimated_work_minutes")
+    if (
+        lower <= 0
+        or upper < lower
+        or upper > EXECUTION_BUDGET_MAX_MINUTES
+    ):
+        raise ValueError("invalid_estimated_work_minutes")
+
+    context_budget = budget["context_budget_tokens"]
+    if context_budget is not None and (
+        isinstance(context_budget, bool)
+        or not isinstance(context_budget, int)
+        or not 1 <= context_budget <= EXECUTION_BUDGET_MAX_CONTEXT_TOKENS
+    ):
+        raise ValueError("invalid_context_budget_tokens")
+
+    _bounded_text(
+        budget["capacity_source"],
+        "invalid_capacity_source",
+        max_bytes=512,
+    )
+    _bounded_text(
+        budget["usage_source"],
+        "invalid_usage_source",
+        max_bytes=512,
+    )
+    observed_at = _bounded_text(
+        budget["observed_at"],
+        "invalid_observed_at",
+        max_bytes=128,
+    )
+    if observed_at != "UNKNOWN":
+        import datetime
+        try:
+            parsed_observed_at = datetime.datetime.fromisoformat(
+                observed_at.replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("invalid_observed_at") from exc
+        if parsed_observed_at.tzinfo is None:
+            raise ValueError("invalid_observed_at")
+    _bounded_text(
+        budget["checkpoint_action"],
+        "invalid_checkpoint_action",
+        max_bytes=4096,
+    )
+
+
 def validate_task_definition(item: Dict[str, Any]) -> None:
     if not isinstance(item, dict):
         raise ValueError("invalid_task")
@@ -402,7 +490,7 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         "id", "project_id", "writer_key", "goal", "non_goals", "workspace",
         "dependencies", "allowed_paths", "protected_paths", "checks",
         "required_review", "review", "owner_acceptance", "publication",
-        "max_attempts",
+        "max_attempts", "execution_budget",
     }
     unknown = sorted(set(item) - allowed_fields)
     if unknown:
@@ -415,6 +503,7 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
     ):
         raise ValueError("invalid_task_id")
     _bounded_text(item.get("goal"), "invalid_goal", max_bytes=16 * 1024)
+    _validate_execution_budget(item)
 
     non_goals = item.get("non_goals", [])
     if not isinstance(non_goals, list) or len(non_goals) > PLAN_MAX_NON_GOALS:
