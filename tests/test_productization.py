@@ -601,6 +601,18 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(task["project_id"], config["project_id"])
         self.assertEqual(task["writer_key"], config["writer_key"])
         self.assertTrue(task["writer_key"].startswith("git:"))
+        self.assertEqual(task["execution_budget"], {
+            "schema_version": 1,
+            "enforcement": "advisory",
+            "estimated_work_minutes": {"min": 15, "max": 30},
+            "context_budget_tokens": None,
+            "capacity_source": "UNKNOWN",
+            "usage_source": "UNKNOWN",
+            "observed_at": "UNKNOWN",
+            "checkpoint_action": (
+                "Persist a checkpoint and report before an unsafe handoff."
+            ),
+        })
         self.assertEqual(config["inventory_at_registration"]["writer_key"], config["writer_key"])
 
     def test_queue_enqueue_compiles_registered_project_and_cross_plan_dependency(self):
@@ -627,6 +639,14 @@ class ProductizationTests(unittest.TestCase):
         plan1 = Path(first["plan_path"])
         self.assertEqual(plan1.stat().st_mode & 0o777, 0o600)
         self.assertEqual(plan1.parent.stat().st_mode & 0o777, 0o700)
+        first_compiled = json.loads(plan1.read_text())
+        first_budget = first_compiled["tasks"][0]["execution_budget"]
+        self.assertEqual(first_budget["enforcement"], "advisory")
+        self.assertEqual(
+            first_budget["estimated_work_minutes"], {"min": 15, "max": 30}
+        )
+        self.assertIsNone(first_budget["context_budget_tokens"])
+        self.assertEqual(first_budget["usage_source"], "UNKNOWN")
 
         rc2, second = enqueue(
             "--task-id", "ENQ-2", "--goal", "second",
@@ -645,6 +665,20 @@ class ProductizationTests(unittest.TestCase):
         by_id = {item["task_id"]: item for item in view["tasks"]}
         self.assertEqual(by_id["ENQ-1"]["queue_state"], "READY")
         self.assertEqual(by_id["ENQ-2"]["queue_state"], "WAITING_DEPENDENCY")
+        self.assertEqual(by_id["ENQ-1"]["execution_budget"], first_budget)
+
+        list_output = io.StringIO()
+        with contextlib.redirect_stdout(list_output):
+            list_rc = cli_main([
+                "--root", str(self.home), "queue", "list",
+                "--project", config["project_id"],
+            ])
+        cli_view = json.loads(list_output.getvalue())
+        self.assertEqual(list_rc, 0)
+        cli_by_id = {
+            item["task_id"]: item for item in cli_view["tasks"]
+        }
+        self.assertEqual(cli_by_id["ENQ-1"]["execution_budget"], first_budget)
 
         rc3, repeated = enqueue(
             "--task-id", "ENQ-1", "--goal", "first",

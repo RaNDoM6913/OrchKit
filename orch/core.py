@@ -2963,6 +2963,7 @@ class Orchestrator:
                 "max_attempts": max_attempts,
                 "writer_key": row["writer_key"],
                 "waiting_dependencies": waiting_dependencies,
+                "execution_budget": payload.get("execution_budget"),
             }
             if lock and queue_state == "WAITING_WRITER":
                 item["writer_lock"] = {

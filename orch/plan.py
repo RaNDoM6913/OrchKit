@@ -15,6 +15,21 @@ from .core import (PLAN_MAX_BYTES, PLAN_MAX_TASKS, normalize_relative_path,
 from .git_policy import evaluate_project_git_policy
 
 
+def default_execution_budget() -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "enforcement": "advisory",
+        "estimated_work_minutes": {"min": 15, "max": 30},
+        "context_budget_tokens": None,
+        "capacity_source": "UNKNOWN",
+        "usage_source": "UNKNOWN",
+        "observed_at": "UNKNOWN",
+        "checkpoint_action": (
+            "Persist a checkpoint and report before an unsafe handoff."
+        ),
+    }
+
+
 def build_single_task_plan(
     project: Dict[str, Any], *, task_id: str, goal: str, allowed_paths: Iterable[str],
     risk_tags: Iterable[str] = (), owner_acceptance: bool = False,
@@ -119,6 +134,7 @@ def build_single_task_plan(
         "owner_acceptance": bool(owner_acceptance),
         "publication": publication,
         "max_attempts": max_attempts,
+        "execution_budget": default_execution_budget(),
     }
     validate_task_definition(task)
     return {"schema_version": 1, "plan_revision": revision, "tasks": [task]}
