@@ -10,7 +10,8 @@ from .codex_review import run_review, subscription_preflight
 from .config import configure_home, default_home, ensure_private_dir
 from .core import Orchestrator
 from .doctor import run_doctor
-from .dispatcher import bootstrap_prompt, read_rdc, record_rdc, render_dispatcher
+from .dispatcher import (bootstrap_prompt, read_rdc, read_route_evidence,
+                         record_rdc, record_route_evidence, render_dispatcher)
 from .git_policy import evaluate_project_git_policy
 from .plan import (build_batch_plan, build_single_task_plan,
                    existing_plan_initial_base_binding,
@@ -59,6 +60,26 @@ def build_parser() -> argparse.ArgumentParser:
     rdc_record.add_argument("--device-name", required=True)
     rdc_sub.add_parser("show")
     rdc_sub.add_parser("bootstrap-prompt")
+
+    route = sub.add_parser(
+        "route", help="record or inspect observed ordinary-Chat/RDC route evidence"
+    )
+    route_sub = route.add_subparsers(dest="route_command", required=True)
+    route_record = route_sub.add_parser("record")
+    route_record.add_argument("--run-id", required=True)
+    route_record.add_argument("--model", required=True)
+    route_record.add_argument("--reasoning", required=True)
+    route_record.add_argument("--usage", required=True)
+    route_record.add_argument("--source", required=True)
+    for option in (
+        "work-used", "codex-execution-used", "model-api-used",
+        "external-provider-used",
+    ):
+        route_record.add_argument(
+            "--" + option, choices=["yes", "no", "unknown"], required=True
+        )
+    route_show = route_sub.add_parser("show")
+    route_show.add_argument("--run-id", required=True)
 
     dispatcher = sub.add_parser("dispatcher", help="render the reusable Scheduled ChatGPT prompt")
     dispatcher_sub = dispatcher.add_subparsers(dest="dispatcher_command", required=True)
@@ -298,6 +319,32 @@ def main(argv=None) -> int:
                 result = {"status": "READY", "prompt": bootstrap_prompt(root)}
             else:
                 raise ValueError("unknown_rdc_command")
+        elif args.command == "route":
+            if args.route_command == "record":
+                with orch.connect() as conn:
+                    run = conn.execute(
+                        "SELECT run_id,task_id FROM runs WHERE run_id=?",
+                        (args.run_id,),
+                    ).fetchone()
+                if run is None:
+                    raise ValueError("unknown_run")
+                result = record_route_evidence(
+                    root,
+                    run_id=run["run_id"],
+                    task_id=run["task_id"],
+                    model=args.model,
+                    reasoning=args.reasoning,
+                    usage=args.usage,
+                    source=args.source,
+                    work_used=args.work_used,
+                    codex_execution_used=args.codex_execution_used,
+                    model_api_used=args.model_api_used,
+                    external_provider_used=args.external_provider_used,
+                )
+            elif args.route_command == "show":
+                result = read_route_evidence(root, run_id=args.run_id)
+            else:
+                raise ValueError("unknown_route_command")
         elif args.command == "dispatcher":
             if args.dispatcher_command != "render":
                 raise ValueError("unknown_dispatcher_command")
