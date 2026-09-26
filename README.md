@@ -12,7 +12,7 @@ It is not a service for running untrusted code, a multi-tenant platform, or a re
 
 ## Status and support
 
-This is an early public source release. The implementation is developed and tested primarily in a macOS-oriented environment with Python 3.9+ and Git. No package release, platform support matrix, or compatibility guarantee is published yet.
+This is an early public source release. Release-readiness evidence currently covers macOS arm64 with Python 3.9 and 3.12 on the observed test environment; other platforms and interpreter versions remain unverified. No package release has been published yet. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
 
 Use the issue tracker for reproducible source-level defects and improvement proposals. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and use [SECURITY.md](SECURITY.md) for security-sensitive concerns.
 

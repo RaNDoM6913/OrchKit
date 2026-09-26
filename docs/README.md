@@ -8,6 +8,7 @@ This is the public documentation set for OrchKit. It describes the implemented w
 - [Workflow guide](workflow.md) — the operator, worker, verifier, review, approval, and publication flow.
 - [Architecture](architecture.md) — durable state and component boundaries.
 - [Security model](security-model.md) — workflow controls, trust boundaries, and what OrchKit does not protect.
+- [Compatibility](compatibility.md) — verified release-readiness environments and explicit unverified boundaries.
 - [Roadmap](../ROADMAP.md) — work that must be completed before broader release or support claims.
 
 ## Documentation standards
