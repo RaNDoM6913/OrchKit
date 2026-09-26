@@ -42,6 +42,8 @@ PLAN_MAX_CHECKS = 64
 CHECK_MAX_TIMEOUT_SEC = 300
 PLAN_MAX_ARGV = 64
 PLAN_MAX_NON_GOALS = 128
+PLAN_MAX_ACCEPTANCE = 128
+CHECK_MAX_OUTPUT_TAIL_CHARS = 64 * 1024
 EXECUTION_BUDGET_SCHEMA_VERSION = 1
 EXECUTION_BUDGET_MAX_MINUTES = 24 * 60
 EXECUTION_BUDGET_MAX_CONTEXT_TOKENS = 10_000_000
@@ -490,7 +492,7 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         "id", "project_id", "writer_key", "goal", "non_goals", "workspace",
         "dependencies", "allowed_paths", "protected_paths", "checks",
         "required_review", "review", "owner_acceptance", "publication",
-        "max_attempts", "execution_budget",
+        "max_attempts", "execution_budget", "acceptance",
     }
     unknown = sorted(set(item) - allowed_fields)
     if unknown:
@@ -504,6 +506,12 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
         raise ValueError("invalid_task_id")
     _bounded_text(item.get("goal"), "invalid_goal", max_bytes=16 * 1024)
     _validate_execution_budget(item)
+
+    acceptance = item.get("acceptance", [])
+    if not isinstance(acceptance, list) or len(acceptance) > PLAN_MAX_ACCEPTANCE:
+        raise ValueError("invalid_acceptance")
+    for value in acceptance:
+        _bounded_text(value, "invalid_acceptance_item", max_bytes=4096)
 
     non_goals = item.get("non_goals", [])
     if not isinstance(non_goals, list) or len(non_goals) > PLAN_MAX_NON_GOALS:
@@ -577,8 +585,8 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
     if not isinstance(checks, list) or len(checks) > PLAN_MAX_CHECKS:
         raise ValueError("invalid_checks")
     check_fields = {
-        "id", "argv", "cwd", "timeout_sec",
-        "authority_paths", "authority_absent_paths",
+        "id", "argv", "cwd", "timeout_sec", "output_tail_chars",
+        "timeout_action", "authority_paths", "authority_absent_paths",
     }
     seen_check_ids = set()
     for check in checks:
@@ -614,6 +622,16 @@ def validate_task_definition(item: Dict[str, Any]) -> None:
             or not 1 <= timeout <= CHECK_MAX_TIMEOUT_SEC
         ):
             raise ValueError("invalid_check_timeout")
+        output_tail_chars = check.get("output_tail_chars", 8000)
+        if (
+            not isinstance(output_tail_chars, int)
+            or isinstance(output_tail_chars, bool)
+            or not 1 <= output_tail_chars <= CHECK_MAX_OUTPUT_TAIL_CHARS
+        ):
+            raise ValueError("invalid_check_output_tail_chars")
+        timeout_action = check.get("timeout_action", "needs_fix")
+        if timeout_action != "needs_fix":
+            raise ValueError("invalid_check_timeout_action")
         for field in ("authority_paths", "authority_absent_paths"):
             values = check.get(field, [])
             if not isinstance(values, list) or len(values) > 128:
@@ -2018,6 +2036,8 @@ class Orchestrator:
         if not cwd.is_dir():
             raise ValueError("invalid_check_cwd")
         timeout = min(max(int(check.get("timeout_sec", 30)), 1), CHECK_MAX_TIMEOUT_SEC)
+        output_tail_chars = int(check.get("output_tail_chars", 8000))
+        timeout_action = check.get("timeout_action", "needs_fix")
         executable = check.get("executable_path")
         if not isinstance(executable, str) or not Path(executable).is_absolute():
             raise ValueError("check_executable_not_bound")
@@ -2030,14 +2050,22 @@ class Orchestrator:
             result = {"id": check.get("id", "unnamed"), "argv": argv,
                       "executed_argv": executed_argv, "exit_code": proc.returncode,
                       "duration_ms": int((time.monotonic() - started) * 1000),
-                      "stdout": proc.stdout[-8000:], "stderr": proc.stderr[-8000:], "timed_out": False}
+                      "stdout": proc.stdout[-output_tail_chars:],
+                      "stderr": proc.stderr[-output_tail_chars:],
+                      "timed_out": False,
+                      "output_tail_chars": output_tail_chars,
+                      "timeout_action": timeout_action}
         except subprocess.TimeoutExpired as exc:
             result = {"id": check.get("id", "unnamed"), "argv": argv,
                       "executed_argv": executed_argv, "exit_code": None,
                       "duration_ms": int((time.monotonic() - started) * 1000),
-                      "stdout": (exc.stdout or "")[-8000:] if isinstance(exc.stdout, str) else "",
-                      "stderr": (exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "",
-                      "timed_out": True}
+                      "stdout": ((exc.stdout or "")[-output_tail_chars:]
+                                 if isinstance(exc.stdout, str) else ""),
+                      "stderr": ((exc.stderr or "")[-output_tail_chars:]
+                                 if isinstance(exc.stderr, str) else ""),
+                      "timed_out": True,
+                      "output_tail_chars": output_tail_chars,
+                      "timeout_action": timeout_action}
         log_path = self.logs / (
             f"{run_id}-check-result-"
             f"{str(check.get('id','check')).replace('/','_')}.json"
