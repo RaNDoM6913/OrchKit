@@ -86,6 +86,80 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(first['status'],'CLAIMED'); self.assertEqual(second['status'],'BUSY')
         self.assertEqual(second['active']['run_id'],first['run_id'])
 
+    def test_checkpoint_persists_without_releasing_writer_or_capability(self):
+        self.load([self.task("CHECKPOINT-1"), self.task("CHECKPOINT-2")],
+                  revision="checkpoint-persist")
+        first = self.orch.claim("worker-checkpoint")
+        cap = Path(first["capability_file"])
+        lease = self.orch.lease_from_capability(first["run_id"], cap)
+
+        recorded = self.orch.checkpoint(
+            first["run_id"], lease, "context threshold approaching", "unknown"
+        )
+
+        self.assertEqual(recorded["status"], "CHECKPOINTED")
+        self.assertFalse(recorded["details"]["writer_reservation_released"])
+        self.assertFalse(recorded["details"]["capability_revoked"])
+        self.assertFalse(recorded["details"]["safe_to_resume_elsewhere"])
+        self.assertTrue(cap.is_file())
+        status = self.orch.status()
+        run = next(item for item in status["runs"]
+                   if item["run_id"] == first["run_id"])
+        self.assertEqual(run["state"], "RUNNING")
+        blocked = self.orch.claim("second-worker")
+        self.assertEqual(blocked["status"], "BUSY")
+        self.assertEqual(blocked["active"]["run_id"], first["run_id"])
+
+        with self.orch.connect() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (f"run_checkpoint:{first['run_id']}",),
+            ).fetchone()
+        saved = json.loads(row["value_json"])
+        self.assertEqual(saved["reason"], "context threshold approaching")
+        self.assertEqual(saved["process_state"], "unknown")
+
+    def test_checkpoint_updates_latest_record_and_rejects_unsafe_states(self):
+        self.load([self.task("CHECKPOINT-LATEST")],
+                  revision="checkpoint-latest")
+        claim = self.orch.claim("worker-checkpoint")
+        cap = Path(claim["capability_file"])
+        lease = self.orch.lease_from_capability(claim["run_id"], cap)
+
+        first = self.orch.checkpoint(
+            claim["run_id"], lease, "first checkpoint", "unknown"
+        )
+        second = self.orch.checkpoint(
+            claim["run_id"], lease, "worker still active", "active"
+        )
+        self.assertEqual(first["status"], "CHECKPOINTED")
+        self.assertEqual(second["details"]["reason"], "worker still active")
+        with self.orch.connect() as conn:
+            rows = conn.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (f"run_checkpoint:{claim['run_id']}",),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]["value_json"])["process_state"], "active")
+
+        with self.assertRaisesRegex(ValueError, "invalid_checkpoint_process_state"):
+            self.orch.checkpoint(claim["run_id"], lease, "bad", "stopped")
+        with self.assertRaisesRegex(ValueError, "checkpoint_reason_required"):
+            self.orch.checkpoint(claim["run_id"], lease, "   ")
+
+        receipt = Path(claim["receipt_file"])
+        (self.ws / "CHECKPOINT-LATEST.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        receipt.write_text(json.dumps({
+            "run_id": claim["run_id"],
+            "task_id": "CHECKPOINT-LATEST",
+            "changed_paths": ["CHECKPOINT-LATEST.json"],
+        }) + "\n", encoding="utf-8")
+        self.orch.submit(claim["run_id"], lease, receipt)
+        with self.assertRaisesRegex(ValueError, "run_not_running"):
+            self.orch.checkpoint(claim["run_id"], lease, "too late")
+
     def test_verified_run_keeps_writer_lock_until_completion(self):
         self.load([self.task("VERIFY-1"), self.task("VERIFY-2")], revision="verified-lock")
         first = self.orch.claim("w1")
