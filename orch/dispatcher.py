@@ -125,6 +125,38 @@ def validate_route_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     return evidence
 
 
+def _create_private_json_once(path: Path, value: Dict[str, Any]) -> None:
+    data = (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        raise ValueError("route_evidence_unsafe")
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError("route_evidence_already_recorded") from exc
+    except OSError as exc:
+        raise ValueError("route_evidence_unsafe") from exc
+    try:
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("short route evidence write")
+            offset += written
+        os.fsync(fd)
+    except OSError as exc:
+        raise ValueError("route_evidence_write_failed") from exc
+    finally:
+        os.close(fd)
+
+
 def record_route_evidence(
     home: Path, *, run_id: str, task_id: str, model: str, reasoning: str,
     usage: str, source: str, work_used: str, codex_execution_used: str,
@@ -157,7 +189,7 @@ def record_route_evidence(
     validate_route_evidence(evidence)
     evidence_dir = ensure_private_dir(home.resolve() / "route-evidence")
     path = evidence_dir / f"{run_id}.json"
-    atomic_write_json(path, evidence)
+    _create_private_json_once(path, evidence)
     return {
         "status": "RECORDED",
         "path": str(path),
