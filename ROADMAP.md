@@ -15,10 +15,10 @@ OrchKit is published as an early source project. This roadmap records the public
 The next capability work is intentionally split into small, dependency-ordered milestones. The runtime/test hardening already integrated on `main` is the baseline; this section describes what is still planned.
 
 1. **P0-1 — complete: plan admission budgets and visible CLI.** The runtime admits a versioned advisory execution-budget contract, preserves legacy plans, generates bounded defaults, records acceptance/non-goals and per-check deadline/output/recovery metadata, and exposes a safe contract summary through `orch queue list` before claim. Invalid contracts fail before task admission.
-2. **P0-2 — next: checkpoint/pause recovery with writer/process safety.** Preserve incomplete work without releasing an uncertain writer. Timeouts or missing telemetry must not expire leases. Recovery must remain visibly blocked when process inactivity cannot be proven.
-3. **P0-3: ordinary Chat/RDC route acceptance.** Demonstrate a real fresh ordinary ChatGPT conversation executing a bounded task through RDC with review off, deterministic local verification, truthful route/usage evidence, and no Work/Codex/API fallback.
+2. **P0-2 — complete: cooperative checkpoint/recovery with writer/process safety.** An active `RUNNING` attempt can persist a checkpoint without releasing its writer reservation or capability. Recovery distinguishes active from unknown external process state, fails closed on malformed checkpoint data, and does not recommend blind retry. A checkpointed attempt may be aborted/retried only after the operator independently confirms process inactivity with `--process-inactivity-confirmed`; that confirmation is recorded as an operator assertion, not OS/process fencing.
+3. **P0-3 — next: ordinary Chat/RDC route acceptance.** Demonstrate a real fresh ordinary ChatGPT conversation executing a bounded task through RDC with review off, deterministic local verification, truthful route/usage evidence, and no Work/Codex/API fallback.
 
-Current dispatcher and RDC support are useful building blocks, but they do not by themselves prove ordinary-Chat creation/continuation. Safe suspension/resumption of an incomplete attempt is also not yet an implemented guarantee.
+Current dispatcher and RDC support are useful building blocks, but they do not by themselves prove ordinary-Chat creation/continuation. P0-2 provides durable cooperative checkpoint/recovery and safe blocked disposition, but it does not provide OS/process fencing, automatic proof of process inactivity, or transparent cross-conversation resume of the same `RUNNING` attempt.
 
 ## Before a versioned release
 

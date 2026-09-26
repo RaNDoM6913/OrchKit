@@ -16,5 +16,5 @@
 - Prioritize a visible bounded-task admission contract first, then checkpoint/pause recovery with writer/process safety, then actual ordinary-Chat/RDC route acceptance.
 - Treat time and context budgets as planning and recovery inputs, never as lease expiry, proof of process inactivity, or permission to skip verification.
 - Record worker context telemetry with its source and observation time when available; otherwise report `UNKNOWN` rather than inventing a count.
-- Current pause behavior blocks new claims only. Quiesce requires `RESULT_SUBMITTED`; safe suspension/resumption of an incomplete attempt is not yet an implemented guarantee.
+- Current pause behavior blocks new claims only. A `RUNNING` attempt may persist a durable checkpoint without releasing its writer reservation/capability; recovery must stay blocked while external process activity is unknown. Releasing a checkpointed attempt requires explicit independent process-inactivity confirmation, recorded as an operator assertion rather than OS/process fencing. Quiesce still requires `RESULT_SUBMITTED`; automatic fencing and transparent cross-conversation resume of the same `RUNNING` attempt are not implemented.
 - Public CLI and documentation must distinguish implemented controls from planned behavior and must not claim route acceptance from a prompt/template alone.
