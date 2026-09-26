@@ -40,6 +40,18 @@ class PlanAdmissionTests(unittest.TestCase):
             "max_attempts": 2,
         }
 
+    def execution_budget(self):
+        return {
+            "schema_version": 1,
+            "enforcement": "advisory",
+            "estimated_work_minutes": {"min": 15, "max": 30},
+            "context_budget_tokens": None,
+            "capacity_source": "UNKNOWN",
+            "usage_source": "UNKNOWN",
+            "observed_at": "UNKNOWN",
+            "checkpoint_action": "Persist a checkpoint before unsafe handoff.",
+        }
+
     def write_plan(self, data, name="plan.json"):
         path = self.base / name
         raw = (json.dumps(data, sort_keys=True) + "\n").encode("utf-8")
@@ -65,6 +77,149 @@ class PlanAdmissionTests(unittest.TestCase):
         self.assertEqual(loaded["queued_count"], 1)
         self.assertEqual(loaded["plan_bytes"], len(raw))
         self.assertEqual(loaded["digest"], hashlib.sha256(raw).hexdigest())
+
+    def test_execution_budget_is_versioned_advisory_and_persisted(self):
+        task = self.task("BUDGET-VALID")
+        budget = self.execution_budget()
+        task["execution_budget"] = budget
+        path, _ = self.write_plan(
+            self.plan(tasks=[task], revision="budget-valid"),
+            name="budget-valid.json",
+        )
+
+        loaded = self.orch.load_plan(path)
+
+        self.assertEqual(loaded["status"], "OK")
+        with self.orch.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM tasks WHERE task_id=?",
+                ("BUDGET-VALID",),
+            ).fetchone()
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["execution_budget"], budget)
+
+    def test_execution_budget_rejects_invalid_contract_without_admission(self):
+        cases = []
+
+        value = self.execution_budget()
+        value["schema_version"] = 2
+        cases.append(("schema", value, "invalid_execution_budget_schema"))
+
+        value = self.execution_budget()
+        value["schema_version"] = True
+        cases.append((
+            "bool-schema", value, "invalid_execution_budget_schema"
+        ))
+
+        value = self.execution_budget()
+        value["enforcement"] = "automatic"
+        cases.append((
+            "enforcement", value, "invalid_execution_budget_enforcement"
+        ))
+
+        value = self.execution_budget()
+        value["surprise"] = True
+        cases.append((
+            "unknown", value, "unknown_execution_budget_field:surprise"
+        ))
+
+        value = self.execution_budget()
+        value.pop("capacity_source")
+        cases.append((
+            "missing-capacity-source", value,
+            "missing_execution_budget_field:capacity_source",
+        ))
+
+        value = self.execution_budget()
+        value.pop("usage_source")
+        cases.append((
+            "missing-usage-source", value,
+            "missing_execution_budget_field:usage_source",
+        ))
+
+        value = self.execution_budget()
+        value.pop("observed_at")
+        cases.append((
+            "missing-observed-at", value,
+            "missing_execution_budget_field:observed_at",
+        ))
+
+        value = self.execution_budget()
+        value["observed_at"] = "2026-09-26T12:00:00"
+        cases.append((
+            "naive-observed-at", value, "invalid_observed_at"
+        ))
+
+        value = self.execution_budget()
+        value["observed_at"] = "not-a-timestamp"
+        cases.append((
+            "invalid-observed-at", value, "invalid_observed_at"
+        ))
+
+        value = self.execution_budget()
+        value["estimated_work_minutes"]["min"] = -1
+        cases.append((
+            "negative-minutes", value, "invalid_estimated_work_minutes"
+        ))
+
+        value = self.execution_budget()
+        value["estimated_work_minutes"]["max"] = float("inf")
+        cases.append((
+            "nonfinite-minutes", value, "invalid_estimated_work_minutes"
+        ))
+
+        value = self.execution_budget()
+        value["estimated_work_minutes"] = {"min": 30, "max": 15}
+        cases.append((
+            "reversed-minutes", value, "invalid_estimated_work_minutes"
+        ))
+
+        value = self.execution_budget()
+        value["context_budget_tokens"] = -1
+        cases.append((
+            "negative-context", value, "invalid_context_budget_tokens"
+        ))
+
+        value = self.execution_budget()
+        value["context_budget_tokens"] = 1.5
+        cases.append((
+            "fractional-context", value, "invalid_context_budget_tokens"
+        ))
+
+        value = self.execution_budget()
+        value["checkpoint_action"] = "x" * 4097
+        cases.append((
+            "oversized-action", value, "invalid_checkpoint_action_too_large"
+        ))
+
+        for index, (name, budget, error) in enumerate(cases):
+            with self.subTest(name=name):
+                task = self.task(f"BUDGET-BAD-{index}")
+                task["execution_budget"] = budget
+                path, _ = self.write_plan(
+                    self.plan(
+                        tasks=[task],
+                        revision=f"budget-bad-{index}",
+                    ),
+                    name=f"budget-bad-{index}.json",
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    self.orch.load_plan(path)
+                self.assert_no_tasks()
+
+    def test_legacy_task_without_execution_budget_remains_admitted(self):
+        path, _ = self.write_plan(
+            self.plan(
+                tasks=[self.task("BUDGET-LEGACY")],
+                revision="budget-legacy",
+            ),
+            name="budget-legacy.json",
+        )
+
+        loaded = self.orch.load_plan(path)
+
+        self.assertEqual(loaded["status"], "OK")
+        self.assertEqual(loaded["queued_count"], 1)
 
     def test_review_policy_rejects_string_values_before_admission(self):
         malformed = (
