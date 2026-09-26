@@ -109,6 +109,48 @@ class DispatcherRegistryTests(unittest.TestCase):
             0o600,
         )
 
+    def test_route_evidence_is_write_once_per_run(self):
+        record_rdc(
+            self.home, device_id="device-1", device_name="Mac.one"
+        )
+        first = record_route_evidence(
+            self.home,
+            run_id="RUN-ONCE",
+            task_id="TASK-ONCE",
+            model="GPT-5.6 Sol",
+            reasoning="UNKNOWN",
+            usage="UNKNOWN",
+            source="operator_observed",
+            work_used="no",
+            codex_execution_used="no",
+            model_api_used="no",
+            external_provider_used="no",
+        )
+        path = Path(first["path"])
+        before = path.read_bytes()
+
+        with self.assertRaisesRegex(
+            ValueError, "route_evidence_already_recorded"
+        ):
+            record_route_evidence(
+                self.home,
+                run_id="RUN-ONCE",
+                task_id="TASK-ONCE",
+                model="CHANGED",
+                reasoning="CHANGED",
+                usage="CHANGED",
+                source="replacement_attempt",
+                work_used="yes",
+                codex_execution_used="yes",
+                model_api_used="yes",
+                external_provider_used="yes",
+            )
+
+        self.assertEqual(path.read_bytes(), before)
+        readback = read_route_evidence(self.home, run_id="RUN-ONCE")
+        self.assertEqual(readback["route_evidence"]["model"], "GPT-5.6 Sol")
+        self.assertEqual(readback["route_evidence"]["work_used"], "no")
+
     def test_route_evidence_fails_closed_on_device_rebinding(self):
         record_rdc(
             self.home, device_id="device-1", device_name="Mac.one"
