@@ -238,6 +238,49 @@ def recovery_inspect(
             row["run_id"]: row["snapshot_id"]
             for row in conn.execute("SELECT run_id,snapshot_id FROM approvals").fetchall()
         }
+        checkpoints: Dict[str, Dict[str, Any]] = {}
+        for checkpoint_row in conn.execute(
+            "SELECT key,value_json FROM settings WHERE key LIKE 'run_checkpoint:%'"
+        ).fetchall():
+            checkpoint_run_id = checkpoint_row["key"][len("run_checkpoint:"):]
+            try:
+                checkpoint_value = json.loads(checkpoint_row["value_json"])
+            except (TypeError, json.JSONDecodeError):
+                checkpoints[checkpoint_run_id] = {"status": "INVALID"}
+                continue
+            reason = (
+                checkpoint_value.get("reason")
+                if isinstance(checkpoint_value, dict) else None
+            )
+            process_state = (
+                checkpoint_value.get("process_state")
+                if isinstance(checkpoint_value, dict) else None
+            )
+            recorded_at = (
+                checkpoint_value.get("recorded_at")
+                if isinstance(checkpoint_value, dict) else None
+            )
+            if (
+                not isinstance(checkpoint_value, dict)
+                or checkpoint_value.get("run_id") != checkpoint_run_id
+                or not isinstance(reason, str)
+                or not reason.strip()
+                or len(reason) > 500
+                or process_state not in {"active", "unknown"}
+                or not isinstance(recorded_at, str)
+                or not recorded_at
+            ):
+                checkpoints[checkpoint_run_id] = {"status": "INVALID"}
+                continue
+            checkpoints[checkpoint_run_id] = {
+                "status": "RECORDED",
+                "reason": reason,
+                "process_state": process_state,
+                "recorded_at": recorded_at,
+                "writer_reservation_released": False,
+                "capability_revoked": False,
+                "safe_to_resume_elsewhere": False,
+            }
 
     caps = capability_health(orch)
     claims_ready = caps["directory_status"] == "READY"
@@ -268,6 +311,7 @@ def recovery_inspect(
         )
         commands: List[str] = []
         classification = "TERMINAL"
+        checkpoint = checkpoints.get(row["run_id"])
 
         if unresolved_publication:
             classification = "PUBLICATION_RECONCILIATION_REQUIRED"
@@ -276,17 +320,30 @@ def recovery_inspect(
                 "Use --resume only when reconciliation reports resume_available=true.",
             ]
         elif row["state"] == "RUNNING":
-            if capability_present:
+            if checkpoint is not None:
+                if checkpoint.get("process_state") == "active":
+                    classification = "CHECKPOINTED_WORKER_ACTIVE"
+                    commands = [
+                        "Writer reservation is retained; continue only in the same observed worker.",
+                        "Do not abort/retry or start another worker while external/direct-RDC activity is active.",
+                    ]
+                else:
+                    classification = "CHECKPOINTED_PROCESS_STATE_UNKNOWN"
+                    commands = [
+                        "Verify the external ChatGPT/RDC process state; checkpoint does not prove inactivity.",
+                        "Do not abort/retry or start another worker until process inactivity is independently proven.",
+                    ]
+            elif capability_present:
                 classification = "WORKER_MAY_STILL_BE_ACTIVE"
                 commands = [
                     "Verify the external ChatGPT/RDC worker state; heartbeat age is informational only.",
-                    f"orch abort --run-id {row['run_id']} --reason <reason> --retry",
+                    "Do not abort/retry or start another worker until process inactivity is independently proven.",
                 ]
             else:
                 classification = "CAPABILITY_MISSING"
                 commands = [
                     "Do not recreate a lease/capability file.",
-                    f"orch abort --run-id {row['run_id']} --reason <reason> --retry",
+                    "Do not abort/retry or start another worker until external process inactivity is independently proven.",
                 ]
         elif row["state"] == "RESULT_SUBMITTED":
             if capability_present:
@@ -341,6 +398,7 @@ def recovery_inspect(
             "capability_present": capability_present,
             "snapshot_id": row["snapshot_id"],
             "classification": classification,
+            "checkpoint": checkpoint,
             "publication": publication,
             "safe_next_steps": commands,
         }

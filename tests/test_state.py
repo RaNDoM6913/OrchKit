@@ -198,9 +198,89 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(item["classification"], "WORKER_MAY_STILL_BE_ACTIVE")
         self.assertTrue(item["capability_present"])
         self.assertTrue(item["capability_expected"])
-        self.assertIn("abort --run-id", " ".join(item["safe_next_steps"]))
+        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
+        self.assertNotIn("abort --run-id", " ".join(item["safe_next_steps"]))
+        self.assertIsNone(item["checkpoint"])
         self.assertNotIn("lease_token", json.dumps(result))
         self.assertTrue(capability.exists())
+
+    def test_recovery_inspect_exposes_checkpoint_without_releasing_writer(self):
+        self._load_recovery_task("RECOVERY-CHECKPOINT")
+        claim = self.orch.claim("worker")
+        cap = Path(claim["capability_file"])
+        lease = self.orch.lease_from_capability(claim["run_id"], cap)
+
+        self.orch.checkpoint(
+            claim["run_id"], lease, "handoff pressure", "unknown"
+        )
+        unknown = recovery_inspect(self.orch, run_id=claim["run_id"])
+        item = unknown["items"][0]
+        self.assertEqual(
+            item["classification"], "CHECKPOINTED_PROCESS_STATE_UNKNOWN"
+        )
+        self.assertEqual(item["checkpoint"]["status"], "RECORDED")
+        self.assertEqual(item["checkpoint"]["reason"], "handoff pressure")
+        self.assertFalse(item["checkpoint"]["writer_reservation_released"])
+        self.assertFalse(item["checkpoint"]["capability_revoked"])
+        self.assertFalse(item["checkpoint"]["safe_to_resume_elsewhere"])
+        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
+        self.assertTrue(cap.is_file())
+
+        self.orch.checkpoint(
+            claim["run_id"], lease, "same worker confirmed active", "active"
+        )
+        active = recovery_inspect(self.orch, run_id=claim["run_id"])
+        active_item = active["items"][0]
+        self.assertEqual(
+            active_item["classification"], "CHECKPOINTED_WORKER_ACTIVE"
+        )
+        self.assertEqual(active_item["checkpoint"]["process_state"], "active")
+        self.assertIn(
+            "same observed worker", " ".join(active_item["safe_next_steps"])
+        )
+
+        with self.orch.connect() as conn:
+            run = conn.execute(
+                "SELECT state FROM runs WHERE run_id=?", (claim["run_id"],)
+            ).fetchone()
+        self.assertEqual(run["state"], "RUNNING")
+        with self.orch.connect() as conn:
+            locks = self.orch._active_writer_locks(conn)
+        self.assertEqual(
+            next(iter(locks.values()))["run_id"], claim["run_id"]
+        )
+
+    def test_recovery_inspect_tampered_checkpoint_fails_closed(self):
+        self._load_recovery_task("RECOVERY-CHECKPOINT-TAMPER")
+        claim = self.orch.claim("worker")
+        tampered = {
+            "run_id": claim["run_id"],
+            "reason": {"private": "do-not-echo"},
+            "process_state": "stopped",
+            "recorded_at": 123,
+            "unexpected": "sensitive-marker",
+        }
+        with self.orch.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key,value_json,updated_at) "
+                "VALUES(?,?,?)",
+                (
+                    f"run_checkpoint:{claim['run_id']}",
+                    json.dumps(tampered),
+                    "2026-09-26T00:00:00+00:00",
+                ),
+            )
+
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        item = result["items"][0]
+        self.assertEqual(
+            item["classification"], "CHECKPOINTED_PROCESS_STATE_UNKNOWN"
+        )
+        self.assertEqual(item["checkpoint"], {"status": "INVALID"})
+        rendered = json.dumps(result)
+        self.assertNotIn("do-not-echo", rendered)
+        self.assertNotIn("sensitive-marker", rendered)
+        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
 
     def test_recovery_inspect_tracks_submit_quiesce_and_verify_stages(self):
         workspace = self._load_recovery_task("RECOVERY-STAGES")
@@ -251,6 +331,8 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(item["classification"], "CAPABILITY_MISSING")
         self.assertFalse(item["capability_present"])
         self.assertIn("Do not recreate", item["safe_next_steps"][0])
+        self.assertIn("Do not abort/retry", " ".join(item["safe_next_steps"]))
+        self.assertNotIn("abort --run-id", " ".join(item["safe_next_steps"]))
         self.assertFalse(cap.exists())
 
     def test_recovery_inspect_prioritizes_publication_reconciliation(self):
