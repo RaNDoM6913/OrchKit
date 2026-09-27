@@ -29,6 +29,14 @@ The following remain unverified unless later compatibility runs provide evidence
 
 Reports from unverified environments are welcome, but compatibility should not be advertised until reproducible checks pass there.
 
+## Automated package checks
+
+The compatibility workflow runs on pull requests and pushes to `main` for the macOS/arm64 Python 3.9 and 3.12 matrix. Each job runs unit tests and compilation, builds an sdist and a wheel from that sdist, checks both artifacts with `twine check --strict`, and records their SHA-256 hashes in the job log.
+
+The wheel is installed into a separate clean virtual environment. `scripts/check_installed_package.py` runs with Python `-I` outside the checkout, checks installed metadata/runtime/CLI versions against the candidate source, compares dispatcher-template bytes, and renders a dispatcher into disposable storage. A bootstrap prompt alone does not load or verify the packaged dispatcher template.
+
+These package checks do not publish artifacts, expand the support matrix, launch workers, or certify ordinary-Chat/RDC route acceptance. Release publication still requires the [owner-gated process](release-process.md).
+
 ## Expanding the matrix
 
 Add automated compatibility checks only after the intended environment is named explicitly. A new support claim should record the OS/architecture, Python and Git versions, the source revision, the required test command, and whether package build/install smoke checks passed.

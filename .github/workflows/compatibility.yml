@@ -42,10 +42,21 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Compile
-        run: python -m compileall -q orch tests
+        run: python -m compileall -q orch tests scripts
 
-      - name: Install package
-        run: python -m pip install .
+      - name: Install build tools
+        run: python -m pip install build twine
 
-      - name: CLI smoke
-        run: orch --version
+      - name: Build and validate distributions
+        run: |
+          # Default build creates the wheel from the sdist, not the checkout.
+          python -m build --outdir "$RUNNER_TEMP/orchkit-dist"
+          python -m twine check --strict "$RUNNER_TEMP/orchkit-dist"/*
+          shasum -a 256 "$RUNNER_TEMP/orchkit-dist"/*
+
+      - name: Installed-wheel smoke
+        run: |
+          python -m venv "$RUNNER_TEMP/orchkit-smoke"
+          "$RUNNER_TEMP/orchkit-smoke/bin/python" -m pip install --no-index "$RUNNER_TEMP/orchkit-dist"/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/orchkit-smoke/bin/python" -I "$GITHUB_WORKSPACE/scripts/check_installed_package.py" "$GITHUB_WORKSPACE"
