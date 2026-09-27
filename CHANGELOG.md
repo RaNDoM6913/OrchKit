@@ -8,7 +8,7 @@ All notable public-facing changes are documented here. OrchKit has not published
 
 - Public project overview, source-based Quick Start, workflow guide, and curated documentation index.
 - Contribution and security policies for the early public source stage.
-- Verified compatibility documentation, automated compatibility checks, private vulnerability reporting, and an owner-gated release process.
+- Verified compatibility documentation, automated compatibility checks across CPython 3.9 through 3.14 on macOS arm64, private vulnerability reporting, and an owner-gated release process.
 
 ### Changed
 
