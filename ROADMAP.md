@@ -22,11 +22,11 @@ With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence ha
 
 ## Before a versioned release
 
-- The `orchkit` distribution name and local sdist/wheel artifact shape are verified; select and execute the actual distribution-channel publication only at the versioned-release gate.
+- The `orchkit` distribution name and local sdist/wheel artifact shape are verified. The planned first package-index channel is PyPI, with a matching GitHub Release; actual publication remains owner-gated and follows `docs/release-process.md`.
 - Expand the documented compatibility matrix only from reproducible OS, architecture, Python, and Git test evidence; the initial macOS/arm64 Python 3.9 and 3.12 evidence is recorded in `docs/compatibility.md`.
 - Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available before any versioned release.
-- Add automated compatibility checks only after their supported environments are defined.
-- Publish upgrade and release notes only for an actual versioned release.
+- Compatibility CI runs on pull requests and `main` for the documented macOS/arm64 Python 3.9 and 3.12 matrix. Expand it only after the intended environment is named and reproducible evidence is added.
+- Publish versioned changelog and release notes only when the owner explicitly authorizes an actual versioned release.
 
 ## Product boundaries
 

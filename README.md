@@ -96,6 +96,8 @@ Do not use the current design to execute adversarial workloads or to protect cre
 - [Workflow guide](docs/workflow.md)
 - [Architecture](docs/architecture.md)
 - [Security model](docs/security-model.md)
+- [Compatibility](docs/compatibility.md)
+- [Release process](docs/release-process.md)
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
 
