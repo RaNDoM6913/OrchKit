@@ -8,10 +8,11 @@ All notable public-facing changes are documented here. OrchKit has not published
 
 - Public project overview, source-based Quick Start, workflow guide, and curated documentation index.
 - Contribution and security policies for the early public source stage.
+- Verified compatibility documentation, automated compatibility checks, private vulnerability reporting, and an owner-gated release process.
 
 ### Changed
 
 - Prepared Python distribution metadata under the OrchKit package name (`orchkit`) while preserving the `orch` CLI.
 - Added package metadata for the Apache-2.0 license and public source, issue, and documentation URLs.
-- Made packaged prompt templates explicit package content and extended compatibility smoke checks to verify dispatcher prompt availability after installation.
+- Made packaged prompt templates explicit package content and verified dispatcher prompt availability from a clean installed wheel.
 - Replaced legacy internal planning material in the public source tree with concise, English product documentation.
