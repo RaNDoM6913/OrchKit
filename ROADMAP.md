@@ -24,7 +24,7 @@ With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence ha
 
 - The `orchkit` distribution name and local sdist/wheel artifact shape are verified; select and execute the actual distribution-channel publication only at the versioned-release gate.
 - Expand the documented compatibility matrix only from reproducible OS, architecture, Python, and Git test evidence; the initial macOS/arm64 Python 3.9 and 3.12 evidence is recorded in `docs/compatibility.md`.
-- Establish an explicit private vulnerability-reporting channel and response process.
+- Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available before any versioned release.
 - Add automated compatibility checks only after their supported environments are defined.
 - Publish upgrade and release notes only for an actual versioned release.
 
