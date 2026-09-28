@@ -12,13 +12,22 @@ It is not a service for running untrusted code, a multi-tenant platform, or a re
 
 ## Status and support
 
-This is an early public source release. Release-readiness CI currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. No package release has been published yet. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
+This is an early public release. Release verification currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. Published versioned packages use the `orchkit` name on PyPI and are paired with a matching GitHub Release; source installs remain supported. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
 
 Use the issue tracker for reproducible source-level defects and improvement proposals. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and use [SECURITY.md](SECURITY.md) for security-sensitive concerns.
 
-## Quick start from source
+## Quick start
 
-Clone the repository and install its local source package into a virtual environment:
+For a published version, create a virtual environment and install the `orchkit` package from PyPI:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install orchkit
+orch --version
+```
+
+To work from the current source instead:
 
 ```sh
 git clone https://github.com/RaNDoM6913/OrchKit.git

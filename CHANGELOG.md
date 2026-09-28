@@ -1,13 +1,13 @@
 # Changelog
 
-All notable public-facing changes are documented here. OrchKit has not published a versioned release.
+All notable public-facing changes are documented here.
 
-## Unreleased
+## 0.11.0 - 2026-09-28
 
 ### Added
 
-- Public project overview, source-based Quick Start, workflow guide, and curated documentation index.
-- Contribution and security policies for the early public source stage.
+- Public project overview, package/source Quick Start, workflow guide, and curated documentation index.
+- Contribution and security policies for the early public project stage.
 - Verified compatibility documentation, automated compatibility checks across CPython 3.9 through 3.14 on macOS arm64, private vulnerability reporting, and an owner-gated release process.
 - Added `orch overview`, a read-only operator control view with setup, RDC, project-readiness, state-health, active-writer/publication, and guided next-step summaries.
 

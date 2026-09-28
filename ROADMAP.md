@@ -1,11 +1,11 @@
 # OrchKit Roadmap
 
-OrchKit is published as an early source project. This roadmap records the public work still needed to make broader claims; it is not a delivery schedule.
+OrchKit is an early open-source project. This roadmap records the public work still needed to make broader claims; it is not a delivery schedule.
 
 ## Current public baseline
 
 - The project is named OrchKit and exposes the `orch` command.
-- Source installation from this repository is documented.
+- PyPI and source installation paths are documented.
 - The public documentation covers the workflow, architecture, and same-user security boundary.
 - Codex review is optional. The primary worker model remains a fresh ChatGPT conversation for each task or repair attempt.
 - The source is licensed under Apache-2.0.
@@ -20,13 +20,13 @@ The immediate capability work was split into small, dependency-ordered milestone
 
 With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence has an independently reviewed end-to-end acceptance trace. Dispatcher/RDC markers and route evidence remain observational building blocks and do not, by themselves, prove any future run. P0-2 still does not provide OS/process fencing, automatic proof of process inactivity, or transparent cross-conversation resume of the same `RUNNING` attempt.
 
-## Before a versioned release
+## Release discipline
 
-- The `orchkit` distribution name and local sdist/wheel artifact shape are verified. The planned first package-index channel is PyPI, with a matching GitHub Release; actual publication remains owner-gated and follows `docs/release-process.md`.
+- The `orchkit` distribution name and sdist/wheel artifact shape are verified. Versioned packages are published to PyPI with a matching GitHub Release; publication remains owner-gated and follows `docs/release-process.md`.
 - Expand the documented compatibility matrix only from reproducible OS, architecture, Python, and Git test evidence; current macOS/arm64 CI covers CPython 3.9 through 3.14 and is recorded in `docs/compatibility.md`.
-- Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available before any versioned release.
+- Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available for every release.
 - Compatibility CI runs on pull requests and `main` for the documented macOS/arm64 CPython 3.9 through 3.14 matrix. Expand it only after the intended environment is named and reproducible evidence is added.
-- Publish versioned changelog and release notes only when the owner explicitly authorizes an actual versioned release.
+- Publish a versioned changelog and release notes only when the owner explicitly authorizes that release.
 
 ## Product boundaries
 

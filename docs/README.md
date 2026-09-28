@@ -4,7 +4,7 @@ This is the public documentation set for OrchKit. It describes the implemented w
 
 ## Start here
 
-- [README](../README.md) — positioning, source-based Quick Start, status, and limitations.
+- [README](../README.md) — positioning, package/source Quick Start, status, and limitations.
 - [Workflow guide](workflow.md) — the operator, worker, verifier, review, approval, and publication flow.
 - [Architecture](architecture.md) — durable state and component boundaries.
 - [Security model](security-model.md) — workflow controls, trust boundaries, and what OrchKit does not protect.
