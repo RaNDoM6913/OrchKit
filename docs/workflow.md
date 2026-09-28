@@ -23,6 +23,16 @@ OrchKit coordinates development work whose durable authority must outlive a sing
 
 Use `orch --help` and the relevant subcommand help for exact arguments. The tool intentionally does not infer a task's allowed paths, verification command, or publication policy from a chat request.
 
+## Operator overview
+
+`orch overview` is the normal read-only control view for setup and day-to-day operation. It can be run before the ledger exists and summarizes the configured profile, RDC binding state, registered projects, private-state layout health, and explicit `next_steps`. With `--project`, it adds the existing project-readiness audit summary, including task, active-writer, pending-publication, and pause counts.
+
+Use `orch overview --project <project-id>` for a project-specific readiness view. That form requires a valid project-scoped dispatcher before it reports the project as fully ready for ordinary ChatGPT/RDC work. When queued work exists, the overview deliberately points to `orch queue list --project <project-id>` for the authoritative READY/dependency/writer decision instead of duplicating queue-state logic.
+
+The overview path is intentionally inspection-only. It does not initialize a missing ledger, recreate missing runtime directories, repair file modes, or migrate an older SQLite schema. Unsafe or outdated state is reported as `BLOCKED`; use the dedicated state/recovery commands to resolve it. Capability-file contents are never part of the overview.
+
+For the subscription-free core path, run `orch doctor --skip-codex` and register the project with `--review-mode off`. In that mode, the optional Codex reviewer check is reported as skipped rather than keeping an otherwise ready setup in an attention state.
+
 ## Local state and project workspaces
 
 The OrchKit state directory contains the ledger and private operational artifacts. Keep it separate from registered repositories. A registered workspace is where a task's allowed edits occur; it is not the source of authority for OrchKit's ledger or policy.

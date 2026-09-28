@@ -20,13 +20,24 @@ def run_doctor(home: Path, *, check_codex: bool = True) -> Dict[str, Any]:
     checks.append({"id": "git", "status": "PASS" if git else "BLOCKED", "detail": git})
     writable = os.access(str(home), os.W_OK)
     checks.append({"id": "orch_home", "status": "PASS" if writable else "BLOCKED", "detail": str(home)})
-    checks.append({"id": "codex_binary", "status": "PASS" if CODEX_BIN.is_file() else "OPTIONAL_MISSING", "detail": str(CODEX_BIN)})
-    if check_codex and CODEX_BIN.is_file():
-        preflight = subscription_preflight(home)
+    if check_codex:
         checks.append({
-            "id": "codex_subscription",
-            "status": "PASS" if preflight.get("status") == "PASS" else "OPTIONAL_BLOCKED",
-            "detail": preflight,
+            "id": "codex_binary",
+            "status": "PASS" if CODEX_BIN.is_file() else "OPTIONAL_MISSING",
+            "detail": str(CODEX_BIN),
+        })
+        if CODEX_BIN.is_file():
+            preflight = subscription_preflight(home)
+            checks.append({
+                "id": "codex_subscription",
+                "status": "PASS" if preflight.get("status") == "PASS" else "OPTIONAL_BLOCKED",
+                "detail": preflight,
+            })
+    else:
+        checks.append({
+            "id": "codex_binary",
+            "status": "SKIPPED",
+            "detail": "optional reviewer check disabled",
         })
     try:
         rdc = read_rdc(home)

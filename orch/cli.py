@@ -13,6 +13,7 @@ from .doctor import run_doctor
 from .dispatcher import (bootstrap_prompt, read_rdc, read_route_evidence,
                          record_rdc, record_route_evidence, render_dispatcher)
 from .git_policy import evaluate_project_git_policy
+from .overview import operator_overview
 from .plan import (build_batch_plan, build_single_task_plan,
                    existing_plan_initial_base_binding,
                    read_batch_manifest, write_plan)
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default="safe")
     doctor = sub.add_parser("doctor", help="check local prerequisites and optional reviewer availability")
     doctor.add_argument("--skip-codex", action="store_true")
+    overview = sub.add_parser(
+        "overview",
+        help="show a read-only operator summary and suggested next steps",
+    )
+    overview.add_argument("--project")
 
     rdc = sub.add_parser("rdc", help="record or inspect ChatGPT-to-RDC device binding")
     rdc_sub = rdc.add_subparsers(dest="rdc_command", required=True)
@@ -226,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _command_requires_existing_ledger(args: argparse.Namespace) -> bool:
     if args.command in {
-        "setup", "doctor", "rdc", "dispatcher", "git",
+        "setup", "doctor", "overview", "rdc", "dispatcher", "git",
         "codex-preflight", "project", "init",
     }:
         return False
@@ -310,6 +316,8 @@ def main(argv=None) -> int:
             result["profile"] = args.profile
         elif args.command == "doctor":
             result = run_doctor(root, check_codex=not args.skip_codex)
+        elif args.command == "overview":
+            result = operator_overview(root, project_id=args.project)
         elif args.command == "rdc":
             if args.rdc_command == "record":
                 result = record_rdc(root, device_id=args.device_id, device_name=args.device_name)
@@ -366,6 +374,7 @@ def main(argv=None) -> int:
                     review_mode=args.review_mode, reviewer=args.reviewer,
                     allow_commit=args.commit, allow_push=args.push, replace=args.replace,
                 )
+                result["project_id"] = result["project"]["project_id"]
                 result["ledger"] = {
                     "status": "READY",
                     "db": str(ledger.db_path),

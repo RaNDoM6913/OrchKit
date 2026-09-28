@@ -189,6 +189,11 @@ def _permission_findings(home: Path) -> List[Dict[str, Any]]:
     return findings
 
 
+def state_permission_findings(home: Path) -> List[Dict[str, Any]]:
+    """Inspect private state layout without repairing or creating it."""
+    return _permission_findings(home)
+
+
 def _open_ledger_read_only(db_path: Path) -> sqlite3.Connection:
     if db_path.is_symlink() or not db_path.is_file():
         raise ValueError("state_ledger_missing_or_unsafe")
