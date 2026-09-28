@@ -17,7 +17,7 @@ The current source version is `0.11.0`, but that metadata value alone is not rel
 Use a fresh checkout of the exact candidate commit. Before tagging or uploading, require all of the following:
 
 1. The candidate commit is on public `main` and the worktree is clean.
-2. The push-triggered compatibility workflow is successful for the exact candidate commit on public `main`, on the documented macOS/arm64 Python 3.9 and 3.12 matrix, including package-artifact checks.
+2. The push-triggered compatibility workflow is successful for the exact candidate commit on public `main`, across the full documented macOS/arm64 CPython 3.9 through 3.14 matrix, including package-artifact checks.
 3. `setup.cfg` and `orch.__version__` report the same intended release version.
 4. `CHANGELOG.md` contains release notes for that version and date rather than claiming an unpublished version is released.
 5. GitHub private vulnerability reporting remains enabled.
