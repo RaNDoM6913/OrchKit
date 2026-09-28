@@ -1,16 +1,16 @@
 # Release Process
 
-OrchKit is still pre-release. This document defines the publication gate for the first versioned release; merging it does **not** authorize a tag, GitHub Release, or package-index upload.
+This document defines the publication gate for each versioned OrchKit release; editing or merging it does **not** authorize a tag, GitHub Release, or package-index upload.
 
 ## Target distribution
 
 - Python distribution name: `orchkit`.
 - Installed CLI: `orch`.
-- Planned package index: PyPI.
+- Package index: PyPI.
 - Release record: a GitHub Release tied to the exact Git tag.
 - Release artifacts: source distribution plus the pure-Python (`py3-none-any`) wheel produced by the current package configuration.
 
-The current source version is `0.11.0`, but that metadata value alone is not release authorization. The repository owner must explicitly confirm the release version and publication before the irreversible steps below.
+A source metadata version alone is not release authorization. The repository owner must explicitly confirm the release version and publication before the irreversible steps below.
 
 ## Required release preflight
 
@@ -21,7 +21,7 @@ Use a fresh checkout of the exact candidate commit. Before tagging or uploading,
 3. `setup.cfg` and `orch.__version__` report the same intended release version.
 4. `CHANGELOG.md` contains release notes for that version and date rather than claiming an unpublished version is released.
 5. GitHub private vulnerability reporting remains enabled.
-6. The PyPI project name is rechecked immediately before upload; an earlier availability check is not a reservation.
+6. Before the first upload, the PyPI project name is rechecked immediately before publication; an earlier availability check is not a reservation. For later releases, confirm that publication targets the existing OrchKit PyPI project.
 7. The repository owner explicitly authorizes publication of the selected version.
 
 ## Build and artifact verification

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-OrchKit has no versioned public release yet. Security maintenance applies to the current public `main` branch while the project remains in this early source stage. No response-time or patch-availability commitment is made for unreleased source.
+Security maintenance is focused on the current public `main` branch and the latest published version while OrchKit remains early-stage. Older published versions may not receive backports. No fixed response-time or patch-availability commitment is made.
 
 ## Reporting a vulnerability
 
