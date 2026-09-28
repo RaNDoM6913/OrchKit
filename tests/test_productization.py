@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from orch.dispatcher import (RDC_MARKER_MAX_BYTES, read_rdc, record_rdc,
 from orch.git_policy import evaluate_project_git_policy
 from orch.git_transport import inspect_transport_url
 from orch.core import Orchestrator, path_allowed
+from orch.overview import operator_overview
 from orch.plan import build_single_task_plan
 from orch.project import (PACKAGE_JSON_MAX_BYTES, PROJECT_CONFIG_MAX_BYTES,
                           ProjectRegistry, inspect_project)
@@ -122,6 +124,124 @@ class ProductizationTests(unittest.TestCase):
         self.assertEqual(Path(result["ledger"]["db"]).resolve(), db.resolve())
         self.assertEqual(check_state(Orchestrator(self.home))["status"], "READY")
 
+    def test_overview_guides_registered_project_to_ready_task(self):
+        configure_home(self.home, profile="safe")
+        record_rdc(
+            self.home,
+            device_id="fixture-device",
+            device_name="Fixture Mac",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--review-mode", "off",
+            ])
+        registered = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            registered["project_id"],
+            registered["project"]["project_id"],
+        )
+        project_id = registered["project_id"]
+
+        before = operator_overview(self.home, project_id=project_id)
+        self.assertEqual(before["status"], "ATTENTION")
+        self.assertIn(
+            "render_dispatcher",
+            [item["id"] for item in before["next_steps"]],
+        )
+
+        render_dispatcher(self.home, project_id=project_id)
+        ready = operator_overview(self.home, project_id=project_id)
+        self.assertEqual(ready["status"], "READY")
+        self.assertEqual(ready["project_audit"]["task_count"], 0)
+        self.assertEqual(
+            [item["id"] for item in ready["next_steps"]],
+            ["add_work"],
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "queue", "enqueue", project_id,
+                "--task-id", "OVERVIEW-1",
+                "--goal", "Update the fixture README",
+                "--allowed-path", "README.md",
+            ])
+        self.assertEqual(rc, 0)
+        queued = operator_overview(self.home, project_id=project_id)
+        self.assertEqual(queued["status"], "READY")
+        self.assertEqual(queued["project_audit"]["task_count"], 1)
+        self.assertEqual(
+            [item["id"] for item in queued["next_steps"]],
+            ["inspect_queue"],
+        )
+        self.assertIn(
+            "fresh ordinary ChatGPT conversation",
+            queued["next_steps"][0]["instruction"],
+        )
+
+    def test_overview_does_not_recreate_missing_claims_directory(self):
+        configure_home(self.home, profile="safe")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--review-mode", "off",
+            ])
+        self.assertEqual(rc, 0)
+        project_id = json.loads(output.getvalue())["project_id"]
+        claims = self.home / ".runtime" / "claims"
+        claims.rmdir()
+
+        result = operator_overview(self.home, project_id=project_id)
+        self.assertEqual(result["status"], "BLOCKED")
+        global_result = operator_overview(self.home)
+        self.assertEqual(global_result["status"], "BLOCKED")
+        self.assertEqual(global_result["state"]["status"], "BLOCKED")
+        self.assertGreater(
+            global_result["state"]["blocked_check_count"],
+            0,
+        )
+        self.assertFalse(claims.exists())
+        self.assertEqual(result["project_audit"]["status"], "BLOCKED")
+        blocked = {
+            item["id"]
+            for item in result["project_audit"]["checks"]
+            if item["status"] == "BLOCKED"
+        }
+        self.assertIn("state_permission", blocked)
+
+    def test_overview_blocks_schema_mismatch_without_migrating(self):
+        configure_home(self.home, profile="safe")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--review-mode", "off",
+            ])
+        self.assertEqual(rc, 0)
+        project_id = json.loads(output.getvalue())["project_id"]
+        db = self.home / ".runtime" / "orch.sqlite3"
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute("PRAGMA user_version=3")
+
+        result = operator_overview(self.home, project_id=project_id)
+        self.assertEqual(result["status"], "BLOCKED")
+        state_ledger = next(
+            item
+            for item in result["project_audit"]["checks"]
+            if item["id"] == "state_ledger"
+        )
+        self.assertEqual(state_ledger["status"], "BLOCKED")
+        with sqlite3.connect(str(db)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+
     def test_project_remove_blocks_missing_ledger_without_creating_one(self):
         registry = ProjectRegistry(self.home)
         config = registry.add(
@@ -177,6 +297,69 @@ class ProductizationTests(unittest.TestCase):
         data = json.loads(Path(configured["config"]).read_text())
         self.assertEqual(data["default_profile"], "standard")
         self.assertEqual(data["billing"]["model_api_budget"], 0)
+
+    def test_overview_before_setup_is_read_only_and_guided(self):
+        phantom = self.base / "phantom-overview-home"
+        result = operator_overview(phantom)
+        self.assertEqual(result["status"], "SETUP_REQUIRED")
+        self.assertTrue(result["read_only"])
+        self.assertEqual(
+            [item["id"] for item in result["next_steps"]],
+            ["setup"],
+        )
+        self.assertFalse(phantom.exists())
+
+    def test_overview_missing_config_blocks_existing_authority(self):
+        configure_home(self.home, profile="safe")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main([
+                "--root", str(self.home),
+                "project", "add", str(self.repo),
+                "--review-mode", "off",
+            ])
+        self.assertEqual(rc, 0)
+        config = self.home / "config.json"
+        config.unlink()
+
+        result = operator_overview(self.home)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(
+            result["reason"],
+            "home_config_missing_with_existing_project_authority",
+        )
+        self.assertEqual(result["next_steps"], [])
+        self.assertFalse(config.exists())
+
+    def test_overview_blocks_symlinked_runtime_without_following_it(self):
+        configure_home(self.home, profile="safe")
+        external = self.base / "external-runtime"
+        external.mkdir()
+        runtime = self.home / ".runtime"
+        runtime.symlink_to(external, target_is_directory=True)
+
+        result = operator_overview(self.home)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["state"]["status"], "BLOCKED")
+        self.assertGreater(result["state"]["blocked_check_count"], 0)
+        self.assertTrue(runtime.is_symlink())
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_doctor_skip_codex_is_ready_after_rdc_binding(self):
+        configure_home(self.home, profile="safe")
+        record_rdc(self.home, device_id="fixture-device", device_name="Fixture Mac")
+        missing_codex = self.base / "missing-codex"
+        with mock.patch("orch.doctor.CODEX_BIN", missing_codex):
+            result = run_doctor(self.home, check_codex=False)
+        self.assertEqual(result["status"], "READY")
+        codex = next(
+            item for item in result["checks"] if item["id"] == "codex_binary"
+        )
+        self.assertEqual(codex["status"], "SKIPPED")
+        self.assertFalse(any(
+            item["id"] == "codex_subscription"
+            for item in result["checks"]
+        ))
 
     def test_review_off_never_requires_codex(self):
         payload = {"review": {"mode": "off", "reviewer": "none"}}

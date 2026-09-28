@@ -29,23 +29,48 @@ python -m pip install .
 orch --version
 ```
 
-Choose a local directory for OrchKit state, then initialize it without touching a project:
+Choose a local directory for OrchKit state, initialize it, then ask the read-only overview what is still missing:
 
 ```sh
 export ORCH_HOME="$HOME/.orchkit"
 orch setup --profile safe
 orch doctor --skip-codex
+orch overview
 ```
 
-The state directory contains local workflow authority and private artifacts. Keep it outside a repository and do not commit it. `--skip-codex` skips the optional Codex subscription preflight; Codex is not required for the core workflow.
+The state directory contains local workflow authority and private artifacts. Keep it outside a repository and do not commit it. `--skip-codex` explicitly skips the optional Codex reviewer checks; after the RDC binding is recorded, a missing Codex installation does not keep the core workflow in an attention state.
 
-Before registering a project, review the available commands and the workflow model:
+Connect the ordinary ChatGPT/RDC route by generating the bootstrap prompt and running that prompt in a fresh ordinary ChatGPT conversation with Remote Desktop Commander connected:
 
 ```sh
-orch project add --help
-orch queue enqueue --help
 orch rdc bootstrap-prompt
 ```
+
+Then register a Git repository. Review mode off is the subscription-free core path; optional review can be enabled later:
+
+```sh
+orch project add /absolute/path/to/repository --review-mode off
+```
+
+Copy the returned top-level `project_id`, render the project-scoped worker prompt, and inspect readiness:
+
+```sh
+PROJECT_ID="<returned-project-id>"
+orch dispatcher render --project "$PROJECT_ID"
+orch overview --project "$PROJECT_ID"
+```
+
+When the overview reports that the project is ready for work, add a bounded task and check the control view again:
+
+```sh
+orch queue enqueue "$PROJECT_ID" \
+  --task-id FIRST-TASK \
+  --goal "Describe one bounded change" \
+  --allowed-path README.md
+orch overview --project "$PROJECT_ID"
+```
+
+`orch overview` is an inspection command: it does not initialize a missing ledger, recreate damaged runtime directories, or migrate an old ledger just because the operator asked for status. Its `next_steps` field points to the next explicit setup, connection, task, or recovery action.
 
 ## How the workflow works
 
