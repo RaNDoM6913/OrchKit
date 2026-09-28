@@ -112,7 +112,17 @@ def _transport_env(kind: str) -> Dict[str, str]:
     return env
 
 
-def _transport_prefix(git_dir: Path, kind: str) -> list[str]:
+def _github_credential_helper(remote_url: str, kind: str) -> str | None:
+    if kind != "https":
+        return None
+    parsed = urlsplit(remote_url)
+    if (parsed.hostname or "").lower() != "github.com":
+        return None
+    gh = _trusted_binary("gh", "/opt/homebrew/bin/gh")
+    return f"!{gh} auth git-credential"
+
+
+def _transport_prefix(git_dir: Path, kind: str, remote_url: str) -> list[str]:
     git = _trusted_binary("git", "/usr/bin/git")
     return [
         git, "--no-pager",
@@ -120,6 +130,7 @@ def _transport_prefix(git_dir: Path, kind: str) -> list[str]:
         "-c", f"protocol.{kind}.allow=always",
         "-c", "protocol.ext.allow=never",
         "-c", "credential.helper=",
+        *(["-c", f"credential.helper={helper}"] if (helper := _github_credential_helper(remote_url, kind)) else []),
         "-c", "core.gitProxy=",
         "-c", "core.hooksPath=/dev/null",
         "--git-dir", str(git_dir),
@@ -174,7 +185,7 @@ def run_sandboxed_transport(
         )
         for item in (git_dir / "HEAD", git_dir / "config", git_dir / "objects" / "info" / "alternates"):
             os.chmod(item, 0o600)
-        command = _transport_prefix(git_dir, policy["kind"]) + list(args)
+        command = _transport_prefix(git_dir, policy["kind"], policy["canonical_url"]) + list(args)
         return subprocess.run(
             command,
             env=_transport_env(policy["kind"]),

@@ -17,7 +17,7 @@ from orch.doctor import run_doctor
 from orch.dispatcher import (RDC_MARKER_MAX_BYTES, read_rdc, record_rdc,
                              render_dispatcher)
 from orch.git_policy import evaluate_project_git_policy
-from orch.git_transport import inspect_transport_url
+from orch.git_transport import _github_credential_helper, inspect_transport_url
 from orch.core import Orchestrator, path_allowed
 from orch.overview import operator_overview
 from orch.plan import build_single_task_plan
@@ -26,6 +26,16 @@ from orch.project import (PACKAGE_JSON_MAX_BYTES, PROJECT_CONFIG_MAX_BYTES,
 from orch.review_policy import decide_review, normalize_review_policy
 from orch.state import (backup_state, check_state,
                         reconcile_home_replacement, replace_home_from_backup)
+
+
+class GitTransportAuthTests(unittest.TestCase):
+    def test_github_https_uses_trusted_gh_helper(self):
+        helper = _github_credential_helper("https://github.com/example/repo.git", "https")
+        self.assertEqual(helper, "!/opt/homebrew/bin/gh auth git-credential")
+
+    def test_non_github_or_non_https_has_no_helper(self):
+        self.assertIsNone(_github_credential_helper("https://example.com/repo.git", "https"))
+        self.assertIsNone(_github_credential_helper("git@github.com:example/repo.git", "ssh"))
 
 
 class ProductizationTests(unittest.TestCase):
