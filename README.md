@@ -1,14 +1,62 @@
-# OrchKit
+# ⚡ OrchKit
 
-[![Compatibility](https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml/badge.svg?branch=main)](https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml)
-[![Source tag: v0.11.0](https://img.shields.io/badge/source-v0.11.0-blue.svg)](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+> **Fresh chats. Durable work.** A local control plane for scoped, verifiable development across ChatGPT conversations.
 
-[Install](#install) · [Quick start](#quick-start) · [Documentation](docs/README.md) · [Releases](https://github.com/RaNDoM6913/OrchKit/releases) · [Roadmap](ROADMAP.md)
+<div align="center">
 
-**A durable local control plane for scoped, verifiable development work across fresh ChatGPT conversations.**
+<a href="https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml"><img src="https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml/badge.svg?branch=main" alt="Live compatibility CI status" height="28"></a>
+[![Source tag v0.11.0](docs/assets/badge-source.svg)](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0)
+[![Apache 2.0 license](docs/assets/badge-license.svg)](LICENSE)
 
-OrchKit keeps workflow authority outside the chat: a new ChatGPT conversation handles each task or repair attempt, while task state, verification evidence, approvals, and publication state remain in a local SQLite ledger. The command-line interface is `orch`.
+[![Python 3.9 through 3.14](docs/assets/badge-python.svg)](docs/compatibility.md)
+[![ChatGPT and RDC workflow](docs/assets/badge-route.svg)](docs/workflow.md)
+
+[🚀 Install](#install) · [⚡ Quick Start](#quick-start) · [📖 Documentation](docs/README.md) · [🧭 Delivery Plan](docs/implementation-plan.md) · [📋 Changelog](CHANGELOG.md)
+
+<p>
+  <img src="docs/assets/orchkit-hero.svg" alt="OrchKit: define task and scope, execute in a fresh ChatGPT conversation, verify bytes and checks, then complete or publish after policy gates. Local workflow controls, not an OS sandbox." width="960">
+</p>
+
+<sub>Source tag available · PyPI publication pending · macOS arm64 verification</sub>
+
+</div>
+
+---
+
+OrchKit keeps workflow authority outside the chat: each task or repair attempt starts in a fresh conversation, while task state, verification evidence, approvals, and publication state remain in a local SQLite ledger. The terminal command is **`orch`**.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🧭 Durable context
+New conversation, same recorded task history. Plans, receipts, checkpoints, and recovery evidence stay local.
+
+</td>
+<td width="50%" valign="top">
+
+### 🎯 Explicit write scope
+Bounded tasks, allowed paths, and one writer reservation per shared workspace authority. No time-based lease expiry.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 🔎 Evidence before completion
+The verifier checks actual workspace bytes and registered commands. A worker's receipt is not proof.
+
+</td>
+<td width="50%" valign="top">
+
+### 🛡️ Guarded publication
+Required gates bind to the verified snapshot. Git publication uses exact staging, ordinary pushes, and remote readback.
+
+</td>
+</tr>
+</table>
+
+---
 
 ## Who it is for
 

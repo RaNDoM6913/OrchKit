@@ -6,6 +6,9 @@ All notable public-facing changes are documented here.
 
 ### Documentation
 
+- Added a Superkit-inspired README header with a local SVG workflow banner, coordinated badges, and feature cards.
+- Added a gate-driven implementation plan from release closure through the optional native macOS client.
+
 - Refined the project landing page with compatibility, package, and license navigation.
 - Added isolated CLI installation, update, troubleshooting, and removal guidance.
 - Published the staged three-project Bridge roadmap and the CLI-first/native-client interface strategy, with planned work clearly separated from shipped features.

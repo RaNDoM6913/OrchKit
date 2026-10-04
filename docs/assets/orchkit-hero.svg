@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-labelledby="title description">
+  <title id="title">OrchKit — Fresh chats. Durable work.</title>
+  <desc id="description">Define a bounded task, execute in a fresh ChatGPT conversation, verify actual bytes and checks, then complete or publish only after required policy gates. Task state stays local. The command-line interface is orch.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#0f172a"/><stop offset="1" stop-color="#172338"/></linearGradient>
+    <radialGradient id="aura"><stop stop-color="#7c3aed" stop-opacity="0.19"/><stop offset="1" stop-color="#7c3aed" stop-opacity="0"/></radialGradient>
+    <linearGradient id="accent" x2="1"><stop stop-color="#a78bfa"/><stop offset="0.5" stop-color="#fbbf24"/><stop offset="1" stop-color="#34d399"/></linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#94a3b8" stroke-opacity="0.07"/></pattern>
+    <clipPath id="frame"><rect x="1" y="1" width="1278" height="518" rx="26"/></clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="520" fill="url(#background)"/>
+    <rect width="1280" height="520" fill="url(#grid)"/>
+    <ellipse cx="1090" cy="70" rx="540" ry="350" fill="url(#aura)"/>
+    <rect x="64" y="0" width="1152" height="3" fill="url(#accent)"/>
+  </g>
+  <rect x="1" y="1" width="1278" height="518" rx="26" fill="none" stroke="#334155"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+    <g font-size="15" font-weight="700" letter-spacing="3" fill="#94a3b8">
+      <text x="64" y="61">THE LOCAL WORKFLOW CONTROL PLANE</text>
+      <text x="1216" y="61" text-anchor="end" fill="#a78bfa">CHATGPT + RDC</text>
+    </g>
+    <text x="60" y="155" font-size="80" font-weight="750" letter-spacing="-3" fill="#f8fafc">Orch<tspan fill="#c4b5fd">Kit</tspan></text>
+    <text x="64" y="214" font-size="38" font-weight="650" letter-spacing="-1" fill="#e2e8f0">Fresh chats. Durable work.</text>
+    <text x="64" y="258" font-size="21" fill="#a8b8cc">Keep task state, checks, and publication authority local.</text>
+    <g transform="translate(846 104)">
+      <rect width="370" height="158" rx="16" fill="#0b1323" stroke="#3c3c68"/>
+      <path d="M0 41H370" stroke="#29354a"/>
+      <circle cx="23" cy="21" r="4" fill="#a78bfa"/><circle cx="39" cy="21" r="4" fill="#fbbf24"/><circle cx="55" cy="21" r="4" fill="#34d399"/>
+      <text x="347" y="26" text-anchor="end" font-size="12" letter-spacing="2" fill="#94a3b8">LOCAL CLI</text>
+      <text x="24" y="86" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="25" font-weight="600" fill="#e2e8f0"><tspan fill="#a78bfa">$ </tspan>orch overview</text>
+      <text x="24" y="126" font-size="18" fill="#a8b8cc">Inspect before acting.</text>
+    </g>
+    <path d="M64 306H1216" stroke="#334155"/>
+    <g stroke="#64748b" stroke-width="2" fill="none">
+      <path d="M326 394H352m-7-6 7 6-7 6"/><path d="M626 394H652m-7-6 7 6-7 6"/><path d="M926 394H952m-7-6 7 6-7 6"/>
+    </g>
+    <g transform="translate(64 336)">
+      <rect width="252" height="116" rx="14" fill="#211c43" stroke="#6551a0"/>
+      <rect x="19" y="22" width="5" height="16" rx="2" fill="#a78bfa"/>
+      <text x="35" y="35" font-size="15" font-weight="700" letter-spacing="2" fill="#c4b5fd">01 · DEFINE</text>
+      <text x="20" y="73" font-size="27" font-weight="650" fill="#f1edff">Task + scope</text>
+      <text x="20" y="98" font-size="16" fill="#c1b3e6">Bounded before execution</text>
+    </g>
+    <g transform="translate(364 336)">
+      <rect width="252" height="116" rx="14" fill="#35291c" stroke="#8d652a"/>
+      <rect x="19" y="22" width="5" height="16" rx="2" fill="#fbbf24"/>
+      <text x="35" y="35" font-size="15" font-weight="700" letter-spacing="2" fill="#fcd34d">02 · EXECUTE</text>
+      <text x="20" y="73" font-size="27" font-weight="650" fill="#fff7df">Fresh ChatGPT</text>
+      <text x="20" y="98" font-size="16" fill="#d5c19a">One task attempt per chat</text>
+    </g>
+    <g transform="translate(664 336)">
+      <rect width="252" height="116" rx="14" fill="#12332e" stroke="#267760"/>
+      <rect x="19" y="22" width="5" height="16" rx="2" fill="#34d399"/>
+      <text x="35" y="35" font-size="15" font-weight="700" letter-spacing="2" fill="#6ee7b7">03 · VERIFY</text>
+      <text x="20" y="73" font-size="27" font-weight="650" fill="#e2fff1">Bytes + checks</text>
+      <text x="20" y="98" font-size="16" fill="#a6d6c6">Independent local evidence</text>
+    </g>
+    <g transform="translate(964 336)">
+      <rect width="252" height="116" rx="14" fill="#183044" stroke="#387695"/>
+      <rect x="19" y="22" width="5" height="16" rx="2" fill="#7dd3fc"/>
+      <text x="35" y="35" font-size="15" font-weight="700" letter-spacing="2" fill="#7dd3fc">04 · COMPLETE</text>
+      <text x="20" y="73" font-size="27" font-weight="650" fill="#e0f2fe">Policy gates</text>
+      <text x="20" y="98" font-size="16" fill="#adcede">Guarded publication, if set</text>
+    </g>
+    <text x="64" y="490" font-size="14" letter-spacing="1.7" fill="#94a3b8">LOCAL STATE · EXPLICIT SCOPE · VERIFIED OUTCOMES</text>
+    <text x="1216" y="490" text-anchor="end" font-size="14" fill="#94a3b8">A workflow control plane. Not an OS sandbox.</text>
+  </g>
+</svg>

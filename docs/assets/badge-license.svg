@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="194" height="28" viewBox="0 0 194 28" role="img" aria-label="Apache 2.0 license">
+  <title>Apache 2.0 license</title>
+  <rect width="78" height="28" fill="#1e293b"/>
+  <rect x="78" width="116" height="28" fill="#2563eb"/>
+  <g fill="#ffffff" text-anchor="middle" font-family="Verdana, Geneva, sans-serif" font-size="10" font-weight="700" letter-spacing="0.8">
+    <text x="39" y="18">LICENSE</text>
+    <text x="136" y="18">APACHE-2.0</text>
+  </g>
+</svg>
