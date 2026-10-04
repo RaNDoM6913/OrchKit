@@ -2,7 +2,17 @@
 
 All notable public-facing changes are documented here.
 
-## 0.11.0 - 2026-09-28
+## Unreleased
+
+### Documentation
+
+- Refined the project landing page with compatibility, package, and license navigation.
+- Added isolated CLI installation, update, troubleshooting, and removal guidance.
+- Published the staged three-project Bridge roadmap and the CLI-first/native-client interface strategy, with planned work clearly separated from shipped features.
+
+## 0.11.0 - 2026-10-05 (source tag)
+
+The source tag is available. Package-index publication and the matching GitHub Release remain pending; this is not a completed distribution release. The tagged source retains the earlier changelog preparation date.
 
 ### Added
 
@@ -20,3 +30,7 @@ All notable public-facing changes are documented here.
 - Pinned third-party GitHub Actions to immutable commit SHAs and enabled weekly Dependabot updates for workflow actions.
 - Made `doctor --skip-codex` treat the optional Codex reviewer check as explicitly skipped, and exposed the registered `project_id` at the top level of `project add` output for easier onboarding.
 - Replaced legacy internal planning material in the public source tree with concise, English product documentation.
+
+### Fixed
+
+- Enabled the trusted GitHub HTTPS credential helper for isolated publication, with non-GitHub and non-HTTPS negative coverage.
