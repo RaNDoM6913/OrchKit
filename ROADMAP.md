@@ -2,6 +2,8 @@
 
 OrchKit is an early open-source project. This roadmap records the public work still needed to make broader claims; it is not a delivery schedule.
 
+The [implementation plan](docs/implementation-plan.md) turns this roadmap into small, ordered work packages with explicit entry and acceptance gates.
+
 ## Current public baseline
 
 - The project is named OrchKit and exposes the `orch` command.

@@ -15,6 +15,8 @@ This is the public documentation set for OrchKit. It describes the implemented w
 
 ## Planned work
 
+- [Implementation plan](implementation-plan.md) — next work packages, acceptance evidence, release gates, and stop conditions.
+
 - [Multi-project Bridge](multi-project-bridge.md) — staged concurrency, transport, and connector design; not a list of shipped features.
 - [Distribution and interfaces](../ROADMAP.md#distribution-and-interfaces) — CLI first, then optional terminal and native macOS interfaces over the same authority model.
 
