@@ -1,5 +1,11 @@
 # OrchKit
 
+[![Compatibility](https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml/badge.svg?branch=main)](https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml)
+[![Source tag: v0.11.0](https://img.shields.io/badge/source-v0.11.0-blue.svg)](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+[Install](#install) · [Quick start](#quick-start) · [Documentation](docs/README.md) · [Releases](https://github.com/RaNDoM6913/OrchKit/releases) · [Roadmap](ROADMAP.md)
+
 **A durable local control plane for scoped, verifiable development work across fresh ChatGPT conversations.**
 
 OrchKit keeps workflow authority outside the chat: a new ChatGPT conversation handles each task or repair attempt, while task state, verification evidence, approvals, and publication state remain in a local SQLite ledger. The command-line interface is `orch`.
@@ -12,40 +18,37 @@ It is not a service for running untrusted code, a multi-tenant platform, or a re
 
 ## Status and support
 
-This is an early public release. Release verification currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. Published versioned packages use the `orchkit` name on PyPI and are paired with a matching GitHub Release; source installs remain supported. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
+**Source tag available; package release pending.** The public `v0.11.0` tag is available for source installation. PyPI publication and the matching GitHub Release are not yet complete; use the source-tag command below rather than `pipx install orchkit`.
+
+Release verification currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. The intended package channel is `orchkit` on PyPI, paired with a matching GitHub Release. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
 
 Use the issue tracker for reproducible source-level defects and improvement proposals. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and use [SECURITY.md](SECURITY.md) for security-sensitive concerns.
 
+## Install
+
+For everyday terminal use, install the public source tag in an isolated environment with [pipx](https://pipx.pypa.io/):
+
+```sh
+pipx install 'git+https://github.com/RaNDoM6913/OrchKit.git@v0.11.0'
+orch --version
+```
+
+Need pipx first? On macOS with Homebrew, run `brew install pipx`, then `pipx ensurepath` and open a new terminal. No OrchKit-specific Homebrew formula is provided in this release.
+
+The [installation guide](docs/installation.md) also covers dedicated virtual environments, release-tag/source installs, command-path troubleshooting, safe updates, and removal. Installing the package does not initialize state or start workers.
+
 ## Quick start
-
-For a published version, create a virtual environment and install the `orchkit` package from PyPI:
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install orchkit
-orch --version
-```
-
-To work from the current source instead:
-
-```sh
-git clone https://github.com/RaNDoM6913/OrchKit.git
-cd OrchKit
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
-orch --version
-```
 
 Choose a local directory for OrchKit state, initialize it, then ask the read-only overview what is still missing:
 
 ```sh
-export ORCH_HOME="$HOME/.orchkit"
+export ORCH_HOME="$HOME/.local/share/orchkit-state"
 orch setup --profile safe
 orch doctor --skip-codex
 orch overview
 ```
+
+This setup example is for a new installation. Existing users should keep their established `ORCH_HOME` and inspect it before making changes.
 
 The state directory contains local workflow authority and private artifacts. Keep it outside a repository and do not commit it. `--skip-codex` explicitly skips the optional Codex reviewer checks; after the RDC binding is recorded, a missing Codex installation does not keep the core workflow in an attention state.
 
@@ -55,7 +58,7 @@ Connect the ordinary ChatGPT/RDC route by generating the bootstrap prompt and ru
 orch rdc bootstrap-prompt
 ```
 
-Then register a Git repository. Review mode off is the subscription-free core path; optional review can be enabled later:
+Then register a Git repository. Review mode off does not require Codex; optional review can be enabled later:
 
 ```sh
 orch project add /absolute/path/to/repository --review-mode off
@@ -124,8 +127,15 @@ OrchKit is **not** an operating-system sandbox. A process with broad shell acces
 
 Do not use the current design to execute adversarial workloads or to protect credentials from a same-user process. Stronger isolation requires a separate operating-system identity or an isolated execution environment. Details and reporting guidance are in the [security model](docs/security-model.md) and [SECURITY.md](SECURITY.md).
 
+## What comes next
+
+The CLI is the foundation, not a temporary prototype. The next engineering milestone is a disposable three-project concurrency proof, followed by a transport abstraction and local Bridge. A terminal dashboard or SwiftUI macOS app would be an optional interface over the same core, not a second implementation of writer locks or release policy.
+
+**Not included in 0.11.0:** a native Bridge/MCP connector, a macOS app, same-repository parallel writers, or multi-device scheduling. See the [multi-project plan](docs/multi-project-bridge.md) and [interface strategy](ROADMAP.md#distribution-and-interfaces).
+
 ## Documentation
 
+- [Installation and updates](docs/installation.md)
 - [Documentation index](docs/README.md)
 - [Workflow guide](docs/workflow.md)
 - [Architecture](docs/architecture.md)

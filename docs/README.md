@@ -5,12 +5,18 @@ This is the public documentation set for OrchKit. It describes the implemented w
 ## Start here
 
 - [README](../README.md) — positioning, package/source Quick Start, status, and limitations.
+- [Installation and updates](installation.md) — pipx, virtual environments, source installs, and safe lifecycle management.
 - [Workflow guide](workflow.md) — the operator, worker, verifier, review, approval, and publication flow.
 - [Architecture](architecture.md) — durable state and component boundaries.
 - [Security model](security-model.md) — workflow controls, trust boundaries, and what OrchKit does not protect.
 - [Compatibility](compatibility.md) — verified release-readiness environments and explicit unverified boundaries.
 - [Release process](release-process.md) — owner-gated versioning, artifact verification, and publication sequence.
 - [Roadmap](../ROADMAP.md) — work that must be completed before broader release or support claims.
+
+## Planned work
+
+- [Multi-project Bridge](multi-project-bridge.md) — staged concurrency, transport, and connector design; not a list of shipped features.
+- [Distribution and interfaces](../ROADMAP.md#distribution-and-interfaces) — CLI first, then optional terminal and native macOS interfaces over the same authority model.
 
 ## Documentation standards
 
