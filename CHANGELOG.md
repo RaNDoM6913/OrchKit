@@ -6,6 +6,7 @@ All notable public-facing changes are documented here.
 
 ### Documentation
 
+- Replaced the README Mermaid workflow with a polished, self-contained SVG diagram aligned with OrchKit's visual system.
 - Added a Superkit-inspired README header with a local SVG workflow banner, coordinated badges, and feature cards.
 - Added a gate-driven implementation plan from release closure through the optional native macOS client.
 

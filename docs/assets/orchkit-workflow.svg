@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1760" height="960" viewBox="0 0 1760 960" role="img" aria-labelledby="workflow-title workflow-description">
+  <title id="workflow-title">OrchKit workflow: fresh attempts, local authority, verified outcomes</title>
+  <desc id="workflow-description">Eight numbered phases run from left to right: the operator registers a project and defines a bounded task; local task authority records allowed paths, the task contract, and durable state; a fresh ChatGPT conversation handles one task or repair attempt with project and run scoped context; one active writer per writer authority edits the allowed workspace; the worker submits a receipt and quiesces, but the report is not proof; local verification inspects actual changed bytes, runs registered checks, and validates scope; review and/or owner approval, when configured, bind to the verified snapshot; the task completes locally or publishes through configured Git policy. Failed verification or review that needs changes returns to phase 03 as a new fresh repair attempt. Durable workflow state stays local. Unknown outcomes require recovery and readback. These are workflow controls, not an operating-system sandbox.</desc>
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172338"/>
+    </linearGradient>
+    <radialGradient id="verification-aura">
+      <stop stop-color="#34d399" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#34d399" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="technical-grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#94a3b8" stroke-opacity="0.055"/>
+    </pattern>
+    <clipPath id="outer-frame">
+      <rect x="1" y="1" width="1758" height="958" rx="28"/>
+    </clipPath>
+    <marker id="main-arrow" viewBox="0 0 10 12" refX="9" refY="6" markerWidth="10" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1L9 6L1 11" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="repair-arrow" viewBox="0 0 12 14" refX="11" refY="7" markerWidth="12" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1L11 7L1 13" fill="none" stroke="#fbbf24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- The frame and subtle grid share the README hero's visual language. -->
+  <g clip-path="url(#outer-frame)">
+    <rect width="1760" height="960" fill="url(#canvas)"/>
+    <rect width="1760" height="960" fill="url(#technical-grid)"/>
+    <ellipse cx="1190" cy="350" rx="280" ry="275" fill="url(#verification-aura)"/>
+  </g>
+  <rect x="1" y="1" width="1758" height="958" rx="28" fill="none" stroke="#334155" stroke-width="2"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+    <text x="68" y="93" fill="#f8fafc" font-size="46" font-weight="700" letter-spacing="-1">The OrchKit workflow</text>
+    <text x="68" y="139" fill="#a8b8cc" font-size="26">Fresh conversations follow durable local authority.</text>
+    <path d="M68 165H1692" stroke="#334155" stroke-width="2"/>
+
+    <!-- One worker attempt owns execution through submission, not verification. -->
+    <rect x="456" y="198" width="610" height="374" rx="22" fill="#35291c" fill-opacity="0.38" stroke="#8d652a" stroke-opacity="0.75" stroke-width="1.5"/>
+    <text x="480" y="186" fill="#fcd34d" font-size="24" font-weight="600">One attempt per fresh conversation</text>
+
+    <!-- Main path: every arrow advances exactly one numbered phase. -->
+    <g fill="none" stroke="#94a3b8" stroke-width="3" stroke-linecap="round" marker-end="url(#main-arrow)">
+      <path d="M161 350H287"/>
+      <path d="M371 350H505"/>
+      <path d="M585 350H712"/>
+      <path d="M792 350H918"/>
+      <path d="M998 350H1116"/>
+      <path d="M1264 350H1370"/>
+      <path d="M1472 350H1578"/>
+    </g>
+
+    <!-- Authority: a person defines work; the local contract controls its scope. -->
+    <g text-anchor="middle">
+      <text x="123" y="285" fill="#ede9fe" font-size="28" font-weight="650">Operator</text>
+      <circle cx="123" cy="350" r="34" fill="#211c43" stroke="#a78bfa" stroke-width="2.5"/>
+      <text x="123" y="359" fill="#ddd6fe" font-size="25" font-weight="700">01</text>
+      <g fill="#c1b3e6" font-size="25">
+        <text x="123" y="433">Register project</text>
+        <text x="123" y="467">Define a</text>
+        <text x="123" y="501">bounded task</text>
+      </g>
+
+      <text x="329" y="253" fill="#ede9fe" font-size="28" font-weight="650">Local task</text>
+      <text x="329" y="285" fill="#ede9fe" font-size="28" font-weight="650">authority</text>
+      <rect x="291" y="312" width="76" height="76" rx="14" fill="#211c43" stroke="#a78bfa" stroke-width="2.5"/>
+      <path d="M303 322H355" stroke="#6551a0" stroke-width="2"/>
+      <text x="329" y="359" fill="#ddd6fe" font-size="25" font-weight="700">02</text>
+      <g fill="#c1b3e6" font-size="25">
+        <text x="329" y="433">Explicit allowed</text>
+        <text x="329" y="467">paths</text>
+        <text x="329" y="501">Task contract</text>
+        <text x="329" y="535">Durable ledger</text>
+      </g>
+    </g>
+
+    <!-- Execution is scoped to a new conversation and one writer authority. -->
+    <g text-anchor="middle">
+      <g fill="#fff7df" font-size="28" font-weight="650">
+        <text x="547" y="221">Fresh</text>
+        <text x="547" y="253">ChatGPT</text>
+        <text x="547" y="285">worker</text>
+        <text x="754" y="221">Scoped</text>
+        <text x="754" y="253">workspace</text>
+        <text x="754" y="285">edits</text>
+        <text x="960" y="221">Result</text>
+        <text x="960" y="253">submission</text>
+        <text x="960" y="285">+ quiesce</text>
+      </g>
+      <g fill="#35291c" stroke="#fbbf24" stroke-width="2.5">
+        <circle cx="547" cy="350" r="34"/>
+        <circle cx="754" cy="350" r="34"/>
+        <circle cx="960" cy="350" r="34"/>
+      </g>
+      <g fill="#fde68a" font-size="25" font-weight="700">
+        <text x="547" y="359">03</text>
+        <text x="754" y="359">04</text>
+        <text x="960" y="359">05</text>
+      </g>
+      <g fill="#d5c19a" font-size="25">
+        <text x="547" y="433">One task or</text>
+        <text x="547" y="467">repair attempt</text>
+        <text x="547" y="501">Project/run</text>
+        <text x="547" y="535">scoped context</text>
+        <text x="754" y="433">Allowed workspace</text>
+        <text x="754" y="467">One active writer</text>
+        <text x="754" y="501">per writer</text>
+        <text x="754" y="535">authority</text>
+        <text x="960" y="433">Submit receipt</text>
+        <text x="960" y="467">Stop writing</text>
+      </g>
+      <rect x="873" y="489" width="174" height="61" rx="11" fill="#211c19" stroke="#8d652a"/>
+      <text x="960" y="514" fill="#fde68a" font-size="24" font-weight="600">Receipt is</text>
+      <text x="960" y="540" fill="#fde68a" font-size="24" font-weight="600">not proof</text>
+    </g>
+
+    <!-- Verification is the evidence hub, distinct from the worker's receipt. -->
+    <g text-anchor="middle">
+      <text x="1190" y="223" fill="#e2fff1" font-size="30" font-weight="700">Local</text>
+      <text x="1190" y="258" fill="#e2fff1" font-size="30" font-weight="700">verification</text>
+      <circle cx="1190" cy="350" r="74" fill="none" stroke="#34d399" stroke-opacity="0.12" stroke-width="12"/>
+      <circle cx="1190" cy="350" r="66" fill="#12332e" stroke="#34d399" stroke-width="3"/>
+      <text x="1190" y="360" fill="#a7f3d0" font-size="33" font-weight="700">06</text>
+      <g fill="#a6d6c6" font-size="25">
+        <text x="1190" y="459">Inspect actual bytes</text>
+        <text x="1190" y="493">Registered checks</text>
+        <text x="1190" y="527">Validate scope</text>
+      </g>
+    </g>
+
+    <!-- Policy gates bind to the verified snapshot; completion has two routes. -->
+    <g text-anchor="middle">
+      <g fill="#e0f2fe" font-size="28" font-weight="650">
+        <text x="1421" y="253">Required</text>
+        <text x="1421" y="285">gates</text>
+        <text x="1635" y="253">Complete or</text>
+        <text x="1635" y="285">guarded publish</text>
+      </g>
+      <path d="M1397 310H1445L1467 350L1445 390H1397L1375 350Z" fill="#183044" stroke="#7dd3fc" stroke-width="2.5" stroke-linejoin="round"/>
+      <rect x="1585" y="312" width="100" height="76" rx="22" fill="#183044" stroke="#7dd3fc" stroke-width="2.5"/>
+      <g fill="#bae6fd" font-size="25" font-weight="700">
+        <text x="1421" y="359">07</text>
+        <text x="1635" y="359">08</text>
+      </g>
+      <g fill="#adcede" font-size="25">
+        <text x="1421" y="433">Review and/or</text>
+        <text x="1421" y="467">owner approval</text>
+        <text x="1421" y="501" fill="#bae6fd" font-weight="650">when configured</text>
+        <text x="1421" y="535">Bound to verified</text>
+        <text x="1421" y="569">snapshot</text>
+        <text x="1635" y="433">Complete locally</text>
+        <text x="1635" y="467">or publish via</text>
+        <text x="1635" y="501">configured</text>
+        <text x="1635" y="535">Git policy</text>
+      </g>
+    </g>
+
+    <!-- Repair is a separate path to a NEW attempt, never a resumed running chat. -->
+    <g fill="none" stroke="#fbbf24" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M1237 397H1297Q1315 397 1315 415V607Q1315 625 1297 625H474Q452 625 452 603V392Q452 373 471 373H522" marker-end="url(#repair-arrow)"/>
+      <path d="M1397 390H1333Q1315 390 1315 408V425"/>
+    </g>
+    <rect x="628" y="595" width="480" height="61" rx="13" fill="#30271c" stroke="#8d652a" stroke-width="1.5"/>
+    <text x="868" y="634" text-anchor="middle" fill="#fde68a" font-size="27" font-weight="650">Needs changes: new fresh attempt</text>
+    <text x="936" y="694" text-anchor="middle" fill="#d5c19a" font-size="25">Failed verification or review feedback returns to 03.</text>
+
+    <!-- Supporting authority and recovery facts stay below the main path. -->
+    <g transform="translate(68 748)">
+      <path d="M0 0H726V115H0Z" fill="#191e36" stroke="#4b426d" stroke-width="1.5"/>
+      <path d="M0 0V115" stroke="#a78bfa" stroke-width="4"/>
+      <text x="26" y="40" fill="#ddd6fe" font-size="27" font-weight="650">Durable state stays local</text>
+      <text x="26" y="79" fill="#b7b6d0" font-size="25">Task history, checkpoints, snapshots, approvals</text>
+    </g>
+    <g transform="translate(826 748)">
+      <path d="M0 0H866V115H0Z" fill="#17283a" stroke="#38566d" stroke-width="1.5"/>
+      <path d="M0 0V115" stroke="#7dd3fc" stroke-width="4"/>
+      <text x="26" y="40" fill="#bae6fd" font-size="27" font-weight="650">Unknown outcome? Recover and read back.</text>
+      <text x="26" y="79" fill="#adcede" font-size="25">Uncertain worker or Git state is not success.</text>
+    </g>
+
+    <text x="68" y="922" fill="#94a3b8" font-size="24">Local state · Explicit scope · Verified outcomes</text>
+    <text x="1692" y="922" text-anchor="end" fill="#94a3b8" font-size="24">Workflow controls. Not an OS sandbox.</text>
+  </g>
+</svg>
