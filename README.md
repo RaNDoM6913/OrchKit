@@ -1,10 +1,10 @@
-# ⚡ OrchKit
+# OrchKit
 
 > **Fresh chats. Durable work.** A local control plane for scoped, verifiable development across ChatGPT conversations.
 
 <div align="center">
 
-<a href="https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml"><img src="https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml/badge.svg?branch=main" alt="Live compatibility CI status" height="28"></a>
+<a href="https://github.com/RaNDoM6913/OrchKit/actions/workflows/compatibility.yml"><img src="https://img.shields.io/github/actions/workflow/status/RaNDoM6913/OrchKit/compatibility.yml?branch=main&amp;style=for-the-badge&amp;label=compatibility&amp;labelColor=1e293b" alt="Compatibility CI status on main" height="28"></a>
 [![Source tag v0.11.0](docs/assets/badge-source.svg)](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0)
 [![Apache 2.0 license](docs/assets/badge-license.svg)](LICENSE)
 
