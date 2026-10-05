@@ -134,16 +134,13 @@ orch overview --project "$PROJECT_ID"
 
 ## How the workflow works
 
-```mermaid
-flowchart LR
-    O[Operator] --> P[Register project and define task]
-    P --> W[Fresh ChatGPT worker]
-    W --> E[Scoped workspace edits]
-    E --> V[Local verification]
-    V --> G{Required review or approval}
-    G -->|Gates satisfied| C[Complete or guarded publish]
-    G -->|Needs changes| W
-```
+<p align="center">
+  <img
+    src="docs/assets/orchkit-workflow.svg"
+    alt="OrchKit workflow: an operator registers a project and defines a bounded task under local task authority; a fresh ChatGPT attempt makes scoped edits with one active writer per writer authority, submits a result and quiesces; local verification checks actual bytes, scope, and registered checks; snapshot-bound required gates allow completion or guarded publication. Failed verification or gates return to a fresh repair attempt."
+    width="960"
+  >
+</p>
 
 The diagram reflects the implemented workflow boundaries:
 
