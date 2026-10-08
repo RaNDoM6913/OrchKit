@@ -7,7 +7,7 @@ The [implementation plan](docs/implementation-plan.md) turns this roadmap into s
 ## Current public baseline
 
 - The project is named OrchKit and exposes the `orch` command.
-- The public `v0.11.0` source tag can be installed; PyPI publication and the matching GitHub Release remain pending.
+- The public `v0.11.0` source tag (October 5, 2026) and the matching PyPI and GitHub Release distributions (October 8, 2026) are available: [PyPI](https://pypi.org/project/orchkit/0.11.0/) · [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0).
 - The public documentation covers the workflow, architecture, and same-user security boundary.
 - Codex review is optional. The primary worker model remains a fresh ChatGPT conversation for each task or repair attempt.
 - The source is licensed under Apache-2.0.
@@ -24,7 +24,7 @@ With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence ha
 
 ## Release discipline
 
-- The `orchkit` distribution name and sdist/wheel artifact shape are verified. The intended package channel is PyPI with a matching GitHub Release; publication remains owner-gated and follows `docs/release-process.md`.
+- The frozen `orchkit` 0.11.0 wheel and sdist were published on PyPI with a matching GitHub Release on October 8, 2026; subsequent releases remain owner-gated by `docs/release-process.md`.
 - Expand the documented compatibility matrix only from reproducible OS, architecture, Python, and Git test evidence; current macOS/arm64 CI covers CPython 3.9 through 3.14 and is recorded in `docs/compatibility.md`.
 - Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available for every release.
 - Compatibility CI runs on pull requests and `main` for the documented macOS/arm64 CPython 3.9 through 3.14 matrix. Expand it only after the intended environment is named and reproducible evidence is added.
@@ -32,7 +32,7 @@ With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence ha
 
 ## P1: two or three independent projects
 
-Start P1 implementation after completing the 0.11.0 publication gate.
+The 0.11.0 publication gate closed on October 8, 2026. P1 implementation remains planned and has not started.
 
 The first target is one operator, one Mac, and up to three independent project workers. Preserve one active writer per existing `writer_key`; linked worktrees that share a Git common directory remain serialized.
 
@@ -46,7 +46,7 @@ These are planned milestones, not capabilities shipped in 0.11.0. The [detailed 
 
 ## Distribution and interfaces
 
-**Now: the `orch` CLI.** Keep installation, updates, diagnostics, and recovery dependable. PyPI plus the matching GitHub Release is the target distribution channel; publication is currently pending, while the source-tag route works. [pipx installation](docs/installation.md) exposes the existing command without a project-local virtual environment activation step. A dedicated OrchKit Homebrew formula is a possible later channel, not an available command today.
+**Now: the `orch` CLI.** Keep installation, updates, diagnostics, and recovery dependable. Version 0.11.0 is available from [PyPI](https://pypi.org/project/orchkit/0.11.0/) and a matching [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0); the frozen source-tag route remains supported. [pipx installation](docs/installation.md) exposes the existing command without a project-local virtual environment activation step. A dedicated OrchKit Homebrew formula is a possible later channel, not an available command today.
 
 **Next: a stable local Bridge contract.** The CLI, future connector, and optional interfaces must use the same task/run authority, writer locks, verification gates, and uncertainty handling. Do not let a UI write directly to SQLite or bypass the core with unrestricted shell commands.
 

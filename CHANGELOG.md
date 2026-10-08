@@ -15,9 +15,9 @@ All notable public-facing changes are documented here.
 - Added isolated CLI installation, update, troubleshooting, and removal guidance.
 - Published the staged three-project Bridge roadmap and the CLI-first/native-client interface strategy, with planned work clearly separated from shipped features.
 
-## 0.11.0 - 2026-10-05 (source tag)
+## 0.11.0 - 2026-10-05 (source tag); 2026-10-08 (distribution release)
 
-The source tag is available. Package-index publication and the matching GitHub Release remain pending; this is not a completed distribution release. The tagged source retains the earlier changelog preparation date.
+The immutable [source tag `v0.11.0`](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0) was created on October 5, 2026, from commit `00468b52f8bc55462951036577e8774074ef7529` (prepared September 28). The exact frozen wheel and sdist were published on [PyPI](https://pypi.org/project/orchkit/0.11.0/) on October 8, 2026, with a matching [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0) and checksums. No tag move or artifact rebuild occurred.
 
 ### Added
 
