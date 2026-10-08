@@ -10,7 +10,7 @@ Keep one active writer per `writer_key`. Linked worktrees sharing a Git common d
 
 ## 0. Close the frozen 0.11.0 release
 
-**Current gate: package-index publication is pending.** The public source tag is available, but it does not by itself close the release.
+**Release gate: CLOSED on 2026-10-08.** The immutable `v0.11.0` tag was created on October 5, 2026, from commit `00468b52f8bc55462951036577e8774074ef7529`. The frozen distributions were published on [PyPI](https://pypi.org/project/orchkit/0.11.0/) and the matching [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0) on October 8, 2026. The sequence below records the completed closure checks; P1 implementation is not included.
 
 1. Resolve the package-index authorization condition out of band. Do not ask for a token in chat, print credentials, or retry an unchanged refusal.
 2. Read back the public tag, package-index project/version, GitHub Releases, exact-tag CI, and retained artifact hashes.
@@ -20,7 +20,7 @@ Keep one active writer per `writer_key`. Linked worktrees sharing a Git common d
 6. Install the published version in a fresh environment and run the shared installed-package check against the exact source tag.
 7. Update the pending-publication wording and package links through a separate documentation PR; keep the source-tag history unchanged.
 
-**Exit evidence:** immutable tag/source identity, exact-tag CI, artifact hashes, strict artifact validation, GitHub Release, and a fresh published-package smoke. Follow [release-process.md](release-process.md). An uncertain or partial upload stays blocked until live readback resolves it.
+**Exit evidence (PASS):** unchanged tag/source identity, all six jobs in [exact-source CI](https://github.com/RaNDoM6913/OrchKit/actions/runs/36434444420), frozen wheel/sdist SHA-256 matches against published PyPI files, strict artifact validation, verified GitHub Release assets, and fresh published-package install/template/dispatcher smoke. Future releases still follow [release-process.md](release-process.md); uncertain publication outcomes require readback before retry.
 
 ## 1. P1-A: prove existing multi-project behavior
 

@@ -17,7 +17,7 @@
   <img src="docs/assets/orchkit-hero.svg" alt="OrchKit: define task and scope, execute in a fresh ChatGPT conversation, verify bytes and checks, then complete or publish after policy gates. Local workflow controls, not an OS sandbox." width="960">
 </p>
 
-<sub>Source tag available · PyPI publication pending · macOS arm64 verification</sub>
+<sub><a href="https://pypi.org/project/orchkit/0.11.0/">PyPI 0.11.0</a> · <a href="https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0">GitHub Release</a> · macOS arm64 verification</sub>
 
 </div>
 
@@ -66,18 +66,18 @@ It is not a service for running untrusted code, a multi-tenant platform, or a re
 
 ## Status and support
 
-**Source tag available; package release pending.** The public `v0.11.0` tag is available for source installation. PyPI publication and the matching GitHub Release are not yet complete; use the source-tag command below rather than `pipx install orchkit`.
+**OrchKit 0.11.0 is published.** The frozen [source tag](https://github.com/RaNDoM6913/OrchKit/tree/v0.11.0) was created on October 5, 2026, from commit `00468b52f8bc55462951036577e8774074ef7529`. The matching [PyPI distribution](https://pypi.org/project/orchkit/0.11.0/) and [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0) were published on October 8, 2026.
 
-Release verification currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. The intended package channel is `orchkit` on PyPI, paired with a matching GitHub Release. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
+Release verification currently covers macOS arm64 with CPython 3.9 through 3.14; other platforms, architectures, and later interpreter versions remain unverified. The package is published as `orchkit` on PyPI and installs the `orch` CLI. See the [compatibility matrix](docs/compatibility.md) for exact test points and boundaries.
 
 Use the issue tracker for reproducible source-level defects and improvement proposals. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and use [SECURITY.md](SECURITY.md) for security-sensitive concerns.
 
 ## Install
 
-For everyday terminal use, install the public source tag in an isolated environment with [pipx](https://pipx.pypa.io/):
+For everyday terminal use, install the published 0.11.0 package in an isolated environment with [pipx](https://pipx.pypa.io/):
 
 ```sh
-pipx install 'git+https://github.com/RaNDoM6913/OrchKit.git@v0.11.0'
+pipx install 'orchkit==0.11.0'
 orch --version
 ```
 

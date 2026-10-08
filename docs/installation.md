@@ -2,7 +2,7 @@
 
 OrchKit is a Python command-line application. The distribution is `orchkit`; the installed command is `orch`. A separate terminal UI or macOS app is not required.
 
-**Current distribution status:** the public `v0.11.0` source tag is available. PyPI publication and the matching GitHub Release remain pending. The source-tag commands below work independently of the package-name upload.
+**Distribution status:** `orchkit==0.11.0` is published on [PyPI](https://pypi.org/project/orchkit/0.11.0/) with a matching [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0), both published on October 8, 2026. The immutable `v0.11.0` source tag was created on October 5, 2026, and remains an alternative source-install route.
 
 Release verification covers macOS arm64 and CPython 3.9 through 3.14. Other combinations are unverified; see [compatibility](compatibility.md). Installation does not initialize a ledger, start workers, or register a project.
 
@@ -15,10 +15,10 @@ brew install pipx
 pipx ensurepath
 ```
 
-Git and a supported Python interpreter must be available. Open a new terminal, then install the public source tag:
+A supported Python interpreter must be available; Git is needed only for optional source-tag installs. Open a new terminal, then install the published package:
 
 ```sh
-pipx install 'git+https://github.com/RaNDoM6913/OrchKit.git@v0.11.0'
+pipx install 'orchkit==0.11.0'
 orch --version
 orch --help
 ```
@@ -29,15 +29,20 @@ The source-tag pipx route was checked with pipx 1.17.11 and CPython 3.12.13 on m
 
 If a command is missing or resolves to an older installation, run `command -v orch` and `pipx list`. Do not replace another active runtime or use `sudo pip install` to work around a path conflict.
 
-## PyPI route: pending publication
+## Published package and source-tag alternative
 
-After the package and matching [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases) are available, the shorter command will be `pipx install 'orchkit==0.11.0'`. Do not use it while publication is pending. The source-tag route above is the current installation path.
+The recommended pipx command above installs the exact released PyPI version. The published wheel, source archive, SHA256SUMS, and notes are also available from the [GitHub Release](https://github.com/RaNDoM6913/OrchKit/releases/tag/v0.11.0). To install directly from the frozen source tag instead:
+
+```sh
+pipx install 'git+https://github.com/RaNDoM6913/OrchKit.git@v0.11.0'
+orch --version
+```
 
 ## Alternative: a dedicated virtual environment
 
 ```sh
 python3 -m venv "$HOME/.local/share/orchkit-venv"
-"$HOME/.local/share/orchkit-venv/bin/python" -m pip install 'git+https://github.com/RaNDoM6913/OrchKit.git@v0.11.0'
+"$HOME/.local/share/orchkit-venv/bin/python" -m pip install 'orchkit==0.11.0'
 "$HOME/.local/share/orchkit-venv/bin/orch" --version
 ```
 
@@ -60,7 +65,7 @@ python3 -m venv .venv
 .venv/bin/orch --version
 ```
 
-The tag selects the frozen source candidate; it does not mean that package-index publication is complete. Omit the checkout command only when intentionally evaluating current development source. A version string alone does not identify the commit or prove that development source matches released artifacts.
+The tag selects the immutable source for the published 0.11.0 release. Omit the checkout command only when intentionally evaluating current development source. A version string alone does not identify the commit or prove that development source matches released artifacts.
 
 ## First setup
 
@@ -82,9 +87,9 @@ Follow the [Quick Start](../README.md#quick-start) to bind RDC and register a pr
 
 Before an update, confirm that no active worker depends on the environment being changed, inspect the release notes, and review `orch state backup --help` and back up the established state through that explicit command. See the [workflow guide](workflow.md) for the surrounding safety gates. Pause blocks new claims; it is not proof that an existing writer or process stopped.
 
-A Git-tag installation stays pinned to that source. `pipx upgrade orchkit` does not turn a pinned tag into the next release. Once no worker depends on the installed runtime, remove the managed application with `pipx uninstall orchkit` and install the deliberately selected new tag. Keep the workflow state separate and retained.
+A Git-tag installation stays pinned to that source. Likewise, do not assume `pipx upgrade orchkit` changes a pinned `orchkit==0.11.0` installation to another version. Once no worker depends on the installed runtime, remove the managed application with `pipx uninstall orchkit` and install the deliberately selected version or tag. Keep the workflow state separate and retained.
 
-For a future PyPI-managed installation, `pipx upgrade orchkit` selects the latest available package; review that version first. For an isolated virtual environment, use its Python executable with `-m pip install --upgrade` and the deliberately selected tag or published package version.
+For an unpinned PyPI-managed installation, `pipx upgrade orchkit` can select a newer package; review the available version first. For an isolated virtual environment, use its Python executable with `-m pip install --upgrade` and the deliberately selected tag or published package version.
 
 `pipx uninstall orchkit` removes the managed application, not the separately chosen workflow state directory. Retain state and evidence unless intentionally retiring that installation. Do not downgrade a live ledger without a verified compatibility/recovery plan.
 
