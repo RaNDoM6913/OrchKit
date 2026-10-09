@@ -138,11 +138,13 @@ This proves the scheduler before introducing a new network layer.
 
 ## P1-B — remove RDC from core semantics
 
-**Current stage (P1-B1): source inventory and interface contracts only.** This
-section describes the source as of `8dd8c6da7ac6e2f46e5de93af46802df6fe0933f`
-(after P1-A3 and the registered-check 600-second prerequisite), not a shipped
-transport abstraction. The existing ChatGPT-to-RDC worker route stays in place.
-P1-B1 does **not** introduce an OrchKit Python executor for external RDC calls.
+**Historical P1-B1 inventory baseline.** The caller/source references in
+this section describe `8dd8c6da7ac6e2f46e5de93af46802df6fe0933f`
+(after P1-A3 and the registered-check 600-second prerequisite). P1-B2 and
+P1-B3 subsequently extracted pure v1 validation and route-evidence storage;
+P1-B4 adds only an in-memory operation contract. None of these packages
+introduces a Python executor for ChatGPT's external RDC calls, a Bridge,
+or native device/session authorization. The existing RDC route remains in use.
 
 ### Current operation and authority sequence (implemented)
 
@@ -333,44 +335,66 @@ These interfaces must not relocate or weaken those decisions.
   exact changed paths and Markdown links; a subset or clean HEAD without a
   clean index/worktree cannot satisfy the full acceptance gate.
 
-### Small P1-B packages and the single next extraction task
+### P1-B bounded packages and delivered boundaries
 
-1. **P1-B1 (this package):** source-grounded inventory, compatibility
-   invariants and contracts in documentation only; no code changes.
-2. **P1-B2 (next, one bounded attempt): extract *pure v1 identity/evidence
-   validators*, no storage refactor.** Proposed exact allowed paths:
-   `orch/transport_contracts.py` (new),
-   `orch/dispatcher.py`, `tests/test_transport_contracts.py` (new),
-   `tests/test_dispatcher.py`. Move only pure
-   `validate_rdc_marker`, `validate_route_evidence` and their bounded
-   string/tri-state validation into a version-explicit module; keep
-   `orch.dispatcher` imports as compatibility wrappers/re-exports so
-   `overview`, `readiness`, CLI, tests and external callers do not change
-   their import contract. **Prerequisite:** verified/published P1-B1
-   plus exact-merge CI. **Acceptance:** identical v1 allowed keys,
-   sizes, version rules, error codes, unknown behavior, marker replacement,
-   exclusive evidence writes, stale-binding and `NOT_EVALUATED`;
-   no format migration and no additional authority. **Checks:** targeted
-   `python3 -m unittest discover -s tests -p 'test_transport_contracts.py' -v`
-   and corresponding `test_dispatcher.py` discovery, existing
-   readiness/productization and P1-A acceptance, the complete
-   registered `python3 -m unittest discover -s tests -v`, exact-path diff,
-   link/scope check, OrchKit receipt -> quiesce -> verify -> guarded publish
-   and exact-head/merge CI. **Non-goals:** moving file I/O, modifying
-   `orch/cli.py`/readiness/overview, adding v2 schemas, a Python RDC
-   worker executor, Bridge, relay, broker, session API, daemon, new
-   provider, or changing risk/writer/check/publication gates.
-3. **P1-B3 (later, separately admitted):** a narrow version-aware
-   route-evidence storage seam and historical v1 file/mode/error parity;
-   define its exact scope after B2 readback, not in this run.
-4. **P1-B4 (later, separately admitted):** optional worker-operation
-   protocol boundary with fake adapter and failure contracts, before any
-   Bridge/MCP implementation. No new executor or publication coupling by
-   default.
+1. **P1-B1 — completed (PR #39):** source-grounded inventory and historical
+   v1 schema/permission/error contracts, without implementation changes.
+2. **P1-B2 — completed (PR #40):** `orch/transport_contracts.py` contains
+   pure marker and route-evidence v1 validators. Dispatcher compatibility
+   exports, old error codes and schema bytes remain unchanged.
+3. **P1-B3 — completed (PR #41):** `orch/route_evidence_store.py` contains
+   version-aware v1 route storage and codec with historical exclusive
+   write-once, no-follow reads, mode repair, rebinding and
+   `acceptance=NOT_EVALUATED` preserved.
+4. **P1-B4 — pure boundary (this package):** `orch/worker_operations.py`
+   defines in-memory v1 run identity, operation/outcome metadata and
+   structural file/process adapter protocols. The **only adapters** are
+   fake objects in `tests/test_worker_operations.py`. This is neither
+   an active execution endpoint nor a new native worker session.
 
-The roadmap, P1-C through P1-G milestones and deferred same-repository,
-multi-device and hosted scope remain unchanged. P1-B1 stops after one
-documentation-only lifecycle; it must not implement P1-B2 as a side effect.
+### P1-B4 contract semantics and explicit non-authority
+
+- **Metadata:** `WorkerRunBinding` contains project, writer key, task,
+  run and attempt. `WorkerOperationRequest` adds a bounded operation ID,
+  an exact allowed kind, a lexical target and an output-byte ceiling.
+  An operation ID is not a durable idempotency journal or permission token.
+- **Six kinds:** `file.read`, `file.list`, `file.patch`, `process.start`,
+  `process.poll`, `process.terminate`. File targets are syntactically
+  relative; no filesystem symlink or allowlist check is performed here.
+  Process-start targets are symbolic future *registered profile identifiers*,
+  not executable strings; poll/terminate targets are opaque handles. No
+  process is started, polled or terminated by this module.
+- **Binding checks:** `require_matching_worker_run` compares the presented
+  binding with separately supplied expected values and denies mismatches.
+  Callers must independently obtain authoritative identity from the ledger,
+  check active capability, device trust and run/session authority, and enforce
+  canonical paths, process ownership and resource limits before *any* I/O.
+  A forged expected binding, route evidence or saved RDC marker cannot
+  supply authority. These authorizing mechanisms remain P1-C work.
+- **Outcome checks:** `SUCCEEDED`, `REFUSED`, `FAILED`, `UNKNOWN`
+  are distinct and validated; results correlate to the operation ID and
+  declared output bound. An `UNKNOWN` result requires independent
+  readback and must **not** become success, proven failure or an automatic
+  replay of a mutation. Durable retry/operation reconciliation is **not**
+  implemented by this pure module.
+- **Separation:** no production file/process adapter, RDC client, Bridge,
+  background daemon, relay, broker or MCP server is introduced.
+  `orch/core.py` still executes registered checks locally via bounded
+  `subprocess.run`; guarded Git publication remains in its original
+  publisher and `orch/git_transport.py`. Neither is routed through this
+  worker protocol. Existing writer, capability, recovery, review/approval,
+  evidence and publisher gates do not move.
+- **Tests:** fake adapters exercise the six methods, strict schema and
+  identifiers, cross-project/writer/task/run/attempt denials, unsafe target
+  syntax, bounded output, explicit failure/refusal, unknown/lost-response
+  readback and non-import of subprocess/Git publisher surfaces; the full
+  registered regression and exact PR/main CI remain mandatory.
+
+The next separately scoped milestone is **P1-C**: design and test
+ledger-backed local authorization, path canonicalization, owned-process
+tracking, durable operation IDs, timeouts/reconnect semantics and negative
+cross-session cases before implementing real I/O. P1-D through P1-G and
+multi-device/hosted extensions remain separately gated.
 
 ## P1-C — local OrchKit Bridge MVP
 
