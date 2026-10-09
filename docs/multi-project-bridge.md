@@ -138,28 +138,239 @@ This proves the scheduler before introducing a new network layer.
 
 ## P1-B — remove RDC from core semantics
 
-Introduce internal transport/executor boundaries without changing behavior.
+**Current stage (P1-B1): source inventory and interface contracts only.** This
+section describes the source as of `8dd8c6da7ac6e2f46e5de93af46802df6fe0933f`
+(after P1-A3 and the registered-check 600-second prerequisite), not a shipped
+transport abstraction. The existing ChatGPT-to-RDC worker route stays in place.
+P1-B1 does **not** introduce an OrchKit Python executor for external RDC calls.
 
-Candidate interfaces:
+### Current operation and authority sequence (implemented)
 
-- DeviceIdentityProvider;
-- WorkerTransport;
-- FileOperations;
-- ProcessOperations;
-- GitOperations;
-- RouteEvidenceProvider;
-- OperationJournal.
+1. An operator connects the actual RDC device outside OrchKit. `orch rdc record`
+   persists that observed device's ID/name; `rdc show` reads the local marker.
+   The marker is not live connector authentication or independent proof that the
+   device is still online (`orch/dispatcher.py:53-85`).
+2. Register a Git project and inspect its identity and policy. The registry
+   derives `writer_key` from the canonical Git common directory, so linked
+   worktrees serialize (`orch/project.py:193-236`). A project-scoped rendered
+   prompt includes explicit `--project` and a scoped worker ID
+   (`orch/dispatcher.py:246-301`; `orch/templates/dispatcher_prompt.txt`).
+3. `overview --project`, `project audit`, `recovery inspect`, and `queue list`
+   report readiness, dependency, pause, writer and publication state. A prompt
+   rendering or RDC marker by itself cannot claim an attempt.
+4. In a **fresh ordinary ChatGPT conversation**, the worker invokes the local
+   `orch claim --project ...` via RDC. The ledger atomically checks queue,
+   project pause, dependencies, max attempts, writer reservation, branch, HEAD
+   and workspace preflight, then returns a specific `run_id`,
+   `capability_file`, `receipt_file` and bounded context
+   (`orch/core.py:1325-1538`). The external ChatGPT/RDC session performs
+   scoped file edits and process interactions; no Python `WorkerTransport` or
+   `FileOperations` adapter executes those RDC tool calls today.
+5. The worker writes a receipt at its returned private path, then calls
+   `submit --cap ... --receipt ...` and `quiesce --cap ...`. Receipt identity,
+   changed-path allowlist and lease are checked. `RESULT_SUBMITTED` is not
+   success. `quiesce` revokes the capability and advances to `VERIFYING`,
+   **cooperatively**, without fencing a residual direct RDC shell
+   (`orch/core.py:1601-1627,1726-1788`).
+6. The local verifier independently checks actual Git/workspace changes,
+   protected bytes, Git base, frozen executable/check authority, snapshot and
+   registered checks (`orch/core.py:1899-2317`). The local registered check is
+   `subprocess.run` with bounded output and deadline
+   (`orch/core.py:2095-2140`); **it is not worker transport**. Current admitted
+   check timeout maximum is 600 seconds; a timed-out command cannot prove an
+   unrelated external RDC process has stopped.
+7. `NEEDS_FIX` requires durable feedback and a fresh attempt. `VERIFIED` may
+   require review/owner approval; with review off and no required owner
+   acceptance it can proceed to `publish`. Publication checks exact branch,
+   base, staged scope and verified bytes, then uses local Git and a separate,
+   restricted Git network transport with remote-ref readback
+   (`orch/core.py:2760-3000`; `orch/git_transport.py:30-196`).
+   **Git publication transport is not ChatGPT worker transport.** Unknown
+   publication outcomes require `publish-reconcile`, not a blind retry.
+8. Checkpoint/recovery preserves the writer on active/unknown work. Pauses
+   prevent new claims, not OS processes; elapsed heartbeat/lease time is not
+   fencing (`orch/core.py:1661-1724,3206-3240,3358-3421`;
+   `orch/state.py:197-427`). This is cooperative orchestration, not a sandbox.
 
-The existing RDC path becomes an adapter behind these interfaces.
+### Current RDC-dependent surface and real callers (implemented)
 
-Route evidence must evolve from an RDC-only transport value to a versioned transport record while remaining able to read historical v1 evidence.
+All references below are source locations, **not** proposed module names.
+`read` means a source operation's intent; explicit permission-mode side
+effects are distinguished in the compatibility section.
 
-Acceptance criteria:
+| Surface and callers | Inputs / output and authority | Mutation, failure and recovery |
+| --- | --- | --- |
+| `orch/cli.py:62-94,321-360` — `rdc record/show/bootstrap-prompt`, `route record/show`, `dispatcher render` | Explicit `--root`; device ID/name supplied from external RDC discovery. Route record requires a **real ledger run lookup** before passing exact `run_id`/`task_id`. JSON results; no connector session is created by this CLI. | Record/render write private files; show may repair file mode; missing/invalid marker or unknown run does not authorize a route. |
+| `orch/dispatcher.py:25-85` — `validate_rdc_marker`, `record_rdc`, `read_rdc` | v1 `rdc-bootstrap.json` inside ORCH home; device ID/name, timestamp, fixed source. Callers: CLI, `run_doctor`, route recorder/reader, `render_dispatcher`. | Atomic **replaceable** marker, not append-only or a live identity challenge. Missing -> `UNVERIFIED`; unsafe/oversized/invalid -> error; `read_rdc` explicitly repairs mode to `0600`. |
+| `orch/dispatcher.py:88-233` — `validate_route_evidence`, `record_route_evidence`, `read_route_evidence` | Fixed v1 `ordinary_chat`/`rdc` observation per run. Callers: CLI route commands and dispatcher tests. Device ID/name are copied from recorded marker; no ChatGPT conversation ID is required or proven. | New private `route-evidence/<run_id>.json` **once** via exclusive create; duplicate -> error. Historical read remains available; if current marker differs, `STALE_DEVICE_BINDING` and `acceptance=NOT_EVALUATED`, not a new assertion of authority. |
+| `orch/dispatcher.py:236-311` and `orch/templates/dispatcher_prompt.txt` — renderer/bootstrap | Optional project ID validated against read-only registry; `ORCH_EXECUTABLE` override, installed executable or Python fallback; returns target/scope/worker ID. Template tells the external worker to claim and use exact ledger context. | Writes `0600` prompt; rendering does not start ChatGPT or RDC, grant capability, or prove task acceptance. Scheduled rearming text is a template, **not** permission to schedule work. |
+| `orch/overview.py:148-175,231-493` — `_read_rdc`, `operator_overview` | Reads marker with v1 validator; also state layout and project audit. CLI `overview` consumer. | **Inspection only**: missing -> `UNVERIFIED`; unsafe, wrong mode, or invalid -> `BLOCKED` without chmod, state migration or repair. |
+| `orch/readiness.py:473-948` — `audit_project`, RDC and scoped-dispatcher checks at 786-914 | Reads same marker and a bounded scoped dispatcher; validates registry, writer identity, check authority, ledger health and pauses. Called by CLI project audit/plan/enqueue and overview. | **Inspection only**: missing marker -> `ATTENTION`; unsafe/schema/mode mismatch -> `BLOCKED`; valid `0600` marker -> `PASS`. Project dispatcher missing is `ATTENTION` when required, otherwise optional. |
+| `orch/doctor.py:17-73` — `run_doctor` | Uses `read_rdc` for RDC check; checks Python, Git, home and optional Codex setup. CLI `doctor` caller. | Unlike overview, initializes/checks private home via `ensure_home`; read_rdc may chmod. Reports `RECORDED`, `UNVERIFIED` or `BLOCKED` check, not live RDC availability. |
+| `orch/cli.py:196-227,671-721`, `orch/core.py:1325-1788,2192-2317` | Project-scoped `claim`, bounded context, capability path, receipt, submit/quiesce/verify. This is ledger authority invoked **through** RDC, not implemented by RDC. | Mutating lifecycle; fail-closed identity, path and writer checks; `NEEDS_FIX`/recovery when checks or observations fail. |
+| `orch/core.py:2095-2140`, `orch/readiness.py:207-345` | Admitted `argv`, `cwd`, frozen executable/digest, timeout/output limit/action. Registry/check-authority inspection and local verifier. | Local subprocess, **not** external RDC execution. Failed/timeout checks return `NEEDS_FIX`; drift blocks. A full suite is not proven by a single-case test. |
+| `orch/project.py:193-236`, `orch/git_policy.py`, `orch/core.py:2602-3000`, `orch/git_transport.py` | Git identity, policy, exact verified snapshot and publication URL; isolated, restricted Git transport (`file`, HTTPS, SSH where permitted). | Separate publisher: non-force commit/push, remote-ref check, durable reconcile on unknown outcome; not a worker adapter. |
+| `orch/state.py:197-427` and `orch/core.py:1661-1724,3358-3421` | Ledger run ID, checkpoint and process-state claims; external worker/process status may be unknown. | Readback is not process fencing. Unknown activity remains blocked; explicit independent inactivity confirmation is an operator assertion, not automatic cleanup. |
 
-- current tests continue to pass;
-- RDC behavior is unchanged;
-- no task, verification, recovery, or publication rule depends on Desktop Commander-specific IDs;
-- project/run authority remains in OrchKit.
+The only code paths with **RDC-specific format literals** are the CLI,
+dispatcher, overview/readiness, doctor and their tests. Source Git and local
+check subprocess calls are *adjacent execution/publication surfaces*, not
+implementations or hidden callers of a Python RDC tool client. External
+`Remote Desktop Commander` `read_file` / terminal / process-polling /
+write/edit calls happen in the ChatGPT tool layer outside this repository.
+There is no current project-scoped native worker file/process API, broker,
+Bridge, relay, device online attestation, or generic operation journal.
+
+### On-disk v1 compatibility and fail-closed behavior (implemented)
+
+- **Marker v1:** `<home>/rdc-bootstrap.json` JSON object with exactly allowed
+  keys `schema_version=1` (integer, not bool), `device_id`,
+  `device_name`, `recorded_at`, `source="chatgpt_rdc_bootstrap"`.
+  IDs/name use nonblank UTF-8 strings at most 512 bytes each; timestamp at
+  most 128 bytes. Newlines/CR/NUL are rejected. A read is bounded to 64 KiB,
+  no-follow regular file, with schema/unknown-key rejection
+  (`orch/dispatcher.py:19-85`, `orch/config.py:37-110`).
+  `record_rdc` is an atomic `0600` replacement, allowing explicit
+  **rebinding**; it is not write-once. It must never be mistaken for an online
+  device-authentication result.
+- **Route evidence v1:** `<home>/route-evidence/<run_id>.json`, 64 KiB
+  maximum, created `0600` with exclusive no-follow open. Allowed fields:
+  `schema_version=1`, `run_id`, `task_id` (each ASCII
+  `[A-Za-z0-9._-]{1,200}`), fixed `surface="ordinary_chat"` and
+  `transport="rdc"`, `device_id`, `device_name`, `model`,
+  `reasoning`, `usage`, `observed_at`, `source`, and the four
+  `*_used` observations: `work_used`, `codex_execution_used`,
+  `model_api_used`, `external_provider_used`. Their values are
+  `yes|no|unknown`; `UNKNOWN` strings in telemetry are allowed and
+  must never be upgraded into fabricated observations. Validator rejects
+  unknown keys, unknown version, transport and surface
+  (`orch/dispatcher.py:88-233`). `route record` checks the ledger run
+  before calling the recorder (`orch/cli.py:330-355`); direct function
+  calls do not themselves check run existence.
+- **Write/read distinction:** recording a route is write-once per run:
+  `route_evidence_already_recorded` must never trigger a destructive
+  overwrite. Missing record -> `UNVERIFIED`; mismatched stored run ID ->
+  error. Reading an old route after a marker rebind preserves its bytes,
+  returns `STALE_DEVICE_BINDING` and
+  `rdc_binding_matches=false`; it never rewrites history.
+  Both `read_rdc` and `read_route_evidence` pass
+  `repair_mode=0o600` to the bounded reader; that is a
+  **permission-changing read** via `fchmod`. In contrast,
+  `overview._read_rdc`, `audit_project` and `state_permission_findings`
+  inspect and report unsafe modes without repair. Symlinks, nonregular
+  files, size violations and malformed records must fail closed.
+- **Evidence is observation, not admission:** a successfully recorded v1
+  route always returns `acceptance=NOT_EVALUATED`; even a binding match
+  neither certifies current ChatGPT UI/tool settings nor unlocks writer,
+  verification, review, approval or Git publication gates. Unknown transport
+  values fail validation in the **current** v1 schema; an unverified or
+  stale device binding cannot authorize work. V1 only checks nonblank device
+  ID/name strings (a literal `UNKNOWN` is not cryptographically rejected),
+  so callers must not promote them to attested identity. Future versions must
+  choose an explicit version-aware policy and keep v1 historical reads.
+  No automatic conversion of v1 to an imagined v2 is implemented.
+- **Trust and recovery:** a marker can be re-recorded by a same-user process;
+  the evidence is not a cryptographic signature. A lost response to a
+  write-once recording requires `route show` readback before retry, and a
+  process/tool timeout requires independent process-status readback before
+  release or re-execution. Neither a changed marker nor an adapter may
+  silently transfer a claimed run to a different device or project.
+
+### Proposed internal interfaces (NOT implemented in P1-B1)
+
+| Proposed boundary | Contract; authoritative side |
+| --- | --- |
+| `DeviceIdentityProvider` | Return device identity and freshness/UNKNOWN separately from saved marker. Match actual device against the bound run/workspace; deny silent rebind. A saved marker alone never authenticates a worker. |
+| `RouteEvidenceStore` and `RouteEvidenceCodec` | Read historical v1 exactly; write-once v1 while active, with explicit version dispatch for future observations. Keep `NOT_EVALUATED` and unknowns. Storage layer must not become admission authority. |
+| `WorkerTransport` / `WorkerFileOperations` | Future run-bound relative-path read/list/patch with local path canonicalization, allowlist, identity checks and bounded output; current RDC calls remain *external ChatGPT actions*, not an instantiated Python adapter. |
+| `WorkerProcessOperations` | Future run-bound start/readback/terminate with owned PIDs, deadlines, cursor/operation IDs and an explicit UNKNOWN when process liveness cannot be proven. The current direct RDC shell must not be inferred to have this contract. |
+| `RegisteredCheckExecutor` | Preserve the existing **local** `_run_check` execution/authority/result semantics; do not route verifier tests through an external worker connector. |
+| `PublicationGitTransport` | Keep restricted Git publication and compare-and-readback outside the worker transport. Existing `git_transport.py` is a publication helper, not a candidate RDC adapter. |
+| `OperationJournal` | Future durable idempotency for remote mutations only, with unknown-outcome readback. The existing publication journal is narrower and must not be called a generic worker operation journal. |
+
+The conceptual worker binding is `device -> project -> writer_key -> task
+-> run/attempt -> worker_session -> operation`. Current durable authority
+covers project/writer/task/run/capability, **not** a native
+`worker_session`. An eventual session ID or transport token is *never*
+sufficient authorization without local run/ledger/capability validation.
+These interfaces must not relocate or weaken those decisions.
+
+### Existing coverage and required future contract checks
+
+- **Existing:** `tests/test_dispatcher.py` covers real-run CLI lookup,
+  marker prerequisite, write-once route bytes, stale-device readback and
+  `NOT_EVALUATED`, plus scoped prompt/unsafe-registry cases.
+  `tests/test_productization.py` checks oversized/no-follow marker,
+  doctor and read-only overview, publication/Git safety and dispatcher
+  guards. `tests/test_readiness.py` covers marker and dispatcher bounds,
+  unsafe identity, read-only audit and immutable state layout.
+  `tests/test_multi_project_acceptance.py` tests three distinct writer
+  keys, linked-worktree serialization, project pause, independent outcomes,
+  capability/receipt cross-attempt rejection and symlink scope negatives.
+  `tests/test_check_timeout.py` pins timeout 600/defaults/failure behavior.
+  This fixture is **not** evidence of genuine simultaneous ChatGPT chats.
+- **Add as small contract tests (positive/negative):** v1 marker and evidence
+  round-trip by schema/version with exact bytes; historical v1 read
+  unchanged after rebind; reject unknown schema, transport, surface, keys,
+  malformed/overlong identity, bad tri-state observation, wrong run ID,
+  mismatched current device, duplicate write and symlink/nonregular/
+  oversize/permission-unsafe files. Assert that inspection does not chmod
+  while explicit `read_rdc` may repair `0600`.
+- **Authority negatives:** refuse unregistered run, foreign/stale run
+  capability, changed Git common-dir writer binding, changed project ID,
+  dirty/staged/out-of-scope/escaped paths, unknown external process,
+  stale snapshot, executable/check drift, or uncertain publication result.
+  Tests for new transport must prove these denials without using a
+  generated prompt or `NOT_EVALUATED` record as permission.
+- **Separation checks:** inject a fake *future* worker file/process adapter
+  to establish bounded errors/unknown outcomes without invoking the local
+  verifier's subprocess or the Git publisher. Preserve exact registered
+  test argv/cwd/executable binding, 600-second ceiling, timeout action and
+  bounded output; test published-ref readback independently.
+  Avoid a real network, production credentials, Codex or another provider.
+- **Verification discipline:** run targeted compatibility tests and the
+  complete admitted regression suite through OrchKit verification. Check
+  exact changed paths and Markdown links; a subset or clean HEAD without a
+  clean index/worktree cannot satisfy the full acceptance gate.
+
+### Small P1-B packages and the single next extraction task
+
+1. **P1-B1 (this package):** source-grounded inventory, compatibility
+   invariants and contracts in documentation only; no code changes.
+2. **P1-B2 (next, one bounded attempt): extract *pure v1 identity/evidence
+   validators*, no storage refactor.** Proposed exact allowed paths:
+   `orch/transport_contracts.py` (new),
+   `orch/dispatcher.py`, `tests/test_transport_contracts.py` (new),
+   `tests/test_dispatcher.py`. Move only pure
+   `validate_rdc_marker`, `validate_route_evidence` and their bounded
+   string/tri-state validation into a version-explicit module; keep
+   `orch.dispatcher` imports as compatibility wrappers/re-exports so
+   `overview`, `readiness`, CLI, tests and external callers do not change
+   their import contract. **Prerequisite:** verified/published P1-B1
+   plus exact-merge CI. **Acceptance:** identical v1 allowed keys,
+   sizes, version rules, error codes, unknown behavior, marker replacement,
+   exclusive evidence writes, stale-binding and `NOT_EVALUATED`;
+   no format migration and no additional authority. **Checks:** targeted
+   `python3 -m unittest discover -s tests -p 'test_transport_contracts.py' -v`
+   and corresponding `test_dispatcher.py` discovery, existing
+   readiness/productization and P1-A acceptance, the complete
+   registered `python3 -m unittest discover -s tests -v`, exact-path diff,
+   link/scope check, OrchKit receipt -> quiesce -> verify -> guarded publish
+   and exact-head/merge CI. **Non-goals:** moving file I/O, modifying
+   `orch/cli.py`/readiness/overview, adding v2 schemas, a Python RDC
+   worker executor, Bridge, relay, broker, session API, daemon, new
+   provider, or changing risk/writer/check/publication gates.
+3. **P1-B3 (later, separately admitted):** a narrow version-aware
+   route-evidence storage seam and historical v1 file/mode/error parity;
+   define its exact scope after B2 readback, not in this run.
+4. **P1-B4 (later, separately admitted):** optional worker-operation
+   protocol boundary with fake adapter and failure contracts, before any
+   Bridge/MCP implementation. No new executor or publication coupling by
+   default.
+
+The roadmap, P1-C through P1-G milestones and deferred same-repository,
+multi-device and hosted scope remain unchanged. P1-B1 stops after one
+documentation-only lifecycle; it must not implement P1-B2 as a side effect.
 
 ## P1-C — local OrchKit Bridge MVP
 
