@@ -252,6 +252,61 @@ class DispatcherRegistryTests(unittest.TestCase):
             )
         self.assertEqual(path.read_bytes(), before)
 
+    def test_v1_route_remains_stale_if_current_marker_disappears(self):
+        marker = record_rdc(
+            self.home, device_id="device-1", device_name="Mac.one"
+        )
+        recorded = record_route_evidence(
+            self.home,
+            run_id="RUN-MISSING-MARKER",
+            task_id="TASK-MISSING-MARKER",
+            model="UNKNOWN",
+            reasoning="UNKNOWN",
+            usage="UNKNOWN",
+            source="operator_observed",
+            work_used="unknown",
+            codex_execution_used="unknown",
+            model_api_used="unknown",
+            external_provider_used="unknown",
+        )
+        path = Path(recorded["path"])
+        original = path.read_bytes()
+        Path(marker["path"]).unlink()
+
+        result = read_route_evidence(self.home, run_id="RUN-MISSING-MARKER")
+        self.assertEqual(result["status"], "STALE_DEVICE_BINDING")
+        self.assertFalse(result["rdc_binding_matches"])
+        self.assertEqual(result["acceptance"], "NOT_EVALUATED")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_version_dispatch_rejects_v2_history_without_rewrite(self):
+        record_rdc(self.home, device_id="device-1", device_name="Mac.one")
+        recorded = record_route_evidence(
+            self.home,
+            run_id="RUN-FUTURE",
+            task_id="TASK-FUTURE",
+            model="UNKNOWN",
+            reasoning="UNKNOWN",
+            usage="UNKNOWN",
+            source="operator_observed",
+            work_used="unknown",
+            codex_execution_used="unknown",
+            model_api_used="unknown",
+            external_provider_used="unknown",
+        )
+        path = Path(recorded["path"])
+        original = path.read_bytes()
+        unrecognized = original.replace(
+            b'"schema_version": 1', b'"schema_version": 2'
+        )
+        self.assertNotEqual(unrecognized, original)
+        path.write_bytes(unrecognized)
+        with self.assertRaisesRegex(
+            ValueError, "^route_evidence_invalid_schema$"
+        ):
+            read_route_evidence(self.home, run_id="RUN-FUTURE")
+        self.assertEqual(path.read_bytes(), unrecognized)
+
     def test_missing_home_unknown_project_does_not_create_registry(self):
         with self.assertRaisesRegex(ValueError, "unknown_project"):
             render_dispatcher(self.home, project_id="missing")

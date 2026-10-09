@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -14,6 +13,7 @@ from .config import (atomic_write_json, atomic_write_text, ensure_private_dir,
                      read_bounded_json_object)
 from .core import utc_now
 from .project import ProjectRegistry
+from .route_evidence_store import ROUTE_EVIDENCE_MAX_BYTES, RouteEvidenceStore
 from .transport_contracts import (
     ROUTE_OBSERVATION_VALUES, _bounded_marker_text,
     validate_rdc_marker, validate_route_evidence,
@@ -21,7 +21,6 @@ from .transport_contracts import (
 
 
 RDC_MARKER_MAX_BYTES = 64 * 1024
-ROUTE_EVIDENCE_MAX_BYTES = 64 * 1024
 
 def record_rdc(home: Path, *, device_id: str, device_name: str) -> Dict[str, Any]:
     device_id = _bounded_marker_text(device_id, "device_id", max_bytes=512)
@@ -58,38 +57,6 @@ def read_rdc(home: Path) -> Dict[str, Any]:
     }
 
 
-def _create_private_json_once(path: Path, value: Dict[str, Any]) -> None:
-    data = (
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    elif path.is_symlink():
-        raise ValueError("route_evidence_unsafe")
-    try:
-        fd = os.open(str(path), flags, 0o600)
-    except FileExistsError as exc:
-        raise ValueError("route_evidence_already_recorded") from exc
-    except OSError as exc:
-        raise ValueError("route_evidence_unsafe") from exc
-    try:
-        os.fchmod(fd, 0o600)
-        offset = 0
-        while offset < len(data):
-            written = os.write(fd, data[offset:])
-            if written <= 0:
-                raise OSError("short route evidence write")
-            offset += written
-        os.fsync(fd)
-    except OSError as exc:
-        raise ValueError("route_evidence_write_failed") from exc
-    finally:
-        os.close(fd)
-
-
 def record_route_evidence(
     home: Path, *, run_id: str, task_id: str, model: str, reasoning: str,
     usage: str, source: str, work_used: str, codex_execution_used: str,
@@ -119,10 +86,7 @@ def record_route_evidence(
         "model_api_used": model_api_used,
         "external_provider_used": external_provider_used,
     }
-    validate_route_evidence(evidence)
-    evidence_dir = ensure_private_dir(home.resolve() / "route-evidence")
-    path = evidence_dir / f"{run_id}.json"
-    _create_private_json_once(path, evidence)
+    path = RouteEvidenceStore(home).write_once(evidence)
     return {
         "status": "RECORDED",
         "path": str(path),
@@ -132,23 +96,10 @@ def record_route_evidence(
 
 
 def read_route_evidence(home: Path, *, run_id: str) -> Dict[str, Any]:
-    if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", run_id) is None:
-        raise ValueError("route_evidence_invalid_run_id")
-    path = home.resolve() / "route-evidence" / f"{run_id}.json"
-    try:
-        evidence, meta = read_bounded_json_object(
-            path,
-            max_bytes=ROUTE_EVIDENCE_MAX_BYTES,
-            unsafe_error="route_evidence_unsafe",
-            too_large_error="route_evidence_too_large",
-            invalid_error="route_evidence_invalid_json",
-            repair_mode=0o600,
-        )
-    except FileNotFoundError:
-        return {"status": "UNVERIFIED", "path": str(path)}
-    validate_route_evidence(evidence)
-    if evidence["run_id"] != run_id:
-        raise ValueError("route_evidence_run_binding_mismatch")
+    stored = RouteEvidenceStore(home).read(run_id)
+    if stored["status"] == "UNVERIFIED":
+        return stored
+    evidence = stored["route_evidence"]
     rdc = read_rdc(home)
     binding_matches = (
         rdc.get("status") == "RECORDED"
@@ -157,11 +108,11 @@ def read_route_evidence(home: Path, *, run_id: str) -> Dict[str, Any]:
     )
     return {
         "status": "RECORDED" if binding_matches else "STALE_DEVICE_BINDING",
-        "path": str(path),
+        "path": stored["path"],
         "route_evidence": evidence,
         "rdc_binding_matches": binding_matches,
-        "bytes": meta["bytes"],
-        "mode": oct(meta["mode"]),
+        "bytes": stored["bytes"],
+        "mode": stored["mode"],
         "acceptance": "NOT_EVALUATED",
     }
 
