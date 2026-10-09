@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,9 +50,8 @@ def _claim_worker(home, project_id, worker_id, barrier, output):
 
 class MultiProjectAcceptanceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="orch-p1-a1-1-")
-        self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        self.base = Path(tempfile.mkdtemp(prefix="orch-p1-a1-1-"))
+        self.addCleanup(self._cleanup_disposable_fixture)
         self.home = self.base / "isolated-orch-home"
         env = mock.patch.dict(os.environ, {"ORCH_HOME": str(self.home)})
         env.start()
@@ -191,6 +191,15 @@ class MultiProjectAcceptanceTests(unittest.TestCase):
             finished = self.orch.complete(claim["run_id"])
             self.assertEqual(finished["status"], "COMPLETE")
         return verified, finished
+
+    def _cleanup_disposable_fixture(self):
+        # Do not remove a worker's files while its activity is still unknown.
+        unconfirmed = [process.pid for process in getattr(self, "owned_processes", [])
+                       if process.exitcode is None or process.is_alive()]
+        self.assertFalse(unconfirmed,
+                         "disposable fixture retained; children unconfirmed: "
+                         f"{unconfirmed}")
+        shutil.rmtree(self.base)
 
     def _stop_owned_processes(self):
         remaining = []
