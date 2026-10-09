@@ -59,11 +59,47 @@ Provide a documented fixture command, machine-readable pass/fail evidence, regre
 
 ## 2. P1-B: transport boundary without behavior drift
 
-First inventory RDC-specific assumptions, device identity, file/process execution, and route-evidence validation. Introduce small interfaces behind the existing behavior, with the RDC adapter remaining the default.
+The P1-A three-project fixture and reproducible acceptance runner are complete
+(PRs #35–#37). The separate registered-check timeout prerequisite was completed
+in PR #38; the source-pinned development CLI admits the requested 600-second
+full regression without changing the published 0.11.0 release. The initial
+exact-main Python 3.9 barrier failure and successful same-SHA rerun remain
+recorded as a caveat, not proof that the fixture cannot be timing-sensitive.
 
-Suggested increments: interface inventory and contracts; adapter extraction; versioned route-evidence compatibility. Choose actual module names after inspecting the current source.
+**P1-B1 — source inventory and contracts (documentation-only package).**
+[Multi-Project Bridge: P1-B](multi-project-bridge.md#p1-b--remove-rdc-from-core-semantics)
+records the concrete current caller/surface map, current marker and route
+evidence v1 JSON/permission/error contracts, identity and run authority, mode
+repair versus inspection, independent verifier/Git publisher, compatibility
+tests and proposed interfaces. A ChatGPT worker still makes RDC tool calls
+outside OrchKit Python; neither local registered checks nor Git's publication
+transport should be relabeled as a worker RDC adapter. Do not implement an
+adapter or new evidence version in P1-B1.
 
-**Acceptance:** the release-baseline and P1-A tests continue to pass; historical evidence remains readable; unknown transport/identity states fail closed; no writer, verification, recovery, or publication rule is weakened. Do not add a daemon or relay in the same PR.
+**Proposed sequence after a verified, published P1-B1:**
+
+1. **P1-B2 — pure validators only:** bounded extraction of v1 RDC-marker and
+   route-evidence validation to `orch/transport_contracts.py`, with only
+   `orch/dispatcher.py`, `tests/test_transport_contracts.py`, and
+   `tests/test_dispatcher.py` additionally in the allowed scope. Preserve
+   existing dispatcher exports and exact v1 serialization, permissions,
+   errors, import callers and `acceptance=NOT_EVALUATED`. The detailed
+   dependency, acceptance, checks and non-goals are in the linked P1-B section.
+   **No new task is admitted by this roadmap entry.**
+2. **P1-B3 — version-aware evidence storage seam:** plan after B2, then test
+   historical v1 read/write-once and device rebinding with no unsafe fallback.
+3. **P1-B4 — worker-operation contract boundary:** design with fake adapters,
+   explicitly separate future run-scoped worker I/O from local registered-check
+   subprocess execution and guarded Git publication. Do not assert that
+   external direct RDC calls have acquired native session authorization.
+
+**Acceptance for each package:** existing release/P1-A and full registered
+regression tests pass; version-1 historical evidence stays readable, unknown
+transport or device trust stays fail-closed, and writer keys, capability,
+verification, checkpoint/recovery, review/approval and publication gates
+remain unchanged. Check exact allowed paths and Git staging, then use the real
+OrchKit receipt/quiesce/verification/publication and guarded PR/CI lifecycle.
+Do not introduce a daemon, relay, broker, MCP or model API in the same PR.
 
 ## 3. P1-C: local Bridge
 
