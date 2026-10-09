@@ -14,6 +14,39 @@ Thanks for considering a contribution. OrchKit is an early source project, so cl
 
 4. Discuss a large behavior, interface, or policy change before investing in a broad implementation.
 
+## Disposable multi-project acceptance
+
+Run the three-project concurrency and lifecycle checks from a source checkout with
+Python 3.9–3.14 and Git available. No installed OrchKit runtime is required:
+
+```sh
+python3 -B scripts/run_multi_project_acceptance.py --json-report /tmp/orchkit-p1-a3-report.json
+```
+
+Choose a **new** report filename each time; existing reports are never overwritten.
+The default total deadline is 120 seconds; use `--timeout-seconds 180` on a slower
+machine. For one named test use `--case test_three_scoped_claims_race_and_survive_reopen`.
+The JSON v1 report contains the source HEAD, platform/Python, UTC start, duration,
+per-test names and status, run/passed/failed/error/skip counts, exit code and cleanup
+status. Failure diagnostics contain only the exception type and a relative test
+source line, not exception text, captured output, credentials or private paths.
+
+`PASS` (exit 0) requires all selected tests to pass, consistent results and
+confirmed cleanup. `FAIL` (exit 1) means an assertion failure; `ERROR` (nonzero)
+means a test or runner error. `INCOMPLETE` (nonzero, timeout exit 124) means skipped,
+interrupted or unconfirmed work; a timed-out run reports unknown counts as `null`
+rather than fabricating success. The runner spawns a fresh process group, uses
+separate disposable Git repositories with **no remotes** and a private OrchKit
+home, and removes only its own temporary files after verifying owned processes
+have stopped. Unknown process state prevents a cleanup-success claim and retains
+private temporary evidence for manual investigation. Never use this fixture on
+production project repositories or `ORCH_HOME`.
+
+The multi-process barrier checks concurrent **OS-process writer reservations**,
+not execution by three real ChatGPT conversations, a multi-session broker, an
+OS-level sandbox, or a production Git publication workflow. These are future
+separate milestones; a passing fixture is not evidence that they exist.
+
 ## Contribution expectations
 
 - Keep changes focused and explain the user-visible behavior they add or correct.
