@@ -76,22 +76,32 @@ outside OrchKit Python; neither local registered checks nor Git's publication
 transport should be relabeled as a worker RDC adapter. Do not implement an
 adapter or new evidence version in P1-B1.
 
-**Proposed sequence after a verified, published P1-B1:**
+**P1-B implementation sequence (one scoped lifecycle per package):**
 
-1. **P1-B2 — pure validators only:** bounded extraction of v1 RDC-marker and
-   route-evidence validation to `orch/transport_contracts.py`, with only
-   `orch/dispatcher.py`, `tests/test_transport_contracts.py`, and
-   `tests/test_dispatcher.py` additionally in the allowed scope. Preserve
-   existing dispatcher exports and exact v1 serialization, permissions,
-   errors, import callers and `acceptance=NOT_EVALUATED`. The detailed
-   dependency, acceptance, checks and non-goals are in the linked P1-B section.
-   **No new task is admitted by this roadmap entry.**
-2. **P1-B3 — version-aware evidence storage seam:** plan after B2, then test
-   historical v1 read/write-once and device rebinding with no unsafe fallback.
-3. **P1-B4 — worker-operation contract boundary:** design with fake adapters,
-   explicitly separate future run-scoped worker I/O from local registered-check
-   subprocess execution and guarded Git publication. Do not assert that
-   external direct RDC calls have acquired native session authorization.
+1. **P1-B2 — completed, PR #40:** pure version-1 marker and route-evidence
+   validators in `orch/transport_contracts.py`, retaining dispatcher import,
+   errors and serialization compatibility. Verified and merged with exact-main
+   CI on October 9, 2026.
+2. **P1-B3 — completed, PR #41:** `RouteEvidenceCodec` and
+   `RouteEvidenceStore` in `orch/route_evidence_store.py` isolate version-aware
+   storage from dispatcher. Historical v1 write-once, permission repair,
+   device rebinding and `NOT_EVALUATED` were regression tested. Verified and
+   merged with exact-main CI on October 9, 2026.
+3. **P1-B4 — pure worker-operation contracts (this package):**
+   `orch/worker_operations.py` defines validated, in-memory v1 run binding,
+   file/process operation requests, explicit outcome states and structural
+   interfaces tested with **fake-only adapters**. It neither performs worker
+   I/O nor adds authorization; `UNKNOWN` requires independent readback,
+   not an assumed failure or automatic retry. The local registered-check
+   subprocess and guarded Git publication remain independent and unchanged.
+   A direct ChatGPT-to-RDC tool call still has no native OrchKit session
+   authority. Acceptance requires all configured lifecycle/PR/exact-main gates.
+
+**Next after P1-B4:** P1-C must independently design ledger- and
+capability-backed local run/session authorization, canonicalized file scope,
+owned process execution, bounded responses, durable idempotency and restart
+readback before integrating a real adapter. The pure request's identity and
+lexical-path checks are never sufficient authorization.
 
 **Acceptance for each package:** existing release/P1-A and full registered
 regression tests pass; version-1 historical evidence stays readable, unknown
