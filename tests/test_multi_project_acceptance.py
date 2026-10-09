@@ -1,14 +1,19 @@
-"""Disposable multi-project writer reservation acceptance tests.
+"""Disposable multi-project reservation and lifecycle acceptance tests.
 
 The fixture uses three independent local-only Git repositories, a private
-ORCH_HOME, and spawned OS processes synchronized before their claim attempts.
-It does not start ChatGPT workers, use production remotes, or finish runs.
+ORCH_HOME, and synchronized spawned OS processes for writer claim attempts.
+It also exercises independent completion, Git-local publication and negative
+run-scoped authority cases without starting real ChatGPT workers or contacting
+production remotes.
 """
 
+import hashlib
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -94,18 +99,98 @@ class MultiProjectAcceptanceTests(unittest.TestCase):
         self.projects[label] = result["project"]
         self.repos[label] = repo
 
-    def _enqueue(self, label, task_id):
+    def _enable_local_publication(self, label):
+        result = self.registry.add(
+            self.repos[label], name=f"Project {label}", profile="safe",
+            review_mode="off", allow_commit=True, allow_push=False,
+            replace=True,
+        )
+        self.assertEqual(result["status"], "REGISTERED")
+        self.projects[label] = result["project"]
+        self.assertTrue(result["project"]["git"]["allow_commit"])
+        self.assertFalse(result["project"]["git"]["allow_push"])
+
+    def _enqueue(self, label, task_id, *, checks=(), allowed_paths=None):
         plan = build_single_task_plan(
             self.projects[label], task_id=task_id,
             goal="Exercise local-only writer reservation",
-            allowed_paths=["result.txt"],
+            allowed_paths=allowed_paths or ["result.txt"],
             plan_revision=f"acceptance-{task_id.lower()}",
         )
+        if checks:
+            plan["tasks"][0]["checks"] = list(checks)
         plans = self.home / "plans"
         plans.mkdir(mode=0o700, exist_ok=True)
         path = plans / f"{plan['plan_revision']}.json"
         self.assertEqual(write_plan(path, plan)["status"], "CREATED")
         self.assertEqual(self.orch.load_plan(path)["queued_count"], 1)
+
+    def _claim(self, label):
+        claim = self.orch.claim(
+            f"lifecycle-worker-{label}",
+            project_id=self.projects[label]["project_id"],
+        )
+        self.assertEqual(claim["status"], "CLAIMED", claim)
+        self.assertEqual(claim["project_id"], self.projects[label]["project_id"])
+        return claim
+
+    def _lease(self, claim):
+        return self.orch.lease_from_capability(
+            claim["run_id"], Path(claim["capability_file"])
+        )
+
+    def _write_receipt(self, claim, paths=("result.txt",), **overrides):
+        receipt = {
+            "schema_version": 1,
+            "run_id": claim["run_id"],
+            "task_id": claim["task_id"],
+            "changed_paths": list(paths),
+        }
+        receipt.update(overrides)
+        target = Path(claim["receipt_file"])
+        target.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+        return target
+
+    def _finish_result(self, label, claim, *, publish=False):
+        workspace = self.repos[label]
+        (workspace / "result.txt").write_text(
+            f"completed locally for {label}\n", encoding="utf-8"
+        )
+        lease = self._lease(claim)
+        receipt = self._write_receipt(claim)
+        self.assertEqual(
+            self.orch.submit(claim["run_id"], lease, receipt)["status"],
+            "RESULT_SUBMITTED",
+        )
+        quiesced = self.orch.quiesce(claim["run_id"], lease)
+        self.assertEqual(quiesced["status"], "VERIFYING")
+        self.assertTrue(quiesced["capability_revoked"])
+        self.assertFalse(Path(claim["capability_file"]).exists())
+        verified = self.orch.verify(claim["run_id"])
+        self.assertEqual(verified["status"], "VERIFIED", verified)
+        if publish:
+            self.assertEqual(claim["context"]["publication"]["kind"], "git_local")
+            self.assertEqual(
+                self.orch.complete(claim["run_id"])["status"],
+                "PUBLICATION_REQUIRED",
+            )
+            finished = self.orch.publish(claim["run_id"])
+            self.assertEqual(finished["status"], "COMPLETE")
+            self.assertIsNone(finished["remote_commit"])
+            self.assertEqual(
+                finished["commit"],
+                self._git("-C", str(workspace), "rev-parse", "HEAD").stdout.strip(),
+            )
+            self.assertEqual(
+                self._git("-C", str(workspace), "remote").stdout.strip(), ""
+            )
+            self.assertEqual(
+                self._git("-C", str(workspace), "status", "--porcelain").stdout, ""
+            )
+        else:
+            finished = self.orch.complete(claim["run_id"])
+            self.assertEqual(finished["status"], "COMPLETE")
+        return verified, finished
 
     def _stop_owned_processes(self):
         remaining = []
@@ -260,6 +345,257 @@ class MultiProjectAcceptanceTests(unittest.TestCase):
                  if item["task_id"] == "B-NEXT")["queue_state"], "WAITING_WRITER",
         )
         self.assertEqual(after["summary"]["active_writer_count"], 3)
+
+
+    def test_checkpointed_b_does_not_change_a_c_local_publications(self):
+        for label in ("A", "C"):
+            self._enable_local_publication(label)
+        for label in ("A", "B", "C"):
+            self._enqueue(label, f"{label}-PUBLISH")
+        self._enqueue("B", "B-AFTER-CHECKPOINT")
+        claims = {label: self._claim(label) for label in ("A", "B", "C")}
+        starting_heads = {
+            label: self._git("-C", str(self.repos[label]), "rev-parse", "HEAD")
+            .stdout.strip()
+            for label in ("A", "B", "C")
+        }
+
+        lease_b = self._lease(claims["B"])
+        checkpoint = self.orch.checkpoint(
+            claims["B"]["run_id"], lease_b,
+            "fixture deliberately preserves unknown activity", "unknown",
+        )
+        self.assertEqual(checkpoint["status"], "CHECKPOINTED")
+        self.assertFalse(checkpoint["details"]["writer_reservation_released"])
+        self.assertFalse(checkpoint["details"]["safe_to_resume_elsewhere"])
+        with self.assertRaisesRegex(
+            ValueError, "process_inactivity_confirmation_required"
+        ):
+            self.orch.abort(claims["B"]["run_id"], "unsafe abort", retry=True)
+
+        for label in ("A", "C"):
+            self._finish_result(label, claims[label], publish=True)
+            self.assertNotEqual(
+                self._git("-C", str(self.repos[label]), "rev-parse", "HEAD")
+                .stdout.strip(), starting_heads[label],
+            )
+        reopened = Orchestrator(self.home)
+        state = {item["task_id"]: item for item in reopened.status()["tasks"]}
+        runs = {item["task_id"]: item for item in reopened.status()["runs"]}
+        for label in ("A", "C"):
+            self.assertEqual(state[f"{label}-PUBLISH"]["status"], "DONE")
+            self.assertEqual(runs[f"{label}-PUBLISH"]["state"], "COMPLETE")
+            self.assertEqual(runs[f"{label}-PUBLISH"]["verify_status"], "PASS")
+        self.assertEqual(state["B-PUBLISH"]["status"], "IN_PROGRESS")
+        self.assertEqual(runs["B-PUBLISH"]["state"], "RUNNING")
+        self.assertEqual(reopened.queue_view()["summary"]["active_writer_count"], 1)
+        blocked = reopened.claim(
+            "cannot-steal-b", project_id=self.projects["B"]["project_id"]
+        )
+        self.assertEqual(blocked["status"], "BUSY")
+        self.assertEqual(blocked["active"]["run_id"], claims["B"]["run_id"])
+        self.assertTrue(Path(claims["B"]["capability_file"]).is_file())
+        self.assertEqual(
+            self._git("-C", str(self.repos["B"]), "rev-parse", "HEAD")
+            .stdout.strip(), starting_heads["B"],
+        )
+
+    def test_failed_b_verification_does_not_change_a_c_completion(self):
+        failing_check = {
+            "id": "expected-failure",
+            "argv": [sys.executable, "-c", "import sys; sys.exit(7)"],
+            "cwd": ".",
+            "timeout_sec": 5,
+        }
+        self._enqueue("A", "A-SUCCESS")
+        self._enqueue("B", "B-FAIL", checks=[failing_check])
+        self._enqueue("C", "C-SUCCESS")
+        claims = {label: self._claim(label) for label in ("A", "B", "C")}
+        for label in ("A", "C"):
+            self._finish_result(label, claims[label])
+        (self.repos["B"] / "result.txt").write_text("fail check\n")
+        lease_b = self._lease(claims["B"])
+        receipt_b = self._write_receipt(claims["B"])
+        self.assertEqual(
+            self.orch.submit(claims["B"]["run_id"], lease_b, receipt_b)["status"],
+            "RESULT_SUBMITTED",
+        )
+        self.assertEqual(
+            self.orch.quiesce(claims["B"]["run_id"], lease_b)["status"],
+            "VERIFYING",
+        )
+        failed = self.orch.verify(claims["B"]["run_id"])
+        self.assertEqual(failed["status"], "NEEDS_FIX", failed)
+        self.assertEqual(failed["checks"][0]["exit_code"], 7)
+
+        reopened = Orchestrator(self.home)
+        tasks = {item["task_id"]: item for item in reopened.status()["tasks"]}
+        runs = {item["task_id"]: item for item in reopened.status()["runs"]}
+        for label in ("A", "C"):
+            self.assertEqual(tasks[f"{label}-SUCCESS"]["status"], "DONE")
+            self.assertEqual(runs[f"{label}-SUCCESS"]["state"], "COMPLETE")
+            self.assertEqual(runs[f"{label}-SUCCESS"]["verify_status"], "PASS")
+        self.assertEqual(tasks["B-FAIL"]["status"], "NEEDS_FIX")
+        self.assertEqual(runs["B-FAIL"]["state"], "NEEDS_FIX")
+        self.assertEqual(reopened.queue_view()["summary"]["active_writer_count"], 0)
+        # Only remove the known disposable fixture output after the failed run;
+        # the claim preflight correctly refuses a dirty Git workspace.
+        (self.repos["B"] / "result.txt").unlink()
+        repair = reopened.claim(
+            "b-repair-attempt", project_id=self.projects["B"]["project_id"]
+        )
+        self.assertEqual(repair["status"], "CLAIMED", repair)
+        self.assertEqual(repair["task_id"], "B-FAIL")
+        self.assertEqual(repair["attempt"], 2)
+        self.assertNotEqual(repair["run_id"], claims["B"]["run_id"])
+        task_states = {
+            item["task_id"]: item["status"] for item in reopened.status()["tasks"]
+        }
+        self.assertEqual(task_states["A-SUCCESS"], "DONE")
+        self.assertEqual(task_states["C-SUCCESS"], "DONE")
+
+    def test_foreign_capability_and_receipt_cannot_authorize_other_run(self):
+        for label in ("A", "B", "C"):
+            self._enqueue(label, f"{label}-AUTH")
+        claims = {label: self._claim(label) for label in ("A", "B", "C")}
+        a, b = claims["A"], claims["B"]
+        lease_a, lease_b = self._lease(a), self._lease(b)
+        with self.assertRaisesRegex(ValueError, "invalid_capability_file"):
+            self.orch.lease_from_capability(b["run_id"], Path(a["capability_file"]))
+        with self.assertRaisesRegex(ValueError, "invalid_lease"):
+            self.orch.heartbeat(b["run_id"], lease_a)
+        with self.assertRaisesRegex(ValueError, "invalid_lease"):
+            self.orch.checkpoint(b["run_id"], lease_a, "foreign lease")
+        with self.assertRaisesRegex(ValueError, "invalid_lease"):
+            self.orch.quiesce(b["run_id"], lease_a)
+
+        receipt_a = self._write_receipt(a)
+        receipt_b = self._write_receipt(b)
+        with self.assertRaisesRegex(ValueError, "invalid_receipt_path"):
+            self.orch.submit(b["run_id"], lease_b, receipt_a)
+        with self.assertRaisesRegex(ValueError, "invalid_lease"):
+            self.orch.submit(b["run_id"], lease_a, receipt_b)
+        self._write_receipt(b, run_id=a["run_id"], task_id=a["task_id"])
+        with self.assertRaisesRegex(ValueError, "receipt_identity_mismatch"):
+            self.orch.submit(b["run_id"], lease_b, receipt_b)
+        self._write_receipt(b)
+        for label in ("A", "B", "C"):
+            self.assertEqual(
+                next(row["state"] for row in self.orch.status()["runs"]
+                     if row["run_id"] == claims[label]["run_id"]),
+                "RUNNING",
+            )
+            self._finish_result(label, claims[label])
+        self.assertEqual(
+            {item["status"] for item in Orchestrator(self.home).status()["tasks"]},
+            {"DONE"},
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_capability_file"):
+            self.orch.lease_from_capability(a["run_id"], Path(a["capability_file"]))
+
+    def test_retried_attempt_rejects_stale_capability_and_receipt(self):
+        self._enqueue("A", "A-RETRY-AUTH")
+        first = self._claim("A")
+        former_lease = self._lease(first)
+        former_receipt = self._write_receipt(first)
+        stopped = self.orch.abort(
+            first["run_id"], "disposable test retry, no active child process",
+            retry=True,
+        )
+        self.assertEqual(stopped["status"], "ABORTED")
+        self.assertFalse(Path(first["capability_file"]).exists())
+
+        second = self.orch.claim(
+            "new-attempt-worker", project_id=self.projects["A"]["project_id"]
+        )
+        self.assertEqual(second["status"], "CLAIMED", second)
+        self.assertEqual(second["attempt"], 2)
+        self.assertNotEqual(second["run_id"], first["run_id"])
+        with self.assertRaisesRegex(ValueError, "invalid_capability_file"):
+            self.orch.lease_from_capability(
+                second["run_id"], Path(first["capability_file"])
+            )
+        with self.assertRaisesRegex(ValueError, "invalid_lease"):
+            self.orch.heartbeat(second["run_id"], former_lease)
+        current_lease = self._lease(second)
+        with self.assertRaisesRegex(ValueError, "invalid_receipt_path"):
+            self.orch.submit(second["run_id"], current_lease, former_receipt)
+        current_receipt = self._write_receipt(
+            second, run_id=first["run_id"], task_id=first["task_id"]
+        )
+        with self.assertRaisesRegex(ValueError, "receipt_identity_mismatch"):
+            self.orch.submit(second["run_id"], current_lease, current_receipt)
+        self._finish_result("A", second)
+        run_states = {
+            run["run_id"]: run["state"]
+            for run in Orchestrator(self.home).status()["runs"]
+        }
+        self.assertEqual(run_states[first["run_id"]], "ABORTED")
+        self.assertEqual(run_states[second["run_id"]], "COMPLETE")
+
+    def test_undeclared_and_foreign_paths_block_only_a(self):
+        for label in ("A", "B", "C"):
+            self._enqueue(label, f"{label}-SCOPE")
+        claims = {label: self._claim(label) for label in ("A", "B", "C")}
+        a = claims["A"]
+        lease_a = self._lease(a)
+        escaped = self._write_receipt(a, paths=("../project-b/README.md",))
+        with self.assertRaisesRegex(ValueError, "path_not_allowed"):
+            self.orch.submit(a["run_id"], lease_a, escaped)
+        (self.repos["A"] / "result.txt").write_text("allowed\n")
+        (self.repos["A"] / "not-allowed.txt").write_text("unauthorized\n")
+        receipt = self._write_receipt(a)
+        self.assertEqual(
+            self.orch.submit(a["run_id"], lease_a, receipt)["status"],
+            "RESULT_SUBMITTED",
+        )
+        self.orch.quiesce(a["run_id"], lease_a)
+        blocked = self.orch.verify(a["run_id"])
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(
+            blocked["reason"], "workspace_scope_violation:not-allowed.txt",
+        )
+        for label in ("B", "C"):
+            self._finish_result(label, claims[label])
+        final = {row["task_id"]: row for row in Orchestrator(self.home).status()["tasks"]}
+        self.assertEqual(final["A-SCOPE"]["status"], "BLOCKED")
+        self.assertEqual(final["B-SCOPE"]["status"], "DONE")
+        self.assertEqual(final["C-SCOPE"]["status"], "DONE")
+
+    def test_symlinked_output_cannot_escape_into_another_project(self):
+        for label in ("A", "B", "C"):
+            self._enqueue(label, f"{label}-LINK")
+        claims = {label: self._claim(label) for label in ("A", "B", "C")}
+        foreign = self.repos["B"] / "README.md"
+        before_sha = hashlib.sha256(foreign.read_bytes()).hexdigest()
+        before_head = self._git(
+            "-C", str(self.repos["B"]), "rev-parse", "HEAD"
+        ).stdout.strip()
+        (self.repos["A"] / "result.txt").symlink_to(foreign)
+        a = claims["A"]
+        lease = self._lease(a)
+        self.assertEqual(
+            self.orch.submit(
+                a["run_id"], lease, self._write_receipt(a)
+            )["status"], "RESULT_SUBMITTED",
+        )
+        self.orch.quiesce(a["run_id"], lease)
+        blocked = self.orch.verify(a["run_id"])
+        self.assertEqual(blocked["status"], "BLOCKED", blocked)
+        self.assertEqual(blocked["reason"], "path_escape")
+        self.assertEqual(
+            hashlib.sha256(foreign.read_bytes()).hexdigest(), before_sha,
+        )
+        self.assertEqual(
+            self._git("-C", str(self.repos["B"]), "rev-parse", "HEAD")
+            .stdout.strip(), before_head,
+        )
+        for label in ("B", "C"):
+            self._finish_result(label, claims[label])
+        tasks = {row["task_id"]: row for row in Orchestrator(self.home).status()["tasks"]}
+        self.assertEqual(tasks["A-LINK"]["status"], "BLOCKED")
+        self.assertEqual(tasks["B-LINK"]["status"], "DONE")
+        self.assertEqual(tasks["C-LINK"]["status"], "DONE")
 
 
 if __name__ == "__main__":
