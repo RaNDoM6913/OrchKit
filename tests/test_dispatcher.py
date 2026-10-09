@@ -12,8 +12,9 @@ from unittest import mock
 
 from orch.cli import main as cli_main
 from orch.core import Orchestrator
-from orch.dispatcher import (read_route_evidence, record_rdc,
+from orch.dispatcher import (read_rdc, read_route_evidence, record_rdc,
                              record_route_evidence, render_dispatcher)
+from orch.overview import _read_rdc as inspect_rdc
 from orch.project import ProjectRegistry
 
 
@@ -176,6 +177,80 @@ class DispatcherRegistryTests(unittest.TestCase):
         self.assertEqual(readback["status"], "STALE_DEVICE_BINDING")
         self.assertFalse(readback["rdc_binding_matches"])
         self.assertEqual(readback["acceptance"], "NOT_EVALUATED")
+
+    def test_inspection_never_repairs_marker_but_read_rdc_does(self):
+        recorded = record_rdc(
+            self.home, device_id="device-1", device_name="Mac.one"
+        )
+        path = Path(recorded["path"])
+        before = path.read_bytes()
+        os.chmod(path, 0o644)
+
+        inspection = inspect_rdc(self.home)
+        self.assertEqual(inspection["status"], "BLOCKED")
+        self.assertEqual(inspection["reason"], "rdc_marker_mode:0o644")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        self.assertEqual(path.read_bytes(), before)
+
+        repaired = read_rdc(self.home)
+        self.assertEqual(repaired["status"], "RECORDED")
+        self.assertEqual(repaired["mode"], "0o600")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_v1_route_historical_bytes_survive_rebinding_and_mode_repair(self):
+        record_rdc(
+            self.home, device_id="device-1", device_name="Mac.one"
+        )
+        recorded = record_route_evidence(
+            self.home,
+            run_id="RUN-HISTORICAL",
+            task_id="TASK-HISTORICAL",
+            model="UNKNOWN",
+            reasoning="UNKNOWN",
+            usage="UNKNOWN",
+            source="operator_observed",
+            work_used="unknown",
+            codex_execution_used="unknown",
+            model_api_used="unknown",
+            external_provider_used="unknown",
+        )
+        path = Path(recorded["path"])
+        before = path.read_bytes()
+        self.assertEqual(json.loads(before)["schema_version"], 1)
+        self.assertEqual(recorded["acceptance"], "NOT_EVALUATED")
+        os.chmod(path, 0o644)
+        repaired = read_route_evidence(self.home, run_id="RUN-HISTORICAL")
+        self.assertEqual(repaired["status"], "RECORDED")
+        self.assertEqual(repaired["mode"], "0o600")
+        self.assertEqual(path.read_bytes(), before)
+
+        record_rdc(
+            self.home, device_id="device-2", device_name="Mac.two"
+        )
+        stale = read_route_evidence(self.home, run_id="RUN-HISTORICAL")
+        self.assertEqual(stale["status"], "STALE_DEVICE_BINDING")
+        self.assertFalse(stale["rdc_binding_matches"])
+        self.assertEqual(stale["acceptance"], "NOT_EVALUATED")
+        self.assertEqual(stale["route_evidence"]["device_id"], "device-1")
+        self.assertEqual(path.read_bytes(), before)
+        with self.assertRaisesRegex(
+            ValueError, "^route_evidence_already_recorded$"
+        ):
+            record_route_evidence(
+                self.home,
+                run_id="RUN-HISTORICAL",
+                task_id="TASK-HISTORICAL",
+                model="CHANGED",
+                reasoning="CHANGED",
+                usage="CHANGED",
+                source="new_observation",
+                work_used="yes",
+                codex_execution_used="yes",
+                model_api_used="yes",
+                external_provider_used="yes",
+            )
+        self.assertEqual(path.read_bytes(), before)
 
     def test_missing_home_unknown_project_does_not_create_registry(self):
         with self.assertRaisesRegex(ValueError, "unknown_project"):
