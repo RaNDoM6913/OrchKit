@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 import signal
 import subprocess
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from orch.core import Orchestrator, canonical_json
+from orch.core import Orchestrator, _begin_immediate, canonical_json
 from orch.codex_review import prepare_review, run_review
 
 
@@ -42,6 +43,71 @@ class OrchestratorTests(unittest.TestCase):
         self.orch.submit(claim['run_id'],lease,receipt)
         self.orch.quiesce(claim['run_id'],lease)
         return self.orch.verify(claim['run_id'])
+
+    def test_connect_retries_transient_protocol_without_rewriting_wal_mode(self):
+        original_connect = sqlite3.connect
+
+        class TracedConnection(sqlite3.Connection):
+            statements = []
+            injected = False
+
+            def execute(self, sql, *args, **kwargs):
+                self.statements.append(sql)
+                if sql == "PRAGMA foreign_keys=ON" and not self.injected:
+                    type(self).injected = True
+                    raise sqlite3.OperationalError("locking protocol")
+                return super().execute(sql, *args, **kwargs)
+
+        def connect_with_trace(*args, **kwargs):
+            return original_connect(*args, factory=TracedConnection, **kwargs)
+
+        with mock.patch("orch.core.sqlite3.connect", side_effect=connect_with_trace) as opened:
+            with mock.patch("orch.core.time.sleep") as sleep:
+                conn = self.orch.connect()
+                try:
+                    self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                finally:
+                    conn.close()
+        self.assertEqual(opened.call_count, 2)
+        sleep.assert_called_once()
+        self.assertTrue(TracedConnection.injected)
+        self.assertNotIn("PRAGMA journal_mode=WAL", TracedConnection.statements)
+
+    def test_connect_protocol_retry_exhaustion_and_unrelated_error(self):
+        for message, expected_attempts in (("locking protocol", 5),
+                                           ("database is locked", 1)):
+            with self.subTest(message=message):
+                with mock.patch("orch.core.sqlite3.connect",
+                                side_effect=sqlite3.OperationalError(message)) as opened:
+                    with mock.patch("orch.core.time.sleep") as sleep:
+                        with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                            self.orch.connect()
+                self.assertEqual(opened.call_count, expected_attempts)
+                self.assertEqual(sleep.call_count, expected_attempts - 1)
+
+    def test_begin_immediate_retries_protocol_before_any_mutation(self):
+        conn = mock.Mock()
+        conn.execute.side_effect = [sqlite3.OperationalError("locking protocol"), None]
+        with mock.patch("orch.core.time.sleep") as sleep:
+            _begin_immediate(conn)
+        self.assertEqual(conn.execute.call_count, 2)
+        conn.execute.assert_called_with("BEGIN IMMEDIATE")
+        sleep.assert_called_once()
+
+        for message, expected_attempts in (("locking protocol", 5),
+                                           ("database is locked", 1)):
+            conn = mock.Mock()
+            conn.execute.side_effect = sqlite3.OperationalError(message)
+            with mock.patch("orch.core.time.sleep"):
+                with self.assertRaisesRegex(sqlite3.OperationalError, message):
+                    _begin_immediate(conn)
+            self.assertEqual(conn.execute.call_count, expected_attempts)
+
+        self.load([self.task("CLAIM-PROTOCOL")])
+        with mock.patch("orch.core._begin_immediate", wraps=_begin_immediate) as begin:
+            claimed = self.orch.claim("claim-protocol")
+        self.assertEqual(claimed["status"], "CLAIMED")
+        begin.assert_called_once()
 
     def test_dependency_sequence_and_no_work(self):
         self.load([self.task('T1'),self.task('T2',deps=['T1'])])
