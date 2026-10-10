@@ -4,6 +4,8 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -393,7 +395,51 @@ class StateMaintenanceTests(unittest.TestCase):
         self.assertEqual(health["permissions"]["status"], "READY")
         self.assertNotEqual(health["status"], "BLOCKED")
 
-    def test_private_file_repair_survives_sqlite_sidecar_removed_at_open(self):
+    def _probe_sqlite_write_lock(self, db):
+        script = (
+            "import json, sqlite3, sys\n"
+            "conn = sqlite3.connect(sys.argv[1], timeout=0.2, isolation_level=None)\n"
+            "try:\n"
+            "    conn.execute('BEGIN IMMEDIATE')\n"
+            "    conn.execute('ROLLBACK')\n"
+            "    result = {'status': 'ACQUIRED'}\n"
+            "except sqlite3.OperationalError as exc:\n"
+            "    result = {'status': 'REFUSED', 'error': str(exc)}\n"
+            "finally:\n"
+            "    conn.close()\n"
+            "print(json.dumps(result))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(db)],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        return json.loads(completed.stdout)
+
+    def test_private_file_repair_preserves_active_sqlite_writer_lock(self):
+        db = self.root / "lock-safety.sqlite3"
+        conn = sqlite3.connect(db, isolation_level=None)
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+            )
+            conn.execute("CREATE TABLE sample(value INTEGER)")
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO sample VALUES (1)")
+            expected = {"status": "REFUSED", "error": "database is locked"}
+            self.assertEqual(self._probe_sqlite_write_lock(db), expected)
+            for path in (db, db.with_name(db.name + "-wal"),
+                         db.with_name(db.name + "-shm")):
+                self.assertTrue(path.is_file())
+                self.assertEqual(ensure_private_file(path), path)
+            self.assertTrue(conn.in_transaction)
+            self.assertEqual(self._probe_sqlite_write_lock(db), expected)
+        finally:
+            conn.rollback()
+            conn.close()
+        # Refusing every child is not a valid proof of transaction exclusion.
+        self.assertEqual(self._probe_sqlite_write_lock(db), {"status": "ACQUIRED"})
+
+    def test_private_file_repair_survives_sqlite_sidecar_removed_at_chmod(self):
         db = self.root / "sidecar-race.sqlite3"
         conn = sqlite3.connect(db)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -402,18 +448,19 @@ class StateMaintenanceTests(unittest.TestCase):
         wal = db.with_name(db.name + "-wal")
         self.assertTrue(wal.is_file())
 
-        original_open = os.open
+        os.chmod(wal, 0o644)
+        original_chmod = os.chmod
         closed = []
 
-        def remove_at_open(path, flags, *args, **kwargs):
+        def remove_at_chmod(path, mode, *args, **kwargs):
             if Path(path) == wal:
                 conn.close()
                 wal.unlink(missing_ok=True)
                 closed.append(True)
-            return original_open(path, flags, *args, **kwargs)
+            return original_chmod(path, mode, *args, **kwargs)
 
         try:
-            with mock.patch("orch.config.os.open", side_effect=remove_at_open):
+            with mock.patch("orch.config.os.chmod", side_effect=remove_at_chmod):
                 self.assertEqual(ensure_private_file(wal), wal)
         finally:
             if not closed:
@@ -445,23 +492,118 @@ class StateMaintenanceTests(unittest.TestCase):
 
         target.unlink()
         target.write_text("safe\n", encoding="utf-8")
-        original_open = os.open
+        os.chmod(target, 0o644)
+        original_chmod = os.chmod
         swapped = []
 
-        def swap_at_open(path, flags, *args, **kwargs):
+        def swap_at_chmod(path, mode, *args, **kwargs):
             if Path(path) == target:
                 target.unlink()
                 target.symlink_to(victim)
                 swapped.append(True)
-            return original_open(path, flags, *args, **kwargs)
+            self.assertIs(kwargs.get("follow_symlinks"), False)
+            return original_chmod(path, mode, *args, **kwargs)
 
-        with mock.patch("orch.config.os.open", side_effect=swap_at_open):
+        with mock.patch("orch.config.os.chmod", side_effect=swap_at_chmod):
             with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
                 ensure_private_file(target)
 
         self.assertEqual(swapped, [True])
         self.assertEqual(victim.read_text(encoding="utf-8"), "do not change\n")
         self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+
+    def test_private_file_repair_never_opens_or_closes_another_descriptor(self):
+        target = self.root / "no-extra-descriptor"
+        target.write_text("preserved bytes\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        with mock.patch("orch.config.os.open", side_effect=AssertionError("open")):
+            with mock.patch("orch.config.os.close", side_effect=AssertionError("close")):
+                self.assertEqual(ensure_private_file(target), target)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserved bytes\n")
+
+    def test_private_file_repair_requires_supported_nofollow_chmod(self):
+        target = self.root / "unsupported-chmod"
+        target.write_text("private\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        with mock.patch("orch.config._CHMOD_NOFOLLOW_SUPPORTED", False):
+            with mock.patch("orch.config.os.chmod") as chmod:
+                with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+                    ensure_private_file(target)
+                chmod.assert_not_called()
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        os.chmod(target, 0o600)
+        with mock.patch("orch.config._CHMOD_NOFOLLOW_SUPPORTED", False):
+            self.assertEqual(ensure_private_file(target), target)
+
+    def test_private_file_repair_rejects_dangling_symlink_and_fifo(self):
+        target = self.root / "dangling-file"
+        target.symlink_to(self.root / "missing-file")
+        fifo = self.root / "not-regular"
+        os.mkfifo(fifo, 0o600)
+        for path in (target, fifo):
+            with self.subTest(path=path.name):
+                with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+                    ensure_private_file(path)
+
+    def test_private_file_repair_rejects_identity_replacement(self):
+        target = self.root / "identity-target"
+        replacement = self.root / "replacement-inode"
+        target.write_text("original\n", encoding="utf-8")
+        replacement.write_text("replacement\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        original_chmod = os.chmod
+
+        def replace_at_chmod(path, mode, **kwargs):
+            replacement.replace(target)
+            return original_chmod(path, mode, **kwargs)
+
+        with mock.patch("orch.config.os.chmod", side_effect=replace_at_chmod):
+            with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+                ensure_private_file(target)
+
+    def test_private_file_repair_rejects_failed_or_ineffective_mode_changes(self):
+        target = self.root / "failed-chmod"
+        target.write_text("unchanged\n", encoding="utf-8")
+        for error in (PermissionError("denied"), NotImplementedError("unsupported"), None):
+            os.chmod(target, 0o644)
+            with self.subTest(error=type(error).__name__):
+                with mock.patch("orch.config.os.chmod", side_effect=error):
+                    with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+                        ensure_private_file(target)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
+    def test_private_file_repair_survives_removal_after_chmod(self):
+        target = self.root / "removed-after-chmod"
+        target.write_text("transient\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        original_chmod = os.chmod
+
+        def remove_after_chmod(path, mode, **kwargs):
+            original_chmod(path, mode, **kwargs)
+            target.unlink()
+
+        with mock.patch("orch.config.os.chmod", side_effect=remove_after_chmod):
+            self.assertEqual(ensure_private_file(target), target)
+        self.assertFalse(target.exists())
+
+    def test_connect_preserves_another_live_sqlite_writer(self):
+        conn = self.orch.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            expected = {"status": "REFUSED", "error": "database is locked"}
+            self.assertEqual(self._probe_sqlite_write_lock(self.orch.db_path), expected)
+            other = self.orch.connect()
+            try:
+                self.assertTrue(conn.in_transaction)
+                self.assertEqual(self._probe_sqlite_write_lock(self.orch.db_path), expected)
+            finally:
+                other.close()
+        finally:
+            conn.rollback()
+            conn.close()
+        self.assertEqual(self._probe_sqlite_write_lock(self.orch.db_path),
+                         {"status": "ACQUIRED"})
 
     def test_runtime_symlink_is_rejected(self):
         other = Path(self.tmp.name) / "symlink-root"
