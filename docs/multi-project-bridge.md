@@ -480,6 +480,38 @@ multi-device/hosted extensions remain separately gated.
   The scope remains not thread-safe, and an existing fd is not retroactively
   revoked by a state transition.
 
+### P1-C2 — bounded in-process file.list names (third package)
+
+- `orch/bridge_file_list.py` provides trusted local `LocalBoundedFileLister`
+  over an already-live `LocalFileScope`. `file.list` does not inherit broad
+  parent/child permissions: the requested existing directory must have its
+  own **literal trailing-slash** `target/` entry in the currently checked
+  ledger task `allowed_paths`. A child-file grant, a parent-directory grant,
+  or a target without its own directory entry is not enough.
+- The new `LocalFileScope.open_listing` context yields a borrowed directory
+  descriptor after `O_DIRECTORY|O_NOFOLLOW` walks from the pinned root.
+  Entry type, every parent component, live session/capability/run/allowlist,
+  original root identity and path inode are rechecked. The scope closes owned
+  fds even on rejection or exceptions; no reusable approved path is returned.
+- Enumerate immediate child **names only** via `os.scandir(directory_fd)`,
+  without opening/stat'ing/following children. Child symlink names are inert
+  list entries; symlink ancestors and the requested directory are refused.
+  A deterministic compact JSON `{"entries":["..."]}` byte response is sorted
+  and strictly bounded by the request's 1–65,536 byte limit. Stop the scan
+  once the response would exceed the limit; return no partial names.
+- Before returning, require unchanged directory metadata and a fresh scoped
+  descriptor acquisition/identity check, including renewed live authority.
+  Scanner I/O errors are sanitized; if fd-based enumeration is unsupported,
+  refuse. The output is not an atomic filesystem snapshot: malicious same-user
+  races, hardlinks, metadata restoration and changes after the final check are
+  not fenced. The existing LocalFileScope remains non-thread-safe.
+- The plan schema can retain literal `docs/` permission entries, but the
+  `build_single_task_plan` helper currently removes trailing slashes.
+  Until a separate authorized helper/API change, directory-list fixtures and
+  callers must supply a validated explicit plan with that literal grant.
+  There is still no patch/write, owned process, journal/reconnect, remote
+  transport, daemon/broker, MCP, device trust or ordinary-Chat replacement.
+
 Only after further owned-process, durable-operation and transport gates should
 a real Bridge endpoint be considered. These local packages are **not** an RDC
 replacement, shell, relay, daemon or MCP.
