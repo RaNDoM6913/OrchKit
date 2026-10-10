@@ -87,8 +87,8 @@ adapter or new evidence version in P1-B1.
    storage from dispatcher. Historical v1 write-once, permission repair,
    device rebinding and `NOT_EVALUATED` were regression tested. Verified and
    merged with exact-main CI on October 9, 2026.
-3. **P1-B4 — pure worker-operation contracts (this package):**
-   `orch/worker_operations.py` defines validated, in-memory v1 run binding,
+3. **P1-B4 — completed, PR #42:** `orch/worker_operations.py`
+   defines validated, in-memory v1 run binding,
    file/process operation requests, explicit outcome states and structural
    interfaces tested with **fake-only adapters**. It neither performs worker
    I/O nor adds authorization; `UNKNOWN` requires independent readback,
@@ -97,11 +97,15 @@ adapter or new evidence version in P1-B1.
    A direct ChatGPT-to-RDC tool call still has no native OrchKit session
    authority. Acceptance requires all configured lifecycle/PR/exact-main gates.
 
-**Next after P1-B4:** P1-C must independently design ledger- and
-capability-backed local run/session authorization, canonicalized file scope,
-owned process execution, bounded responses, durable idempotency and restart
-readback before integrating a real adapter. The pure request's identity and
-lexical-path checks are never sufficient authorization.
+**P1-C1 (this scoped package):** add a local, in-process run/session
+preflight backed by the existing ledger, claim capability and registered
+project/Git identity. Session IDs are volatile routing metadata; the same
+capability and RUNNING ledger state are required at every recheck. The gate
+does not authorize or execute file/process operations, attest an RDC device,
+or provide an OS fence. **P1-C2 and later** must add canonicalized file scope,
+symlink/escape defenses, owned processes, bounded responses, durable operation
+IDs and restart readback before connecting any real adapter. P1-B4 lexical
+validation remains non-authorizing.
 
 **Acceptance for each package:** existing release/P1-A and full registered
 regression tests pass; version-1 historical evidence stays readable, unknown
@@ -112,6 +116,25 @@ OrchKit receipt/quiesce/verification/publication and guarded PR/CI lifecycle.
 Do not introduce a daemon, relay, broker, MCP or model API in the same PR.
 
 ## 3. P1-C: local Bridge
+
+**P1-C1 — local preflight contract (no Bridge service):**
+`orch/bridge_authorization.py` checks the existing RUNNING ledger record,
+IN_PROGRESS task, claim capability lease, registered project root,
+Git-common-dir writer key, branch and claim HEAD. A same-process authority
+tracks volatile random session IDs; opening and checking a session require
+live validation, and closing or recreating the authority loses the mapping.
+IDs are not bearer permissions and a pause never revokes a running claim.
+Invalid mode, symlink, foreign/revoked capability, cross-project/attempt,
+branch/HEAD/writer drift and unknown session fail closed in disposable tests.
+Checks are point-in-time only: another same-user process is not fenced.
+There is **no authorized operation dispatch**, file I/O, canonical path access,
+process ownership, operation journal, external device trust or service.
+The existing verifier and Git publisher remain separate.
+
+**P1-C2 next:** build and test descriptor-based canonical file-scope checks
+(no-follow symlinks, allowlist, TOCTOU handling) before any file adapter.
+Only later add owned process execution, durable idempotency and bounded daemon
+lifecycle. Do not treat the preflight as a production-ready Bridge.
 
 Define a versioned local protocol and a bounded, explicitly authorized daemon lifecycle before adding remote connectivity. The CLI and future UI must consume the same protocol.
 
