@@ -159,7 +159,28 @@ in-memory adapter is **not** a remote endpoint, durable operation journal or
 OS sandbox; malicious same-user races, hard links and changes after readback
 remain possible, and the original scope is not thread-safe.
 
-**Still not implemented:** `file.list`/`file.patch` adapters, external content
+**P1-C2 — third bounded package (local `file.list`):**
+`orch/bridge_file_list.py` adds a trusted, in-process
+`LocalBoundedFileLister` using a live `LocalFileScope`.
+The listed target must be an **existing directory** with its own literal
+trailing-slash entry (for example `docs/`) in the task's live
+`allowed_paths`; a parent grant or a grant to a child file is insufficient.
+`open_listing` anchors each directory component with no-follow,
+descriptor-relative opens and rechecks the pinned project root and
+session/capability/ledger scope. The adapter enumerates names only, never
+opens child entries, bounds its complete compact sorted JSON response by
+`max_output_bytes` (1–65,536), and emits no partial output on overflow,
+directory change or revoked authority. Symlinks *inside* the listed directory
+are names only; symlink ancestors and the directory target are refused.
+A fresh descriptor acquisition and unchanged directory metadata check are
+required before returning bytes. An unsupported descriptor-scanning OS is
+refused; scanner errors are sanitized. This is not a remote API, durable
+journal, atomic directory snapshot or same-user OS sandbox. The current
+`build_single_task_plan` helper normalizes away trailing slashes: callers
+must preserve the directory grant in a validated explicit plan until a
+separate helper/API contract package is authorized.
+
+**Still not implemented:** `file.patch`/write adapters, external content
 transport, owned processes, journal/idempotency, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any
 first ordinary-Chat route without RDC; do not relabel this foundation as a

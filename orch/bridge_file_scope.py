@@ -228,6 +228,53 @@ class LocalFileScope:
         finally:
             self._active_handles -= 1
 
+    @contextmanager
+    def open_listing(self, request: WorkerOperationRequest) -> Iterator[int]:
+        """Yield an owned directory fd for an explicitly allowed file.list.
+
+        Unlike file.read's inherited subtree checks, listing requires the
+        exact directory entry target/ in the live ledger allowed_paths.
+        A file-only grant, or a parent directory grant, never authorizes a
+        directory listing. No child is opened or followed here.
+        """
+        if self._root_fd < 0:
+            raise ValueError("bridge_file_scope_closed")
+        require_matching_worker_run(self._binding, request)
+        if request.kind != "file.list":
+            raise ValueError("bridge_file_scope_kind_unsupported")
+        root, allowed = self._live_scope()
+        if root != self._root_path or request.target + "/" not in allowed:
+            raise ValueError("bridge_file_scope_path_denied")
+        self._check_root_identity()
+        self._active_handles += 1
+        try:
+            with ExitStack() as owned:
+                parent_fd = self._root_fd
+                ancestors = []
+                try:
+                    for part in request.target.split("/"):
+                        _entry(parent_fd, part, directory=True)
+                        child = os.open(part, _directory_flags(), dir_fd=parent_fd)
+                        owned.callback(os.close, child)
+                        if not stat.S_ISDIR(os.fstat(child).st_mode):
+                            raise ValueError("bridge_file_scope_unsafe_type")
+                        ancestors.append((parent_fd, part, child))
+                        parent_fd = child
+                    for parent, name, child in ancestors:
+                        if (_identity(_entry(parent, name, directory=True))
+                                != _identity(os.fstat(child))):
+                            raise ValueError("bridge_file_scope_path_changed")
+                    fresh_root, fresh_allowed = self._live_scope()
+                    if (fresh_root != self._root_path
+                            or request.target + "/" not in fresh_allowed):
+                        raise ValueError("bridge_file_scope_scope_changed")
+                    self._check_root_identity()
+                except (OSError, TypeError) as exc:
+                    raise ValueError("bridge_file_scope_path_denied") from exc
+                yield parent_fd
+        finally:
+            self._active_handles -= 1
+
     def close(self) -> None:
         if self._active_handles:
             raise ValueError("bridge_file_scope_busy")
