@@ -27,10 +27,21 @@ def ensure_private_dir(path: Path) -> Path:
 
 def ensure_private_file(path: Path) -> Path:
     target = path.expanduser()
-    if target.exists():
-        if target.is_symlink() or not target.is_file():
+    if not hasattr(os, "O_NOFOLLOW") and target.is_symlink():
+        raise ValueError("private_file_unsafe")
+    try:
+        fd = os.open(str(target), regular_file_read_flags())
+    except FileNotFoundError:
+        # SQLite may unlink its final WAL/SHM sidecar during connection cleanup.
+        return target
+    except OSError as exc:
+        raise ValueError("private_file_unsafe") from exc
+    try:
+        if not statmod.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("private_file_unsafe")
-        os.chmod(target, 0o600)
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
     return target
 
 

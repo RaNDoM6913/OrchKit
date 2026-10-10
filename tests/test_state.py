@@ -10,6 +10,7 @@ from unittest import mock
 import zipfile
 
 import orch.state as state_module
+from orch.config import ensure_private_file
 from orch.core import Orchestrator
 from orch.state import (backup_state, check_state, inspect_home_replacement,
                         migration_history, prune_capabilities, prune_retention,
@@ -391,6 +392,76 @@ class StateMaintenanceTests(unittest.TestCase):
         health = check_state(repaired)
         self.assertEqual(health["permissions"]["status"], "READY")
         self.assertNotEqual(health["status"], "BLOCKED")
+
+    def test_private_file_repair_survives_sqlite_sidecar_removed_at_open(self):
+        db = self.root / "sidecar-race.sqlite3"
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE sample(value INTEGER)")
+        conn.commit()
+        wal = db.with_name(db.name + "-wal")
+        self.assertTrue(wal.is_file())
+
+        original_open = os.open
+        closed = []
+
+        def remove_at_open(path, flags, *args, **kwargs):
+            if Path(path) == wal:
+                conn.close()
+                wal.unlink(missing_ok=True)
+                closed.append(True)
+            return original_open(path, flags, *args, **kwargs)
+
+        try:
+            with mock.patch("orch.config.os.open", side_effect=remove_at_open):
+                self.assertEqual(ensure_private_file(wal), wal)
+        finally:
+            if not closed:
+                conn.close()
+
+        self.assertEqual(closed, [True])
+        self.assertFalse(wal.exists())
+        self.assertEqual(ensure_private_file(wal), wal)
+
+    def test_private_file_repair_rejects_nonregular_and_symlink_swaps(self):
+        target = self.root / "private-file"
+        target.write_text("test\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+        self.assertEqual(ensure_private_file(target), target)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+        directory = self.root / "not-a-file"
+        directory.mkdir()
+        with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+            ensure_private_file(directory)
+
+        victim = self.root / "victim"
+        victim.write_text("do not change\n", encoding="utf-8")
+        os.chmod(victim, 0o644)
+        target.unlink()
+        target.symlink_to(victim)
+        with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+            ensure_private_file(target)
+
+        target.unlink()
+        target.write_text("safe\n", encoding="utf-8")
+        original_open = os.open
+        swapped = []
+
+        def swap_at_open(path, flags, *args, **kwargs):
+            if Path(path) == target:
+                target.unlink()
+                target.symlink_to(victim)
+                swapped.append(True)
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch("orch.config.os.open", side_effect=swap_at_open):
+            with self.assertRaisesRegex(ValueError, "private_file_unsafe"):
+                ensure_private_file(target)
+
+        self.assertEqual(swapped, [True])
+        self.assertEqual(victim.read_text(encoding="utf-8"), "do not change\n")
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
 
     def test_runtime_symlink_is_rejected(self):
         other = Path(self.tmp.name) / "symlink-root"
