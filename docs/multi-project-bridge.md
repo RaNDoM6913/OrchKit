@@ -454,12 +454,35 @@ multi-device/hosted extensions remain separately gated.
   durably attested at project registration. Hard links and adversarial races
   after the last recheck are not an OS sandbox guarantee. An already-open fd
   cannot be revoked retroactively by a ledger transition. No safe concurrent
-  use of one scope instance across threads is claimed. Further operation
-  adapters, size-bound reads, writable file semantics, process ownership,
-  durable uncertain-outcome reconciliation and device trust are future work.
+  use of one scope instance across threads is claimed. At this foundation
+  stage bounded reads were not included; a separate local read package follows
+  below. List/patch, writable file semantics, process ownership, durable
+  uncertain-outcome reconciliation and device trust remain future work.
 
-Only after those later gates should a real Bridge endpoint be considered;
-this foundation is **not** an RDC replacement, shell, relay, daemon or MCP.
+### P1-C2 — bounded in-process file.read content (second package)
+
+- `orch/bridge_file_read.py` offers `LocalBoundedFileReader` to a **trusted
+  local caller** already holding a live `LocalFileScope`. Only `file.read`
+  requests are supported. The existing P1-C1 session/capability/ledger and
+  P1-C2 no-follow descriptor walk determine access; there is no second ACL.
+- A version-1 `WorkerOperationOutcome` returns bytes only after bounded EOF,
+  metadata comparison before/after reading and an independent second scoped
+  descriptor open/identity check just before returning. Reads are capped by
+  `max_output_bytes` (up to 64 KiB), plus one excess-byte sentinel; an
+  oversized, growing, changed or newly unauthorized file produces no partial
+  bytes. Read failures are sanitized; no raw filesystem exception or lease
+  token is sent in the outcome. No content is stored in a durable journal.
+- `file.list`, `file.patch`, and process operations remain unsupported. This
+  does not add external content transfer, network connectivity, a daemon,
+  relay/MCP, device authentication, or an arbitrary shell endpoint. Scope
+  authorization and descriptor checks remain point-in-time; same-user
+  tampering, hard links and changes after the final check are not OS-fenced.
+  The scope remains not thread-safe, and an existing fd is not retroactively
+  revoked by a state transition.
+
+Only after further owned-process, durable-operation and transport gates should
+a real Bridge endpoint be considered. These local packages are **not** an RDC
+replacement, shell, relay, daemon or MCP.
 
 Add a local daemon controlled by the CLI.
 

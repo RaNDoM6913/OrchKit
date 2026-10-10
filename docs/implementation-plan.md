@@ -145,7 +145,21 @@ file descriptor is closed by its context even on errors. These are point-in-time
 checks, not an OS sandbox: same-user races, hard links and already-granted fd
 access remain residual limitations. The scope is not thread-safe.
 
-**Still not implemented:** `file.list`/`file.patch` adapters, bounded content
+**P1-C2 — second bounded package (`file.read` content):**
+`orch/bridge_file_read.py` adds a **local in-process** `LocalBoundedFileReader`
+using an already-live `LocalFileScope`, not arbitrary path or shell access.
+An authorized read returns version-1 `WorkerOperationOutcome` bytes only after
+EOF within the request's maximum (1–65,536 bytes), unchanged file metadata,
+and a second no-follow descriptor acquisition that rechecks session,
+capability, run, allowlist, root and leaf identity. Reading is limited to the
+requested byte ceiling plus one sentinel byte; oversized/changed files return
+no partial bytes, and I/O errors do not disclose raw system exceptions.
+`file.list`, `file.patch` and processes are not implemented. This synchronous
+in-memory adapter is **not** a remote endpoint, durable operation journal or
+OS sandbox; malicious same-user races, hard links and changes after readback
+remain possible, and the original scope is not thread-safe.
+
+**Still not implemented:** `file.list`/`file.patch` adapters, external content
 transport, owned processes, journal/idempotency, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any
 first ordinary-Chat route without RDC; do not relabel this foundation as a
