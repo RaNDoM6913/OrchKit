@@ -426,10 +426,40 @@ multi-device/hosted extensions remain separately gated.
   The independent local registered-check executor and guarded Git publisher
   are untouched. Tests use disposable Git/ledger/capability fixtures only.
 
-**Next, P1-C2:** canonical workspace/allowlist scope with symlink and
-TOCTOU negatives, still no shell or remote relay. Only after later owned
-process, idempotency, restart and device-trust gates should a real Bridge
-endpoint be considered.
+### P1-C2 — bounded descriptor-based file scope (first foundation)
+
+- `LocalFileScope` operates only for a trusted local caller with a live P1-C1
+  session, active capability and matching ledger/project/writer authority. Its
+  `file.read` scope is sourced from the task's existing `allowed_paths`, not a
+  second ACL or a supplied expected run. Only exact allowed **existing regular
+  files** currently receive a descriptor. `file.list`, `file.patch`, process
+  operations and file-content transfer remain unsupported.
+- The registered canonical project root is pinned by a no-follow directory fd
+  (device/inode). Each directory component is opened relative to an owned fd
+  using `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`; the leaf uses read-only,
+  nonblocking, no-follow flags and must be regular. Identity checks compare
+  the opened fds with no-follow directory-relative entries and independently
+  reopen/check the registered root. OS primitives unavailable or ineffective
+  for this contract must fail closed; lexical `resolve()` or prefix tests are
+  not permission grants.
+- All parents and the target must already exist; neither missing parents nor
+  missing leaves are created. Symlink parents/leaves, traversal, absolute
+  requests, wrong task allowlist, unknown/stale session/capability and root
+  substitution are refused. Deterministic injected swaps test path changes
+  between checks and opens. The scope owns and closes its root descriptor;
+  the caller borrows the opened file fd only within a context, including
+  automatic cleanup on exceptions. Never cache a checked pathname for later I/O.
+- **Residual limitations:** same-user malicious processes are not fenced;
+  root identity is pinned only when a local scope instance is created, not
+  durably attested at project registration. Hard links and adversarial races
+  after the last recheck are not an OS sandbox guarantee. An already-open fd
+  cannot be revoked retroactively by a ledger transition. No safe concurrent
+  use of one scope instance across threads is claimed. Further operation
+  adapters, size-bound reads, writable file semantics, process ownership,
+  durable uncertain-outcome reconciliation and device trust are future work.
+
+Only after those later gates should a real Bridge endpoint be considered;
+this foundation is **not** an RDC replacement, shell, relay, daemon or MCP.
 
 Add a local daemon controlled by the CLI.
 
