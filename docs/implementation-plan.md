@@ -131,10 +131,25 @@ There is **no authorized operation dispatch**, file I/O, canonical path access,
 process ownership, operation journal, external device trust or service.
 The existing verifier and Git publisher remain separate.
 
-**P1-C2 next:** build and test descriptor-based canonical file-scope checks
-(no-follow symlinks, allowlist, TOCTOU handling) before any file adapter.
-Only later add owned process execution, durable idempotency and bounded daemon
-lifecycle. Do not treat the preflight as a production-ready Bridge.
+**P1-C2 — first bounded file-scope foundation:**
+`orch/bridge_file_scope.py` offers a trusted local caller a context-managed,
+read-only descriptor for an **existing regular-file** `file.read` target only.
+It rechecks the P1-C1 live session/capability and ledger task `allowed_paths`
+(exact file entries), uses the registered canonical project root and a pinned
+root device/inode, walks all components via directory-relative, no-follow
+opens, and verifies the opened object identities. It never returns a reusable
+approved pathname, creates missing parents/leaves, or reads content itself.
+Unsupported safe OS primitives, symlinks, scope/identity drift and missing or
+nonregular files fail closed. The scope owns its root descriptor; the returned
+file descriptor is closed by its context even on errors. These are point-in-time
+checks, not an OS sandbox: same-user races, hard links and already-granted fd
+access remain residual limitations. The scope is not thread-safe.
+
+**Still not implemented:** `file.list`/`file.patch` adapters, bounded content
+transport, owned processes, journal/idempotency, daemon, multi-session broker,
+relay/MCP or device trust. Finish those as separately scoped gates before any
+first ordinary-Chat route without RDC; do not relabel this foundation as a
+working Bridge or relax P1-C1/verifier/publisher authority.
 
 Define a versioned local protocol and a bounded, explicitly authorized daemon lifecycle before adding remote connectivity. The CLI and future UI must consume the same protocol.
 
