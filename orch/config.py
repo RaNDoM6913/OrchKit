@@ -10,6 +10,7 @@ from typing import Any, Dict
 SCHEMA_VERSION = 1
 DEFAULT_PROFILE = "safe"
 HOME_CONFIG_MAX_BYTES = 64 * 1024
+_CHMOD_NOFOLLOW_SUPPORTED = os.chmod in os.supports_follow_symlinks
 
 
 
@@ -26,22 +27,38 @@ def ensure_private_dir(path: Path) -> Path:
 
 
 def ensure_private_file(path: Path) -> Path:
+    """Repair modes without releasing SQLite's process-scoped POSIX locks.
+
+    Opening and closing another descriptor for a live SQLite file (especially
+    WAL shared memory) can drop locks held by an existing connection. Use
+    no-follow metadata operations, not an open/fchmod/close permission probe.
+    These remain point-in-time checks, not an OS boundary against same-user
+    processes replacing paths after validation.
+    """
     target = path.expanduser()
-    if not hasattr(os, "O_NOFOLLOW") and target.is_symlink():
-        raise ValueError("private_file_unsafe")
     try:
-        fd = os.open(str(target), regular_file_read_flags())
+        before = target.lstat()
     except FileNotFoundError:
-        # SQLite may unlink its final WAL/SHM sidecar during connection cleanup.
         return target
     except OSError as exc:
         raise ValueError("private_file_unsafe") from exc
+    if not statmod.S_ISREG(before.st_mode):
+        raise ValueError("private_file_unsafe")
     try:
-        if not statmod.S_ISREG(os.fstat(fd).st_mode):
-            raise ValueError("private_file_unsafe")
-        os.fchmod(fd, 0o600)
-    finally:
-        os.close(fd)
+        if statmod.S_IMODE(before.st_mode) != 0o600:
+            if not _CHMOD_NOFOLLOW_SUPPORTED:
+                raise ValueError("private_file_unsafe")
+            os.chmod(target, 0o600, follow_symlinks=False)
+        after = target.lstat()
+    except FileNotFoundError:
+        # SQLite may remove its final WAL/SHM sidecar during these checks.
+        return target
+    except (OSError, NotImplementedError) as exc:
+        raise ValueError("private_file_unsafe") from exc
+    if (not statmod.S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or statmod.S_IMODE(after.st_mode) != 0o600):
+        raise ValueError("private_file_unsafe")
     return target
 
 

@@ -40,6 +40,7 @@ PLAN_MAX_PROTECTED_PATHS = 512
 PLAN_MAX_DEPENDENCIES = 128
 PLAN_MAX_CHECKS = 64
 CHECK_MAX_TIMEOUT_SEC = 600
+SQLITE_PROTOCOL_MAX_ATTEMPTS = 5
 PLAN_MAX_ARGV = 64
 PLAN_MAX_NON_GOALS = 128
 PLAN_MAX_ACCEPTANCE = 128
@@ -47,6 +48,24 @@ CHECK_MAX_OUTPUT_TAIL_CHARS = 64 * 1024
 EXECUTION_BUDGET_SCHEMA_VERSION = 1
 EXECUTION_BUDGET_MAX_MINUTES = 24 * 60
 EXECUTION_BUDGET_MAX_CONTEXT_TOKENS = 10_000_000
+
+
+def _is_sqlite_locking_protocol(exc: Exception) -> bool:
+    return (isinstance(exc, sqlite3.OperationalError)
+            and str(exc).lower() == "locking protocol")
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    # Retrying BEGIN is safe because no transaction has started yet.
+    for attempt in range(SQLITE_PROTOCOL_MAX_ATTEMPTS):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if (not _is_sqlite_locking_protocol(exc)
+                    or attempt + 1 == SQLITE_PROTOCOL_MAX_ATTEMPTS):
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def utc_now() -> str:
@@ -775,23 +794,38 @@ class Orchestrator:
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=5, isolation_level=None)
-        ensure_private_file(self.db_path)
-        for sidecar in (
-            self.db_path.with_name(self.db_path.name + "-wal"),
-            self.db_path.with_name(self.db_path.name + "-shm"),
-        ):
-            ensure_private_file(sidecar)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        ensure_private_file(self.db_path)
-        for sidecar in (
-            self.db_path.with_name(self.db_path.name + "-wal"),
-            self.db_path.with_name(self.db_path.name + "-shm"),
-        ):
-            ensure_private_file(sidecar)
-        return conn
+        # A WAL database retains its journal mode across connections. Avoid
+        # requesting the mode change on every competing process open.
+        for attempt in range(SQLITE_PROTOCOL_MAX_ATTEMPTS):
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    str(self.db_path), timeout=5, isolation_level=None
+                )
+                ensure_private_file(self.db_path)
+                for sidecar in (
+                    self.db_path.with_name(self.db_path.name + "-wal"),
+                    self.db_path.with_name(self.db_path.name + "-shm"),
+                ):
+                    ensure_private_file(sidecar)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys=ON")
+                if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                    conn.execute("PRAGMA journal_mode=WAL")
+                ensure_private_file(self.db_path)
+                for sidecar in (
+                    self.db_path.with_name(self.db_path.name + "-wal"),
+                    self.db_path.with_name(self.db_path.name + "-shm"),
+                ):
+                    ensure_private_file(sidecar)
+                return conn
+            except Exception as exc:
+                if conn is not None:
+                    conn.close()
+                if (not _is_sqlite_locking_protocol(exc)
+                        or attempt + 1 == SQLITE_PROTOCOL_MAX_ATTEMPTS):
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _capability_path(self, run_id: str) -> Path:
         if re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
@@ -1327,7 +1361,7 @@ class Orchestrator:
             raise ValueError("invalid_project_id")
         now = utc_now()
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            _begin_immediate(conn)
             paused = conn.execute("SELECT value_json FROM settings WHERE key='paused'").fetchone()
             if paused:
                 conn.execute("COMMIT")
