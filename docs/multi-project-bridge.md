@@ -346,7 +346,7 @@ These interfaces must not relocate or weaken those decisions.
    version-aware v1 route storage and codec with historical exclusive
    write-once, no-follow reads, mode repair, rebinding and
    `acceptance=NOT_EVALUATED` preserved.
-4. **P1-B4 — pure boundary (this package):** `orch/worker_operations.py`
+4. **P1-B4 — completed, PR #42:** `orch/worker_operations.py`
    defines in-memory v1 run identity, operation/outcome metadata and
    structural file/process adapter protocols. The **only adapters** are
    fake objects in `tests/test_worker_operations.py`. This is neither
@@ -390,13 +390,46 @@ These interfaces must not relocate or weaken those decisions.
   readback and non-import of subprocess/Git publisher surfaces; the full
   registered regression and exact PR/main CI remain mandatory.
 
-The next separately scoped milestone is **P1-C**: design and test
-ledger-backed local authorization, path canonicalization, owned-process
-tracking, durable operation IDs, timeouts/reconnect semantics and negative
-cross-session cases before implementing real I/O. P1-D through P1-G and
+The first **P1-C1** package adds only local in-process ledger/capability
+session preflight; this is still not a native Bridge transport. **P1-C2**
+addresses canonical path allowlists and symlink/escape protection before
+file I/O. Owned processes, durable operation IDs, timeout/reconnect and
+restart semantics remain separate later gates. P1-D through P1-G and
 multi-device/hosted extensions remain separately gated.
 
 ## P1-C — local OrchKit Bridge MVP
+
+### P1-C1 — in-process run/session preflight (implemented boundary)
+
+- `orch/bridge_authorization.py` exposes `LocalRunSessionAuthority` to a
+  **trusted local caller**; there is no endpoint, daemon, protocol server or
+  permission to perform an operation. `open_session` generates a volatile
+  random local routing ID only after validating a `WorkerRunBinding` against
+  an active `RUNNING` ledger claim, `IN_PROGRESS` task and the existing
+  bounded no-follow `0600` capability file with exact lease match.
+- `require_session` rechecks capability and ledger on **each** call. The
+  current project registry, workspace identity, Git common-dir writer key,
+  task publication branch and claimed HEAD must match independently.
+  Foreign project/writer/task/run/attempt, foreign/revoked/symlink/mis-moded
+  capability, changed branch/HEAD, closed/unknown session and stale attempt
+  are refused. Global/project pause still only prevents new claims.
+- The same run cannot open two sessions in one authority instance; close
+  deletes its mapping, and a new instance does **not** inherit old sessions.
+  This is not a durable or cross-process broker; a same-user process that can
+  read the live capability is not OS-isolated. A session ID alone is never
+  a bearer credential. Checks are **point-in-time**, not OS/process fencing.
+- No `WorkerOperationRequest` or `WorkerOperationOutcome` is dispatched by
+  this preflight. **No file/path or process operation is authorized yet**;
+  even `file.read` requires separate future canonical scope enforcement,
+  symlink-resistant descriptor I/O and active revalidation. P1-B4 route
+  evidence, markers and syntactic request checks remain non-authorizing.
+  The independent local registered-check executor and guarded Git publisher
+  are untouched. Tests use disposable Git/ledger/capability fixtures only.
+
+**Next, P1-C2:** canonical workspace/allowlist scope with symlink and
+TOCTOU negatives, still no shell or remote relay. Only after later owned
+process, idempotency, restart and device-trust gates should a real Bridge
+endpoint be considered.
 
 Add a local daemon controlled by the CLI.
 
