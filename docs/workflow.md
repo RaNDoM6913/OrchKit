@@ -61,13 +61,13 @@ The native review adapter locates the legacy ChatGPT app executable or the
 current `codex-cli/CodexCLI.app/Contents/MacOS/codex` bundle. It does not search
 arbitrary PATH executables, change the installation, or create compatibility
 symlinks. Missing, non-executable, writable or symlink leaves fail closed.
-Use explicit reviewer routing; the adapter never infers Sol from a default:
+Use explicit reviewer routing; the adapter never infers the reviewer model from a default:
 
 ```bash
 orch --root /absolute/state/home codex-preflight \
-  --model gpt-5.6-sol --reasoning-effort high
+  --model gpt-6-astra --reasoning-effort high
 orch --root /absolute/state/home codex-review --run-id RUN_ID \
-  --model gpt-5.6-sol --reasoning-effort high --execute
+  --model gpt-6-astra --reasoning-effort high --execute
 ```
 
 Preflight checks the signed-in ChatGPT subscription, known rate/credit evidence

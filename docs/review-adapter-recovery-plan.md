@@ -29,7 +29,7 @@ Acceptance for this repair:
   project review mode, owner approval, capability, writer, verifier, publisher and
   registered command authority do not change.
 - A real disposable fixture completes native verification, explicitly selected
-  subscription-backed `gpt-5.6-sol/high` review, bound report import and local-only
+  subscription-backed `gpt-6-astra/high` review, bound report import and local-only
   publication. This proves adapter integration only, not a Superkit role or
   ordinary-ChatGPT acceptance trace. Do not silently substitute another model.
 - Targeted and full registered regression, source PR checks, guarded merge and

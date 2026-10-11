@@ -49,7 +49,7 @@ def responses(account_type="chatgpt", *, credits=False, usage_allowed=True):
         {"id": 2, "result": {"ordinaryUsageAllowed": usage_allowed,
                               "rateLimits": rates,
                               "rateLimitsByLimitId": {"codex": rates}}},
-        {"id": 3, "result": {"data": [{"model": "gpt-5.6-sol",
+        {"id": 3, "result": {"data": [{"model": "gpt-6-astra",
                                          "supportedReasoningEfforts": [
                                              {"reasoningEffort": "high"}]}],
                               "nextCursor": None}},
@@ -115,10 +115,10 @@ class ReviewerRuntimeTests(unittest.TestCase):
         self.assertEqual(self._preflight([])["status"], "BLOCKED")
 
     def test_explicit_route_is_checked_against_available_model_and_effort(self):
-        result = self._preflight(model="gpt-5.6-sol", reasoning_effort="high")
+        result = self._preflight(model="gpt-6-astra", reasoning_effort="high")
         self.assertEqual(result["status"], "PASS", result)
         for route in (dict(model="other", reasoning_effort="high"),
-                      dict(model="gpt-5.6-sol", reasoning_effort="low")):
+                      dict(model="gpt-6-astra", reasoning_effort="low")):
             self.assertEqual(self._preflight(**route)["status"], "BLOCKED")
 
     def test_preflight_does_not_return_private_usage_or_credit_balances(self):
@@ -130,11 +130,11 @@ class ReviewerRuntimeTests(unittest.TestCase):
     def test_cli_accepts_explicit_review_and_preflight_routing(self):
         parser = build_parser()
         args = parser.parse_args(["codex-review", "--run-id", "fixture",
-                                  "--model", "gpt-5.6-sol", "--reasoning-effort", "high"])
-        self.assertEqual((args.model, args.reasoning_effort), ("gpt-5.6-sol", "high"))
-        args = parser.parse_args(["codex-preflight", "--model", "gpt-5.6-sol",
+                                  "--model", "gpt-6-astra", "--reasoning-effort", "high"])
+        self.assertEqual((args.model, args.reasoning_effort), ("gpt-6-astra", "high"))
+        args = parser.parse_args(["codex-preflight", "--model", "gpt-6-astra",
                                   "--reasoning-effort", "high"])
-        self.assertEqual(args.model, "gpt-5.6-sol")
+        self.assertEqual(args.model, "gpt-6-astra")
 
     def test_malformed_duplicate_and_oversized_rpc_outputs_are_blocked(self):
         duplicate = responses()
@@ -153,8 +153,8 @@ class ReviewerRuntimeTests(unittest.TestCase):
                          ('BLOCKED', 'review_routing_required'))
 
     def test_invalid_route_is_rejected_before_launch(self):
-        for model, effort in (("a;command", "high"), ("gpt-5.6-sol", "invalid"),
-                              (None, "high"), ("gpt-5.6-sol", None)):
+        for model, effort in (("a;command", "high"), ("gpt-6-astra", "invalid"),
+                              (None, "high"), ("gpt-6-astra", None)):
             with self.subTest(model=model, effort=effort):
                 self.assertEqual(self._preflight(model=model, reasoning_effort=effort)['status'],
                                  'BLOCKED')
