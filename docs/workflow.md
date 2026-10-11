@@ -57,6 +57,35 @@ See the [roadmap](../ROADMAP.md) for the ordered P0 milestones.
 
 Review can be disabled, risk-based, or required by policy. Codex is an optional reviewer and must not be used as a prerequisite for the core workflow.
 
+The native review adapter locates the legacy ChatGPT app executable or the
+current `codex-cli/CodexCLI.app/Contents/MacOS/codex` bundle. It does not search
+arbitrary PATH executables, change the installation, or create compatibility
+symlinks. Missing, non-executable, writable or symlink leaves fail closed.
+Use explicit reviewer routing; the adapter never infers the reviewer model from a default:
+
+```bash
+orch --root /absolute/state/home codex-preflight \
+  --model gpt-6-astra --reasoning-effort high
+orch --root /absolute/state/home codex-review --run-id RUN_ID \
+  --model gpt-6-astra --reasoning-effort high --execute
+```
+
+Preflight checks the signed-in ChatGPT subscription, known rate/credit evidence
+and the available model/effort catalog. Missing evidence, purchased credits,
+provider environment overrides or unsupported routing block execution. Diagnostic
+output contains the decision and binary/routing identity, not usage percentages,
+credit balances or account identifiers. Preflight runs again immediately before
+each review; a prior successful check is not a lasting billing permission.
+
+Review retains frozen export/schema/report bindings and uses `read-only`,
+`--ignore-user-config`, disabled hooks/plugins, explicit OpenAI routing and no
+interactive approval escalation. The returned route describes explicit command
+selection and catalog evidence; it is not self-attestation of a hidden backend
+model identity or ordinary ChatGPT route acceptance. Same-user changes after the
+last check remain outside the cooperative boundary. Required review/owner gates
+still apply. See [review-adapter-recovery-plan.md](review-adapter-recovery-plan.md)
+for observed compatibility, rollout and remaining release gates.
+
 When publication is allowed, OrchKit guards the expected branch and base, requires empty pre-existing staging, stages only verified changed paths, uses ordinary non-force Git behavior, and confirms the remote reference. These checks improve workflow integrity; they do not protect against a process that already has broad same-user access.
 
 Read the [architecture](architecture.md) for component relationships and the [security model](security-model.md) before applying OrchKit to sensitive work.

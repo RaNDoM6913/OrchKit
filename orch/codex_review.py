@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import stat as statmod
@@ -19,6 +20,12 @@ from .core import (VERIFICATION_EVIDENCE_MAX_BYTES, Orchestrator,
                    safe_workspace_path, sha256_bytes, utc_now)
 
 CODEX_BIN = Path('/Applications/ChatGPT.app/Contents/Resources/codex')
+CURRENT_CODEX_BIN = Path(
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/'
+    'CodexCLI.app/Contents/MacOS/codex'
+)
+PREFLIGHT_MAX_BYTES = 256 * 1024
+CODEX_BINARY_MAX_BYTES = 256 * 1024 * 1024
 REVIEW_SCHEMA_MAX_BYTES = 64 * 1024
 REVIEW_PROMPT_MAX_BYTES = 512 * 1024
 REVIEW_EVENTS_MAX_BYTES = 4 * 1024 * 1024
@@ -28,49 +35,188 @@ def safe_env() -> Dict[str, str]:
     return {key: os.environ[key] for key in ('HOME','USER','PATH','TMPDIR','LANG','LC_ALL') if key in os.environ}
 
 
-def subscription_preflight(root: Path) -> Dict[str, Any]:
-    if not CODEX_BIN.is_file():
-        return {'status':'BLOCKED','reason':'codex_binary_missing'}
-    forbidden = [name for name in ('OPENAI_API_KEY','OPENAI_BASE_URL','DEEPSEEK_API_KEY','ANTHROPIC_API_KEY') if os.environ.get(name)]
-    if forbidden:
-        return {'status':'BLOCKED','reason':'forbidden_provider_env','present':forbidden}
-    env=safe_env()
-    proc=subprocess.Popen([str(CODEX_BIN),'--disable','hooks','app-server','--stdio'],cwd=str(root),env=env,
-                          stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
-    def send(obj: Dict[str, Any]) -> None:
-        assert proc.stdin is not None
-        proc.stdin.write(json.dumps(obj,separators=(',',':'))+'\n'); proc.stdin.flush()
-    send({'method':'initialize','id':0,'params':{'clientInfo':{'name':'orch','title':'ORCH subscription preflight','version':'0.1.0'}}})
-    send({'method':'initialized','params':{}})
-    send({'method':'account/read','id':1,'params':{'refreshToken':False}})
-    send({'method':'account/rateLimits/read','id':2})
-    responses={}; deadline=time.time()+12
-    assert proc.stdout is not None
-    while time.time()<deadline and len(responses)<3:
-        ready,_,_=select.select([proc.stdout],[],[],0.5)
-        if not ready: continue
-        line=proc.stdout.readline()
-        if not line: break
-        try: msg=json.loads(line)
-        except Exception: continue
-        if msg.get('id') in {0,1,2}: responses[msg['id']]=msg
-    proc.terminate()
-    try: proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        proc.kill(); proc.wait()
-    account_result=responses.get(1,{}).get('result',{})
-    account=account_result.get('account') or {}
-    rates=responses.get(2,{}).get('result',{})
-    primary=(rates.get('rateLimits') or {}).get('primary') or {}
-    buckets=rates.get('rateLimitsByLimitId') or {}
-    credits=(buckets.get('codex') or {}).get('credits') or {}
-    summary={'status':'PASS','checked_at_utc':utc_now(),'account_type':account.get('type'),'plan_type':account.get('planType'),
-             'requires_openai_auth':account_result.get('requiresOpenaiAuth'),'rate_limit_reached_type':(rates.get('rateLimits') or {}).get('rateLimitReachedType'),
-             'used_percent':primary.get('usedPercent'),'resets_at':primary.get('resetsAt'),'purchased_credits':bool(credits.get('hasCredits')),
-             'credit_balance':credits.get('balance'),'errors':{str(k):v.get('error') for k,v in responses.items() if v.get('error')}}
-    if len(responses)<3 or summary['errors'] or summary['account_type']!='chatgpt' or summary['rate_limit_reached_type'] is not None or summary['purchased_credits']:
-        summary['status']='BLOCKED'
-    return summary
+def resolve_codex_binary() -> Path:
+    """Select known app-bundled executables, never an arbitrary PATH command."""
+    for candidate in (CODEX_BIN, CURRENT_CODEX_BIN):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (not statmod.S_ISREG(info.st_mode) or info.st_mode & 0o022
+                or not os.access(candidate, os.X_OK)):
+            raise ValueError('codex_binary_unsafe')
+        return candidate
+    raise ValueError('codex_binary_missing')
+
+
+def _binary_signature(info: os.stat_result) -> list[int]:
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _binary_info(binary: Path) -> Dict[str, Any]:
+    before = binary.lstat()
+    raw, _ = read_bounded_regular_file(
+        binary, max_bytes=CODEX_BINARY_MAX_BYTES,
+        unsafe_error='codex_binary_unsafe', too_large_error='codex_binary_too_large',
+    )
+    info = binary.lstat()
+    if (not statmod.S_ISREG(info.st_mode) or info.st_mode & 0o022
+            or _binary_signature(before) != _binary_signature(info)):
+        raise ValueError('codex_binary_unsafe')
+    return {'path': str(binary), 'sha256': sha256_bytes(raw),
+            'signature': _binary_signature(info)}
+
+
+def _review_route(model: Optional[str], effort: Optional[str]) -> None:
+    if model is None and effort is None:
+        return
+    if (not isinstance(model, str) or len(model) > 120
+            or re.fullmatch(r'[A-Za-z0-9._-]+', model, flags=re.ASCII) is None
+            or effort not in {'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}):
+        raise ValueError('review_routing_invalid')
+
+
+def _read_preflight_responses(proc: Any, expected: set[int]) -> Dict[int, Any]:
+    """Bound bytes and time even for partial lines; avoid TextIO read-ahead."""
+    result: Dict[int, Any] = {}
+    pending = b''
+    used = 0
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline and set(result) != expected:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+        if not ready:
+            continue
+        data = os.read(proc.stdout.fileno(), 8192)
+        if not data:
+            break
+        used += len(data)
+        if used > PREFLIGHT_MAX_BYTES:
+            raise ValueError('codex_preflight_too_large')
+        pending += data
+        while b'\n' in pending:
+            line, pending = pending.split(b'\n', 1)
+            try:
+                message = json.loads(line)
+            except (ValueError, UnicodeError):
+                raise ValueError('codex_preflight_invalid_json') from None
+            if not isinstance(message, dict):
+                raise ValueError('codex_preflight_invalid_response')
+            ident = message.get('id')
+            if isinstance(ident, int) and not isinstance(ident, bool) and ident in expected:
+                if ident in result:
+                    raise ValueError('codex_preflight_duplicate_response')
+                result[ident] = message
+    if set(result) != expected or any(x.get('error') for x in result.values()):
+        raise ValueError('codex_preflight_incomplete')
+    return result
+
+
+def _billing_reason(account: Any, rates: Any) -> Optional[str]:
+    if not isinstance(account, dict) or account.get('type') != 'chatgpt':
+        return 'subscription_account_required'
+    if not isinstance(rates, dict):
+        return 'subscription_evidence_unknown'
+    buckets = rates.get('rateLimitsByLimitId')
+    legacy = rates.get('rateLimits')
+    current = buckets.get('codex') if isinstance(buckets, dict) else None
+    current = current if isinstance(current, dict) else legacy
+    if not isinstance(current, dict):
+        return 'subscription_evidence_unknown'
+    credits = current.get('credits')
+    if not isinstance(credits, dict) or not isinstance(credits.get('hasCredits'), bool):
+        return 'subscription_credit_evidence_unknown'
+    if credits['hasCredits']:
+        return 'purchased_credits_disallowed'
+    if 'rateLimitReachedType' not in current:
+        return 'subscription_evidence_unknown'
+    if current['rateLimitReachedType'] is not None or rates.get('ordinaryUsageAllowed') is False:
+        return 'subscription_rate_limit_reached'
+    if rates.get('ordinaryUsageAllowed') is not True:
+        primary = current.get('primary')
+        used = primary.get('usedPercent') if isinstance(primary, dict) else None
+        if not isinstance(used, (int, float)) or isinstance(used, bool) or not 0 <= used < 100:
+            return 'subscription_evidence_unknown'
+    return None
+
+
+def subscription_preflight(
+    root: Path, *, model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> Dict[str, Any]:
+    proc = None
+    try:
+        _review_route(model, reasoning_effort)
+        binary = resolve_codex_binary()
+        identity = _binary_info(binary)
+        forbidden = [name for name in (
+            'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY',
+        ) if os.environ.get(name)]
+        if forbidden:
+            return {'status': 'BLOCKED', 'reason': 'forbidden_provider_env', 'present': forbidden}
+        version = subprocess.run(
+            [str(binary), '--version'], env=safe_env(), capture_output=True,
+            text=True, timeout=5, check=False,
+        )
+        if version.returncode or re.fullmatch(r'codex-cli [A-Za-z0-9.+_-]{1,100}', version.stdout.strip()) is None:
+            raise ValueError('codex_version_unsupported')
+        identity['version'] = version.stdout.strip()
+        proc = subprocess.Popen(
+            [str(binary), '--disable', 'hooks', '--disable', 'plugins', 'app-server', '--stdio'],
+            cwd=str(root), env=safe_env(), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
+        def send(message: Dict[str, Any]) -> None:
+            proc.stdin.write((json.dumps(message, separators=(',', ':')) + '\n').encode())
+            proc.stdin.flush()
+        send({'method': 'initialize', 'id': 0, 'params': {'clientInfo': {'name': 'orch', 'version': '0.1.0'}}})
+        send({'method': 'initialized', 'params': {}})
+        send({'method': 'account/read', 'id': 1, 'params': {'refreshToken': False}})
+        send({'method': 'account/rateLimits/read', 'id': 2, 'params': {}})
+        expected = {0, 1, 2}
+        if model is not None:
+            send({'method': 'model/list', 'id': 3, 'params': {'limit': 100, 'includeHidden': True}})
+            expected.add(3)
+        replies = _read_preflight_responses(proc, expected)
+        account_result = replies[1].get('result')
+        reason = _billing_reason(
+            account_result.get('account') if isinstance(account_result, dict) else None,
+            replies[2].get('result'),
+        )
+        if reason:
+            return {'status': 'BLOCKED', 'reason': reason, 'binary': identity}
+        if model is not None:
+            catalog = replies[3].get('result', {}).get('data', [])
+            matching = [m for m in catalog if isinstance(m, dict) and m.get('model') == model]
+            if (len(matching) != 1 or reasoning_effort not in {
+                    e.get('reasoningEffort') for e in matching[0].get('supportedReasoningEfforts', [])
+                    if isinstance(e, dict)}):
+                return {'status': 'BLOCKED', 'reason': 'review_routing_unsupported', 'binary': identity}
+        if _binary_signature(binary.lstat()) != identity['signature']:
+            raise ValueError('codex_binary_changed')
+        return {'status': 'PASS', 'checked_at_utc': utc_now(), 'account_type': 'chatgpt',
+                'binary': identity, 'routing': {'model': model, 'reasoning_effort': reasoning_effort},
+                'routing_observation': 'catalog_verified' if model else 'not_requested'}
+    except ValueError as exc:
+        return {'status': 'BLOCKED', 'reason': str(exc)}
+    except (OSError, subprocess.SubprocessError, TypeError, AttributeError):
+        return {'status': 'BLOCKED', 'reason': 'codex_preflight_failed'}
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    return {'status': 'BLOCKED', 'reason': 'codex_preflight_cleanup_unknown'}
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 def _copy_bound_review_file(
@@ -606,7 +752,12 @@ def run_review(
     run_id: str,
     *,
     execute: bool = False,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if model is None or reasoning_effort is None:
+        return {'status': 'BLOCKED', 'reason': 'review_routing_required'}
+    _review_route(model, reasoning_effort)
     prepared = prepare_review(orch, run_id)
     _read_prepared_review_artifact(
         Path(prepared["schema"]),
@@ -625,12 +776,25 @@ def run_review(
     except UnicodeDecodeError as exc:
         raise ValueError("review_prompt_invalid_utf8") from exc
 
-    preflight = subscription_preflight(orch.root)
+    preflight = subscription_preflight(
+        orch.root, model=model, reasoning_effort=reasoning_effort,
+    )
+    if preflight.get('status') != 'PASS':
+        return {'status': 'BLOCKED', 'preflight': preflight}
+    identity = preflight.get('binary')
+    if (not isinstance(identity, dict) or not isinstance(identity.get('path'), str)
+            or preflight.get('routing') != {'model': model, 'reasoning_effort': reasoning_effort}):
+        return {'status': 'BLOCKED', 'reason': 'review_preflight_binding_missing'}
+    binary = Path(identity['path'])
+    if _binary_info(binary) != {key: identity[key] for key in ('path', 'sha256', 'signature')}:
+        return {'status': 'BLOCKED', 'reason': 'codex_binary_changed'}
     report = Path(prepared["report"])
     cmd = [
-        str(CODEX_BIN), "--disable", "hooks", "exec",
+        str(binary), "--disable", "hooks", "--disable", "plugins", "-a", "never", "exec",
         "--ignore-user-config", "--sandbox", "read-only",
         "--skip-git-repo-check", "--json",
+        "--model", model, "-c", f'model_reasoning_effort="{reasoning_effort}"',
+        "-c", 'model_provider="openai"',
         "--output-schema", prepared["schema"],
         "-o", str(report), "-C", prepared["workspace"], "-",
     ]
@@ -641,8 +805,6 @@ def run_review(
             "command": cmd,
             "prepared": prepared,
         }
-    if preflight.get("status") != "PASS":
-        return {"status": "BLOCKED", "preflight": preflight}
     if report.exists() or report.is_symlink():
         raise ValueError("review_report_preexisting")
 
@@ -712,4 +874,6 @@ def run_review(
         "events": str(events),
         "events_bytes": events_meta["bytes"],
         "imported": imported,
+        "routing": preflight['routing'],
+        "routing_observation": 'explicit_command_and_catalog',
     }

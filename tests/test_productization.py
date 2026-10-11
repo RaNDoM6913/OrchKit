@@ -359,7 +359,7 @@ class ProductizationTests(unittest.TestCase):
         configure_home(self.home, profile="safe")
         record_rdc(self.home, device_id="fixture-device", device_name="Fixture Mac")
         missing_codex = self.base / "missing-codex"
-        with mock.patch("orch.doctor.CODEX_BIN", missing_codex):
+        with mock.patch("orch.doctor.resolve_codex_binary", side_effect=ValueError("codex_binary_missing")):
             result = run_doctor(self.home, check_codex=False)
         self.assertEqual(result["status"], "READY")
         codex = next(
