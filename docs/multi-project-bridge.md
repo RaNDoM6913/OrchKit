@@ -577,17 +577,69 @@ not a `WorkerFileOperations.patch` implementation or a Bridge endpoint:
   never converts `UNKNOWN` to success or retries a mutation. It has no durable
   operation journal and performs no file creation, rename, deletion or write.
 
-**Gate before real application:** define a separately versioned or explicitly
-compatible bounded patch/replacement input, binding the exact original and
-result bytes to durable run-scoped operation IDs and request fingerprints.
-Reject conflicting duplicate IDs. Recheck live authority, descriptor-anchored
+### Durable local patch intent and independent observation
+
+`FilePatchReplacement` v1 carries a `FilePatchBaseline` and immutable replacement
+bytes up to 65,536 bytes to trusted local code. Its metadata contains only
+original/result hashes, sizes and companion version. Equal descriptions are
+refused because a content observation could not distinguish them. Request v1
+is unchanged; the original patch request, including output limit and complete
+run binding, participates in its canonical fingerprint.
+
+`LocalFilePatchIntentService.prepare` requires fresh existing session/capability
+authority before looking up a run-scoped operation ID. An identical recorded
+fingerprint returns `EXISTING` before baseline preflight, including after the
+target becomes replacement or unrelated content. A changed fingerprint returns
+`CONFLICT`. New intents use the existing two-observation original preflight and
+renew authority/file scope at the publication gate. Internal observations have
+a separate 65,536-byte ceiling and return no file bytes.
+
+`OperationIntentJournal` stores only strict metadata beneath
+`.runtime/operation_journal`. Hashed identifiers avoid treating lexical IDs as
+filesystem paths. Runtime/journal/run anchors must be private and are walked
+with descriptor-relative no-follow operations; inspection never repairs modes.
+Records are owner-private single-link regular files, bounded to 8,192 bytes.
+There are at most 64 records per run and 1,024 in a complete inventory, without
+automatic eviction. Existing home-directory modes are not changed.
+
+Publication fsyncs an owned exclusive temporary file before atomic no-replace
+linking, removes only that owned temporary alias, and strictly fsyncs containing
+directories before acknowledging `CREATED`. A bounded advisory directory lock
+serializes participating creators and capacity checks; busy acquisition is
+`UNKNOWN`, not a retry instruction. Failures after publication preserve final
+evidence and uncertain durability. Crash aliases, unsafe entries, malformed
+records and changed census evidence are not silently cleaned or treated as
+absence. Same-user adversaries and filesystem durability limits remain outside
+an OS fence.
+
+Preparation results `CREATED`, `EXISTING`, `CONFLICT`, `REFUSED` and `UNKNOWN`
+are distinct from worker-operation success. The immutable persisted state is
+`INTENT_RECORDED`; no applied/completed state or apply token exists.
+`observe` uses two fresh authorized reads and reports `ORIGINAL_MATCH`,
+`REPLACEMENT_MATCH`, `OTHER_CONTENT` or `UNAVAILABLE` only. Replacement content
+may have been written by another actor; no author attribution or execution
+success follows from a matching digest. No response permits automatic replay,
+and a restored session still needs current native authority.
+
+The historical `orch bridge operation inspect --run-id RUN --operation-id OP`
+view returns validated metadata without capability access or state creation.
+Global/project recovery surfaces terminal and orphaned journal evidence, as
+well as unsafe or mismatched records. It does not release writers or invent a
+worker outcome. Backup/verify/restore preserve the exact journal bytes and
+reject incomplete or changing inclusion; existing active-run backup refusal
+remains. Old homes without journal records retain legacy behavior, and ordinary
+evidence retention leaves journal records intact. Payload bytes are unavailable
+from the journal and cannot be replayed after restart.
+
+**Remaining gate before real application:** recheck live authority, descriptor-anchored
 parents/leaf and original bytes at apply; specify hardlink, mode and replacement
 identity behavior. Establish data/journal/directory durability and restart
 reconciliation for failures before/after publication, including independent
 readback for lost responses and `UNKNOWN`. An atomic rename alone does not
 establish compare-and-swap against another same-user writer or crash recovery.
-Prove each claimed guarantee in disposable fault/race fixtures before adding
-mutation. The native verifier still checks actual resulting bytes/scope and
+The intent journal has no workspace publication protocol or automatic recovery
+action. Prove each additional mutator guarantee in disposable fault/race fixtures
+before adding mutation. The native verifier still checks actual resulting bytes/scope and
 registered commands after normal submission/quiescence; this preflight cannot
 replace that verification or authorize Git publication.
 

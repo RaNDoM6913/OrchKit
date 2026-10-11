@@ -213,6 +213,43 @@ uncertain outcomes; it cannot consume this success as an apply token. Positive,
 limit, mismatch, revocation, race and compatibility tests use disposable real
 ledger/session/capability fixtures. Verifier and publisher remain independent.
 
+**P1-C2 — sixth bounded package (durable patch intent and readback):**
+`orch/bridge_patch_intent.py` adds a versioned, bounded local replacement
+companion and a trusted `LocalFilePatchIntentService`. It accepts `file.patch`
+metadata without changing request v1 or implementing the patch adapter.
+Preparation checks fresh run/session/capability authority, then looks up a
+durable ID before preflighting a new original. Identical duplicates remain
+`EXISTING` when target bytes later change; conflicting fingerprints refuse.
+Only a new intent performs the existing original-content preflight and a final
+live authority/scope check before publication.
+
+`orch/bridge_operation_journal.py` stores immutable `INTENT_RECORDED` metadata
+under the private runtime. Hashed run/operation storage names, strict bounded
+records and descriptor-relative no-follow checks protect lookup and publication.
+An owned temporary file is fsynced, published without replacement, unlinked from
+its temporary alias, and followed by directory fsync. Participating creators
+use a bounded advisory directory lock; contention or uncertain publication
+returns `UNKNOWN`, never automatic replay. Final records are preserved after
+publication failure. Payload bytes and capabilities are not stored. Unsafe or
+incomplete evidence remains visible rather than being silently repaired.
+
+The service independently observes a recorded target twice through renewed
+existing file-read authority. `ORIGINAL_MATCH`, `REPLACEMENT_MATCH`,
+`OTHER_CONTENT` and `UNAVAILABLE` describe content only; none proves that this
+executor applied a patch, completes a run, or permits a retry. Equal original
+and replacement descriptions are rejected. Historical operator inspection is
+available through `orch bridge operation inspect`; it neither opens a live
+session nor creates or repairs state.
+
+Backup selection, archive verification and restore preserve exact journal
+records. Initial/final bounded census checks refuse changed or incomplete
+coverage; the existing active-run backup prohibition remains. Retention does
+not prune these records as ordinary log evidence. Read-only recovery surfaces
+live, terminal, orphaned and invalid intent evidence while preserving writer,
+capability, native verification and Git publication authority. Existing homes
+without a journal retain their previous behavior. These are local trusted APIs,
+not a daemon/transport, workspace mutator, exactly-once executor or OS sandbox.
+
 **Still not implemented:** mutating `file.patch`/write adapters, external content
 transport, owned processes, journal/idempotency, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any

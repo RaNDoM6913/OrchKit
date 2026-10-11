@@ -59,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     overview.add_argument("--project")
 
+    bridge = sub.add_parser("bridge", help="inspect local worker-operation records")
+    bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
+    operation = bridge_sub.add_parser("operation")
+    operation_sub = operation.add_subparsers(dest="operation_command", required=True)
+    operation_inspect = operation_sub.add_parser("inspect")
+    operation_inspect.add_argument("--run-id", required=True)
+    operation_inspect.add_argument("--operation-id", required=True)
+
     rdc = sub.add_parser("rdc", help="record or inspect ChatGPT-to-RDC device binding")
     rdc_sub = rdc.add_subparsers(dest="rdc_command", required=True)
     rdc_record = rdc_sub.add_parser("record")
@@ -237,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _command_requires_existing_ledger(args: argparse.Namespace) -> bool:
     if args.command in {
         "setup", "doctor", "overview", "rdc", "dispatcher", "git",
-        "codex-preflight", "project", "init",
+        "codex-preflight", "project", "init", "bridge",
     }:
         return False
     if (
@@ -322,6 +330,14 @@ def main(argv=None) -> int:
             result = run_doctor(root, check_codex=not args.skip_codex)
         elif args.command == "overview":
             result = operator_overview(root, project_id=args.project)
+        elif args.command == "bridge":
+            from .bridge_operation_journal import OperationIntentJournal
+            try:
+                journal = OperationIntentJournal(root)
+            except (OSError, TypeError, ValueError):
+                result = {"status": "UNKNOWN", "error_code": "journal_home_unavailable"}
+            else:
+                result = journal.inspect(args.run_id, args.operation_id)
         elif args.command == "rdc":
             if args.rdc_command == "record":
                 result = record_rdc(root, device_id=args.device_id, device_name=args.device_name)

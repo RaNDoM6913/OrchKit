@@ -31,6 +31,416 @@ class StateMaintenanceTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _journal_fixture(self, *, binding=None, operation_id="state-intent", home=None):
+        from orch.bridge_operation_journal import build_intent_record
+        from orch.worker_operations import WorkerOperationRequest, WorkerRunBinding
+
+        home = (home or self.orch.root).resolve()
+        binding = binding or WorkerRunBinding(
+            project_id="journal-project", writer_key="journal-writer",
+            task_id="JOURNAL-TASK", run_id="JOURNAL-ORPHAN", attempt=1,
+        )
+        request = WorkerOperationRequest(
+            binding=binding, operation_id=operation_id, kind="file.patch",
+            target="result.json",
+        )
+        record = build_intent_record(request, {
+            "schema_version": 1,
+            "baseline": {"sha256": hashlib.sha256(b"before\n").hexdigest(),
+                         "size_bytes": 7},
+            "sha256": hashlib.sha256(b"after\n").hexdigest(), "size_bytes": 6,
+        })
+        journal = home / ".runtime" / "operation_journal"
+        run_dir = journal / hashlib.sha256(binding.run_id.encode()).hexdigest()
+        run_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(journal, 0o700)
+        os.chmod(run_dir, 0o700)
+        path = run_dir / (hashlib.sha256(operation_id.encode()).hexdigest() + ".json")
+        raw = (json.dumps(record, sort_keys=True, indent=2) + "\n").encode()
+        path.write_bytes(raw)
+        os.chmod(path, 0o600)
+        return path, raw, record
+
+    def _journal_binding_for_run(self, run_id):
+        from orch.worker_operations import WorkerRunBinding
+
+        with self.orch.connect() as conn:
+            row = conn.execute(
+                "SELECT r.run_id,r.task_id,r.attempt,t.project_id,t.writer_key "
+                "FROM runs r JOIN tasks t ON r.task_id=t.task_id WHERE r.run_id=?",
+                (run_id,),
+            ).fetchone()
+        return WorkerRunBinding(**dict(row))
+
+    def _rewrite_backup(self, source, target, transform):
+        with zipfile.ZipFile(source) as bundle:
+            members = {info.filename: (info, bundle.read(info.filename))
+                       for info in bundle.infolist()}
+        transform(members)
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for info, raw in members.values():
+                bundle.writestr(info, raw)
+
+    def _journal_archive_fixture(self):
+        source = Path(backup_state(self.orch)["path"])
+        path, raw, record = self._journal_fixture()
+        name = "files/" + path.relative_to(self.orch.root).as_posix()
+        target = Path(self.tmp.name) / "imported-journal.zip"
+
+        def add_journal(members):
+            info = zipfile.ZipInfo(name)
+            info.external_attr = 0o100600 << 16
+            members[name] = (info, raw)
+            info, data = members["state/manifest.json"]
+            manifest = json.loads(data)
+            manifest["file_evidence"][name] = {
+                "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            }
+            members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+        self._rewrite_backup(source, target, add_journal)
+        return target, path, raw, record
+
+    def test_operation_journal_backup_verify_restore_preserves_exact_bytes(self):
+        path, raw, _ = self._journal_fixture()
+        relative = path.relative_to(self.orch.root).as_posix()
+        output = Path(self.tmp.name) / "journal-backup.zip"
+        result = backup_state(self.orch, output)
+        with zipfile.ZipFile(output) as bundle:
+            self.assertIn("files/" + relative, bundle.namelist())
+            self.assertEqual(bundle.read("files/" + relative), raw)
+        self.assertEqual(result["manifest"]["file_evidence"]["files/" + relative], {
+            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+        })
+        verified = verify_backup_archive(output)
+        self.assertEqual(verified["status"], "VERIFIED", verified)
+        destination = Path(self.tmp.name) / "journal-restored"
+        restore_backup_archive(output, destination)
+        restored = destination / relative
+        self.assertEqual(restored.read_bytes(), raw)
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(restored.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(recovery_inspect(Orchestrator(destination))["status"], "ATTENTION")
+
+    def test_operation_journal_backup_fails_closed_on_unsafe_or_incomplete_census(self):
+        for defect in ("malformed", "duplicate-key", "symlink", "fifo", "hardlink",
+                       "record-mode", "directory-mode", "foreign-entry", "run-name"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                orch = Orchestrator(home)
+                path, raw, _ = self._journal_fixture(home=home)
+                if defect == "malformed":
+                    path.write_bytes(b'{"schema_version":1}\n')
+                elif defect == "duplicate-key":
+                    path.write_bytes(raw.replace(b'{', b'{"schema_version":99,', 1))
+                elif defect == "symlink":
+                    external = Path(tmp) / "foreign.json"
+                    external.write_bytes(raw)
+                    path.unlink()
+                    path.symlink_to(external)
+                elif defect == "fifo":
+                    path.unlink()
+                    os.mkfifo(path, 0o600)
+                elif defect == "hardlink":
+                    os.link(path, Path(tmp) / "alias.json")
+                elif defect == "record-mode":
+                    os.chmod(path, 0o644)
+                elif defect == "directory-mode":
+                    os.chmod(path.parent, 0o755)
+                elif defect == "foreign-entry":
+                    (path.parent / "crash.tmp").write_bytes(b"unacknowledged")
+                else:
+                    path.parent.rename(path.parent.with_name("unsafe-run"))
+                output = Path(tmp) / "blocked.zip"
+                with self.assertRaisesRegex(ValueError, "operation_journal"):
+                    backup_state(orch, output)
+                self.assertFalse(output.exists())
+
+    def test_operation_journal_backup_refuses_symlinked_journal_anchor(self):
+        journal = self.orch.runtime / "operation_journal"
+        external = Path(self.tmp.name) / "external-journal"
+        external.mkdir()
+        journal.symlink_to(external, target_is_directory=True)
+        output = Path(self.tmp.name) / "blocked-anchor.zip"
+        with self.assertRaisesRegex(ValueError, "operation_journal"):
+            backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_operation_journal_backup_refuses_missing_selected_record(self):
+        path, _, _ = self._journal_fixture()
+        original = state_module._backup_members
+        output = Path(self.tmp.name) / "missing-journal.zip"
+        with mock.patch.object(state_module, "_backup_members", side_effect=lambda orch: [
+            member for member in original(orch) if member != path
+        ]):
+            with self.assertRaisesRegex(ValueError, "backup_operation_journal_coverage_mismatch"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_operation_journal_backup_detects_absent_to_present_race(self):
+        original = state_module._backup_members
+        output = Path(self.tmp.name) / "appearing-journal.zip"
+
+        def appear_after_selection(orch):
+            selected = original(orch)
+            self._journal_fixture()
+            return selected
+
+        with mock.patch.object(state_module, "_backup_members", side_effect=appear_after_selection):
+            with self.assertRaisesRegex(ValueError, "operation_journal"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+        self.assertTrue((self.orch.runtime / "operation_journal").is_dir())
+
+    def test_operation_journal_backup_detects_changed_bytes_after_streaming(self):
+        path, _, _ = self._journal_fixture()
+        original = state_module._stream_backup_member
+        output = Path(self.tmp.name) / "changed-journal.zip"
+
+        def mutate_after_stream(archive, orch, member):
+            result = original(archive, orch, member)
+            if member == path:
+                record = json.loads(path.read_text())
+                record["created_at"] = "2026-01-02T00:00:00.000000Z"
+                path.write_text(json.dumps(record) + "\n")
+            return result
+
+        with mock.patch.object(state_module, "_stream_backup_member", side_effect=mutate_after_stream):
+            with self.assertRaisesRegex(ValueError, "backup_operation_journal_changed_during_backup"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_operation_journal_backup_detects_empty_run_directory_race(self):
+        self._journal_fixture()
+        original = state_module._backup_members
+        output = Path(self.tmp.name) / "directory-race.zip"
+
+        def add_run_after_selection(orch):
+            selected = original(orch)
+            (orch.runtime / "operation_journal" / ("e" * 64)).mkdir(mode=0o700)
+            return selected
+
+        with mock.patch.object(state_module, "_backup_members", side_effect=add_run_after_selection):
+            with self.assertRaisesRegex(ValueError, "operation_journal"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_operation_journal_archive_verifier_requires_hash_coverage(self):
+        source, _, _, _ = self._journal_archive_fixture()
+        target = Path(self.tmp.name) / "unbound-journal.zip"
+
+        def remove_file_evidence(members):
+            info, raw = members["state/manifest.json"]
+            manifest = json.loads(raw)
+            manifest.pop("file_evidence")
+            members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+        self._rewrite_backup(source, target, remove_file_evidence)
+        result = verify_backup_archive(target)
+        self.assertEqual(result["status"], "BLOCKED", result)
+        self.assertIn("backup_operation_journal_evidence_missing", result["errors"])
+        with self.assertRaisesRegex(ValueError, "backup_not_verified"):
+            restore_backup_archive(target, Path(self.tmp.name) / "unbound-restore")
+
+    def test_operation_journal_archive_verifier_rejects_semantic_corruption_with_rehashed_evidence(self):
+        source, path, _, _ = self._journal_archive_fixture()
+        name = "files/" + path.relative_to(self.orch.root).as_posix()
+        target = Path(self.tmp.name) / "corrupt-journal.zip"
+
+        def corrupt_and_rehash(members):
+            info, raw = members[name]
+            record = json.loads(raw)
+            record["request"]["binding"]["run_id"] = "OTHER-RUN"
+            data = json.dumps(record).encode()
+            members[name] = (info, data)
+            info, raw = members["state/manifest.json"]
+            manifest = json.loads(raw)
+            manifest["file_evidence"][name] = {
+                "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+            }
+            members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+        self._rewrite_backup(source, target, corrupt_and_rehash)
+        result = verify_backup_archive(target)
+        self.assertEqual(result["status"], "BLOCKED", result)
+        self.assertIn("backup_operation_journal_invalid", result["errors"])
+
+    def test_operation_journal_archive_verifier_refuses_unhashed_nested_member(self):
+        source = Path(backup_state(self.orch)["path"])
+        target = Path(self.tmp.name) / "unsafe-journal-path.zip"
+        self._rewrite_backup(source, target, lambda members: members.update({
+            "foreign": (zipfile.ZipInfo("files/.runtime/operation_journal/foreign.json"), b"{}"),
+        }))
+        result = verify_backup_archive(target)
+        self.assertEqual(result["status"], "BLOCKED", result)
+        self.assertIn("backup_member_not_restorable", result["errors"])
+
+    def test_operation_journal_archive_verifier_refuses_duplicate_oversized_and_wrong_path_records(self):
+        source, path, raw, _ = self._journal_archive_fixture()
+        name = "files/" + path.relative_to(self.orch.root).as_posix()
+        for defect in ("duplicate-key", "oversized", "wrong-path", "fifo", "nested-json"):
+            with self.subTest(defect=defect):
+                target = Path(self.tmp.name) / (defect + "-journal.zip")
+
+                def corrupt(members):
+                    info, data = members.pop(name)
+                    new_name = name
+                    if defect == "duplicate-key":
+                        data = raw.replace(b'{', b'{"schema_version":99,', 1)
+                    elif defect == "oversized":
+                        data = raw + b" " * 8192
+                    elif defect == "wrong-path":
+                        new_name = str(Path(name).with_name("f" * 64 + ".json"))
+                        info.filename = new_name
+                    elif defect == "nested-json":
+                        data = b"[" * 1500 + b"0" + b"]" * 1500
+                    else:
+                        info.external_attr = (0o010600 << 16)
+                    members[new_name] = (info, data)
+                    info, data_manifest = members["state/manifest.json"]
+                    manifest = json.loads(data_manifest)
+                    manifest["file_evidence"].pop(name)
+                    manifest["file_evidence"][new_name] = {
+                        "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+                    }
+                    members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+                self._rewrite_backup(source, target, corrupt)
+                result = verify_backup_archive(target)
+                self.assertEqual(result["status"], "BLOCKED", result)
+                self.assertIn("backup_operation_journal_invalid", result["errors"])
+
+    def test_operation_journal_archive_verifier_refuses_missing_bound_member(self):
+        source, path, _, _ = self._journal_archive_fixture()
+        name = "files/" + path.relative_to(self.orch.root).as_posix()
+        target = Path(self.tmp.name) / "omitted-journal.zip"
+        self._rewrite_backup(source, target, lambda members: members.pop(name))
+        result = verify_backup_archive(target)
+        self.assertEqual(result["status"], "BLOCKED", result)
+        self.assertIn("backup_file_evidence_members_mismatch", result["errors"])
+
+    def test_operation_journal_retention_preserves_terminal_intent(self):
+        self._load_recovery_task("JOURNAL-RETENTION")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = self._journal_binding_for_run(claim["run_id"])
+        log = self.orch.runtime / "logs" / (claim["run_id"] + "-scope.json")
+        log.write_text('{"old":true}\n')
+        path, raw, _ = self._journal_fixture(binding=binding)
+        result = prune_retention(self.orch, max_evidence_bytes=0, keep_recent_runs=0,
+                                 keep_backups=1, max_backup_bytes=0)
+        self.assertEqual(result["pruned"]["run_count"], 1)
+        self.assertFalse(log.exists())
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_operation_journal_recovery_surfaces_terminal_and_orphan_without_authority(self):
+        self._load_recovery_task("JOURNAL-TERMINAL")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = self._journal_binding_for_run(claim["run_id"])
+        terminal, raw, _ = self._journal_fixture(binding=binding)
+        self._journal_fixture(operation_id="orphan-intent")
+        with self.orch.connect() as conn:
+            before = [tuple(row) for row in conn.execute("SELECT * FROM runs ORDER BY run_id")]
+        with mock.patch.object(self.orch, "lease_from_capability", side_effect=AssertionError("authority read")):
+            result = recovery_inspect(self.orch)
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["items"], [])
+        records = result["operation_journal"]["records"]
+        self.assertEqual({item["classification"] for item in records}, {
+            "TERMINAL_RUN_INTENT", "ORPHAN_INTENT",
+        })
+        bound = next(item for item in records if item["run_id"] == claim["run_id"])
+        self.assertEqual(bound["run_state"], "ABORTED")
+        self.assertTrue(bound["ledger_binding_matches"])
+        self.assertNotIn("lease_token", json.dumps(result))
+        self.assertNotIn("safe_next_steps", result["operation_journal"])
+        self.assertEqual(terminal.read_bytes(), raw)
+        self.assertFalse(Path(claim["capability_file"]).exists())
+        with self.orch.connect() as conn:
+            after = [tuple(row) for row in conn.execute("SELECT * FROM runs ORDER BY run_id")]
+        self.assertEqual(after, before)
+
+    def test_operation_journal_recovery_filters_projects_and_uses_real_ledger_binding(self):
+        self._load_recovery_task("JOURNAL-FILTER")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = self._journal_binding_for_run(claim["run_id"])
+        self._journal_fixture(binding=binding)
+        self._journal_fixture(operation_id="orphan-other-project")
+        result = recovery_inspect(self.orch, project_id="recovery-project")
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual([item["run_id"] for item in result["operation_journal"]["records"]], [claim["run_id"]])
+        other = recovery_inspect(self.orch, project_id="unrelated-project")
+        self.assertEqual(other["status"], "CLEAN")
+        self.assertEqual(other["operation_journal"]["records"], [])
+
+    def test_operation_journal_recovery_flags_ledger_binding_mismatch_in_ledger_project(self):
+        import dataclasses
+
+        self._load_recovery_task("JOURNAL-MISMATCH")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = dataclasses.replace(self._journal_binding_for_run(claim["run_id"]),
+                                      project_id="forged-project", attempt=2)
+        self._journal_fixture(binding=binding)
+        result = recovery_inspect(self.orch, project_id="recovery-project")
+        self.assertIn("operation_journal", result)
+        item = result["operation_journal"]["records"][0]
+        self.assertEqual(item["classification"], "BINDING_MISMATCH")
+        self.assertFalse(item["ledger_binding_matches"])
+        self.assertEqual(item["project_id"], "recovery-project")
+        self.assertEqual(result["status"], "ATTENTION")
+
+    def test_operation_journal_recovery_invalid_evidence_is_visible_and_read_only(self):
+        path, _, _ = self._journal_fixture()
+        path.write_bytes(b'{"private":"must-not-leak"}')
+        before = path.stat()
+        result = recovery_inspect(self.orch, project_id="unrelated-project")
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["operation_journal"]["inventory_status"], "UNKNOWN")
+        self.assertEqual(result["operation_journal"]["records"], [])
+        self.assertNotIn("must-not-leak", json.dumps(result))
+        self.assertEqual(path.read_bytes(), b'{"private":"must-not-leak"}')
+        after = path.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns, before.st_mode),
+                         (after.st_ino, after.st_mtime_ns, after.st_mode))
+
+    def test_operation_journal_recovery_run_filter_preserves_writer_reservation(self):
+        self._load_recovery_task("JOURNAL-LIVE")
+        claim = self.orch.claim("fixture")
+        self._journal_fixture(binding=self._journal_binding_for_run(claim["run_id"]))
+        self._journal_fixture(operation_id="another-run")
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        self.assertIn("operation_journal", result)
+        records = result["operation_journal"]["records"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["classification"], "LIVE_RUN_INTENT")
+        self.assertEqual(result["items"][0]["classification"], "WORKER_MAY_STILL_BE_ACTIVE")
+        self.assertTrue(Path(claim["capability_file"]).is_file())
+        with self.orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT state FROM runs WHERE run_id=?",
+                                          (claim["run_id"],)).fetchone()[0], "RUNNING")
+
+    def test_operation_journal_recovery_symlink_anchor_is_unknown_without_foreign_reads(self):
+        external = Path(self.tmp.name) / "external-intents"
+        external.mkdir()
+        foreign = external / "foreign.json"
+        foreign.write_bytes(b"private-foreign-data")
+        (self.orch.runtime / "operation_journal").symlink_to(external, target_is_directory=True)
+        result = recovery_inspect(self.orch)
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["operation_journal"]["inventory_status"], "UNKNOWN")
+        self.assertNotIn("private-foreign-data", json.dumps(result))
+        self.assertEqual(foreign.read_bytes(), b"private-foreign-data")
+
+    def test_operation_journal_absence_preserves_legacy_recovery_output(self):
+        result = recovery_inspect(self.orch)
+        self.assertEqual(result["status"], "CLEAN")
+        self.assertNotIn("operation_journal", result)
+        self.assertFalse((self.orch.runtime / "operation_journal").exists())
+
     def test_fresh_state_has_schema_version_and_integrity(self):
         result = check_state(self.orch)
         self.assertEqual(result["status"], "READY")
