@@ -541,6 +541,56 @@ multi-device/hosted extensions remain separately gated.
   limitations remain. Separate list-only permissions or a broader portable
   path grammar would require another explicitly scoped contract change.
 
+### P1-C2 — local original-content patch preflight (fifth package)
+
+`orch/bridge_patch_preflight.py` adds a **trusted local, non-mutating helper**,
+not a `WorkerFileOperations.patch` implementation or a Bridge endpoint:
+
+- Construct `FilePatchBaseline(sha256, size_bytes)` with a canonical lowercase
+  64-character SHA-256 and an integer byte length from 0 through 65,536; bools,
+  malformed digests and out-of-range lengths are rejected. This local companion
+  input does not extend `WorkerOperationRequest v1` or supply credentials.
+- `LocalFilePatchPreflight(scope).check(request, baseline)` accepts only the
+  existing `file.read` request. Actual `file.patch`, list and process requests
+  are refused before filesystem access. No patch bytes, output-file digest,
+  writable fd, approved pathname or application token is accepted/returned.
+- The unchanged `LocalBoundedFileReader` obtains the original under P1-C1 live
+  session/run/capability and P1-C2 descriptor/allowlist authority. Compare the
+  complete byte length and SHA-256, then perform a second independent bounded
+  read through the same live scope. Only identical observations can succeed.
+  Each read retains at most the request's 1–65,536-byte ceiling and uses at
+  most one extra sentinel byte; preflight retains at most two complete bounded
+  observations, rather than an unbounded source or patch payload.
+- A successful v1 `WorkerOperationOutcome` contains **empty output**; refusal
+  and I/O failure also contain no original/partial bytes or raw OS exception.
+  The operation ID correlates this observation only. Repeating an ID, even
+  with different baseline/target metadata, recomputes the authorized read; no
+  durable replay cache, mutation idempotency or ID-conflict guarantee exists.
+- The second read renews authority after digest comparison and detects common
+  file changes/revocation between observations. Success remains point-in-time:
+  same-user races, hardlinks, changes after final readback and replacement by
+  an equal-content object between complete observations are not fenced. No
+  object identity is durably bound for later application. The existing scope
+  is not thread-safe and an already-open fd is not retroactively revoked.
+- Restart or lost observation requires a new live session and fresh preflight;
+  it does not imply that an unrelated uncertain mutation failed. The helper
+  never converts `UNKNOWN` to success or retries a mutation. It has no durable
+  operation journal and performs no file creation, rename, deletion or write.
+
+**Gate before real application:** define a separately versioned or explicitly
+compatible bounded patch/replacement input, binding the exact original and
+result bytes to durable run-scoped operation IDs and request fingerprints.
+Reject conflicting duplicate IDs. Recheck live authority, descriptor-anchored
+parents/leaf and original bytes at apply; specify hardlink, mode and replacement
+identity behavior. Establish data/journal/directory durability and restart
+reconciliation for failures before/after publication, including independent
+readback for lost responses and `UNKNOWN`. An atomic rename alone does not
+establish compare-and-swap against another same-user writer or crash recovery.
+Prove each claimed guarantee in disposable fault/race fixtures before adding
+mutation. The native verifier still checks actual resulting bytes/scope and
+registered commands after normal submission/quiescence; this preflight cannot
+replace that verification or authorize Git publication.
+
 Only after further owned-process, durable-operation and transport gates should
 a real Bridge endpoint be considered. These local packages are **not** an RDC
 replacement, shell, relay, daemon or MCP.

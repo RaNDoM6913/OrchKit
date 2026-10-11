@@ -192,7 +192,28 @@ and all three local scope/read/list surfaces without the former plan rewrite.
 No schema, core normalizer, adapter, authority or installed runtime changes;
 previously admitted plans are not migrated.
 
-**Still not implemented:** `file.patch`/write adapters, external content
+**P1-C2 — fifth bounded package (original-content patch preflight):**
+`orch/bridge_patch_preflight.py` provides a trusted local caller with
+`FilePatchBaseline` (canonical SHA-256 and byte length) and
+`LocalFilePatchPreflight.check`. It accepts the unchanged **file.read** request
+and uses `LocalBoundedFileReader` twice: first compare the expected original,
+then independently reobserve the bytes through renewed live authority. Both
+observations must match; success returns no contents and grants no permission
+to write. Each read uses the existing request ceiling of at most 65,536 bytes.
+Actual `file.patch` requests remain refused. The companion input is local only;
+v1 fields, kinds, protocols, serialization and capability semantics do not
+change. This is original-content observation, not patch-payload validation,
+atomic compare-and-swap, durable replay or an OS fence.
+
+Repeated operation IDs recompute through live authority; no result is cached.
+Crash/restart discards the observation and requires a new live session and
+fresh checks. A later mutating package must first establish durable request
+fingerprints/operation IDs, crash-safe publication and independent readback of
+uncertain outcomes; it cannot consume this success as an apply token. Positive,
+limit, mismatch, revocation, race and compatibility tests use disposable real
+ledger/session/capability fixtures. Verifier and publisher remain independent.
+
+**Still not implemented:** mutating `file.patch`/write adapters, external content
 transport, owned processes, journal/idempotency, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any
 first ordinary-Chat route without RDC; do not relabel this foundation as a
