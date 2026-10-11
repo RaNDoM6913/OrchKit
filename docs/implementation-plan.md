@@ -175,10 +175,22 @@ are names only; symlink ancestors and the directory target are refused.
 A fresh descriptor acquisition and unchanged directory metadata check are
 required before returning bytes. An unsupported descriptor-scanning OS is
 refused; scanner errors are sanitized. This is not a remote API, durable
-journal, atomic directory snapshot or same-user OS sandbox. The current
-`build_single_task_plan` helper normalizes away trailing slashes: callers
-must preserve the directory grant in a validated explicit plan until a
-separate helper/API contract package is authorized.
+journal, atomic directory snapshot or same-user OS sandbox.
+
+**P1-C2 — fourth bounded package (plan directory grants):**
+`build_single_task_plan` now retains one trailing `/` after normalizing an
+explicit directory entry; `build_batch_plan` delegates to the same helper.
+File entries never acquire a directory marker by inference. Existing schema
+validation still rejects normalized duplicates, including `docs` plus
+`docs/`, traversal, absolute paths and malformed entries. A single string is
+rejected rather than interpreted as an iterable of one-character file grants.
+A generated `docs/` grant has the **existing** subtree permission semantics
+for file reads and changed-path scope; it is not a new list-only permission.
+Listing still requires that directory's own literal entry, never just a
+parent or child grant. Tests cover generated plan round-trip/native admission
+and all three local scope/read/list surfaces without the former plan rewrite.
+No schema, core normalizer, adapter, authority or installed runtime changes;
+previously admitted plans are not migrated.
 
 **Still not implemented:** `file.patch`/write adapters, external content
 transport, owned processes, journal/idempotency, daemon, multi-session broker,

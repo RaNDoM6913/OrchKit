@@ -69,13 +69,18 @@ def build_single_task_plan(
             deps.append(value)
     if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 10:
         raise ValueError("invalid_max_attempts")
+    if isinstance(allowed_paths, (str, bytes)):
+        raise ValueError("allowed_paths_required")
     allowed = []
     for item in allowed_paths:
         if not isinstance(item, str):
             raise ValueError("invalid_allowed_path")
         if not item.strip():
             continue
-        allowed.append(normalize_relative_path(item))
+        normalized = normalize_relative_path(item)
+        # Preserve only the caller's explicit directory intent. Never infer
+        # subtree permission from an existing directory or a child-file grant.
+        allowed.append(normalized + "/" if item.endswith("/") else normalized)
     if not allowed:
         raise ValueError("allowed_paths_required")
     git_state = evaluate_project_git_policy(project)
