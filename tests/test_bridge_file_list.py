@@ -14,6 +14,7 @@ from orch import bridge_file_list as module
 from orch.bridge_authorization import LocalRunSessionAuthority
 from orch.bridge_file_list import LocalBoundedFileLister
 from orch.bridge_file_scope import LocalFileScope
+from orch.bridge_file_read import LocalBoundedFileReader
 from orch.core import Orchestrator
 from orch.plan import build_single_task_plan, write_plan
 from orch.project import ProjectRegistry
@@ -37,6 +38,8 @@ class LocalBoundedFileListerTests(unittest.TestCase):
         (self.root / "empty").mkdir()
         (self.root / "fileonly").mkdir()
         (self.root / "hidden").mkdir()
+        (self.root / "bare").mkdir()
+        (self.root / "bare" / "child.txt").write_bytes(b"not granted")
         (self.root / "docs" / "zeta.txt").write_text("z", encoding="utf-8")
         (self.root / "docs" / "alpha.txt").write_text("a", encoding="utf-8")
         (self.root / "docs" / "deep" / "x.txt").write_text("x", encoding="utf-8")
@@ -61,23 +64,23 @@ class LocalBoundedFileListerTests(unittest.TestCase):
             allowed_paths=[
                 "docs/", "docs/deep/", "empty/", "missing/",
                 "non-directory/", "alias/", "parent-alias/deep/",
-                "fileonly/one.txt",
+                "fileonly/one.txt", "bare",
             ],
             plan_revision="bounded-list-fixture",
         )
-        # build_single_task_plan canonicalizes away trailing slashes. The
-        # validated raw plan format preserves these explicit directory grants;
-        # no direct SQLite or registry manipulation is used.
-        plan["tasks"][0]["allowed_paths"] = [
+        expected_grants = [
             "docs/", "docs/deep/", "empty/", "missing/",
             "non-directory/", "alias/", "parent-alias/deep/",
-            "fileonly/one.txt",
+            "fileonly/one.txt", "bare",
         ]
+        self.assertEqual(plan["tasks"][0]["allowed_paths"], expected_grants)
         plan_file = self.base / "plan.json"
         write_plan(plan_file, plan)
+        self.assertEqual(json.loads(plan_file.read_text(encoding="utf-8")), plan)
         self.orch.load_plan(plan_file)
         claim = self.orch.claim("fixture-lister", project_id=project["project_id"])
         self.assertEqual(claim["status"], "CLAIMED", claim)
+        self.assertEqual(claim["context"]["allowed_paths"], expected_grants)
         self.cap = Path(claim["capability_file"])
         self.binding = WorkerRunBinding(
             project_id=project["project_id"], writer_key=project["writer_key"],
@@ -168,11 +171,41 @@ class LocalBoundedFileListerTests(unittest.TestCase):
                          ("REFUSED", b"", "file_list_too_large"))
 
     def test_no_inferred_grant_from_allowed_file_or_parent(self):
+        (self.root / "docs" / "deep" / "unlisted").mkdir()
         with self._scope() as scope:
             lister = LocalBoundedFileLister(scope)
-            for target in ("fileonly", "hidden", "docs/deep/x.txt", "docs/other"):
+            for target in ("fileonly", "bare", "hidden", "docs/deep/x.txt",
+                           "docs/deep/unlisted", "docs/other"):
                 with self.subTest(target=target):
                     result = lister.list(self._request(target))
+                    self.assertEqual((result.state, result.output),
+                                     ("REFUSED", b""))
+
+    def test_generated_directory_and_file_grants_keep_read_scope(self):
+        (self.root / "fileonly" / "two.txt").write_bytes(b"not granted")
+        (self.root / "docs-extra").mkdir()
+        (self.root / "docs-extra" / "outside.txt").write_bytes(b"not granted")
+        with self._scope() as scope:
+            reader = LocalBoundedFileReader(scope)
+            for target, data in (("docs/alpha.txt", b"a"),
+                                 ("docs/deep/x.txt", b"x"),
+                                 ("fileonly/one.txt", b"one")):
+                with self.subTest(target=target):
+                    request = self._request(target, kind="file.read")
+                    with scope.open_readonly(request) as fd:
+                        self.assertEqual(os.read(fd, 100), data)
+                    result = reader.read(request)
+                    self.assertEqual((result.state, result.output),
+                                     ("SUCCEEDED", data))
+            for target in ("fileonly/two.txt", "bare/child.txt",
+                           "docs-extra/outside.txt", "hidden/secret.txt",
+                           "docs/external-link"):
+                with self.subTest(target=target):
+                    request = self._request(target, kind="file.read")
+                    with self.assertRaises(ValueError):
+                        with scope.open_readonly(request):
+                            self.fail("Out-of-scope or symlink read was granted")
+                    result = reader.read(request)
                     self.assertEqual((result.state, result.output),
                                      ("REFUSED", b""))
 

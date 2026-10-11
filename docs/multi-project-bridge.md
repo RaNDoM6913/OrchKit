@@ -505,12 +505,41 @@ multi-device/hosted extensions remain separately gated.
   refuse. The output is not an atomic filesystem snapshot: malicious same-user
   races, hardlinks, metadata restoration and changes after the final check are
   not fenced. The existing LocalFileScope remains non-thread-safe.
-- The plan schema can retain literal `docs/` permission entries, but the
-  `build_single_task_plan` helper currently removes trailing slashes.
-  Until a separate authorized helper/API change, directory-list fixtures and
-  callers must supply a validated explicit plan with that literal grant.
+- Both explicit plans and generated plans can retain literal `docs/`
+  permission entries; the bounded plan-builder contract is described below.
   There is still no patch/write, owned process, journal/reconnect, remote
   transport, daemon/broker, MCP, device trust or ordinary-Chat replacement.
+
+### P1-C2 — explicit directory grants in plan generation (fourth package)
+
+- `build_single_task_plan` normalizes each relative path with the existing
+  core helper, then retains one trailing `/` only when the input explicitly
+  ended in `/`. For example, `./docs//` becomes `docs/`; `docs` and
+  `docs/one.txt` remain file-level entries even if a directory currently
+  exists. Blank entries keep their historical ignored behavior. Pass an
+  iterable of path strings, not a single string or bytes value.
+- The delegated batch builder, serialized plan and native admission retain
+  these entries without caller-side rewrites. Existing validation rejects
+  normalized duplicates and file/directory conflicts (`docs` plus `docs/`),
+  traversal, absolute paths, non-string/control-containing entries and path
+  count/UTF-8 byte-limit violations. A directory marker counts toward the
+  existing byte limit. Distinct parent, child-directory and child-file grants
+  may coexist; no extra entries are synthesized.
+- **Not a list-only ACL:** explicit directory entries already grant subtree
+  scope to `path_allowed`, including regular-file reads and changed paths.
+  Listing still requires the target's own literal `target/` entry; a parent
+  directory or a child-file entry never grants that listing. Existing
+  file-level reads remain exact, and sibling-prefix paths stay out of scope.
+- No plan-time filesystem existence/type probe grants authority. Missing,
+  nonregular or symlink targets/ancestors still fail closed at operation time
+  through the unchanged live `LocalFileScope` and bounded read/list adapters.
+  Pure builder negatives and disposable generated-plan/ledger/claim tests
+  cover these boundaries. Core normalization, schemas, P1-C1, writer locks,
+  verifier and publisher are unchanged; no previously admitted plan is
+  rewritten and no installed runtime is upgraded by this source package.
+- Same-user races, hardlinks, post-check changes and non-thread-safe scope
+  limitations remain. Separate list-only permissions or a broader portable
+  path grammar would require another explicitly scoped contract change.
 
 Only after further owned-process, durable-operation and transport gates should
 a real Bridge endpoint be considered. These local packages are **not** an RDC
