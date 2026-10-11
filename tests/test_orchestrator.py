@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from orch.core import Orchestrator, _begin_immediate, canonical_json
-from orch.codex_review import prepare_review, run_review
+from orch.codex_review import prepare_review, run_review, _binary_info
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -23,6 +23,13 @@ class OrchestratorTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def review_preflight_fixture(self):
+        binary = self.root / 'fixture-codex'
+        binary.write_bytes(b'fixture executable\n')
+        binary.chmod(0o700)
+        return {'status': 'PASS', 'binary': _binary_info(binary),
+                'routing': {'model': 'gpt-5.6-sol', 'reasoning_effort': 'high'}}
 
     def load(self,tasks,revision='p1'):
         path=self.root/'plan.json'
@@ -1353,7 +1360,8 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch('orch.codex_review.subprocess.run') as run:
             with self.assertRaisesRegex(ValueError, 'review_prompt_stale'):
-                run_review(self.orch, claim['run_id'], execute=True)
+                run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         run.assert_not_called()
 
     def test_review_execution_rejects_tampered_prepared_schema(self):
@@ -1369,7 +1377,8 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch('orch.codex_review.subprocess.run') as run:
             with self.assertRaisesRegex(ValueError, 'review_schema_stale'):
-                run_review(self.orch, claim['run_id'], execute=True)
+                run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         run.assert_not_called()
 
     def test_review_execution_refuses_preexisting_events_symlink(self):
@@ -1387,10 +1396,11 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch(
             'orch.codex_review.subscription_preflight',
-            return_value={'status': 'PASS'},
+            return_value=self.review_preflight_fixture(),
         ), mock.patch('orch.codex_review.subprocess.run') as run:
             with self.assertRaisesRegex(ValueError, 'review_events_unsafe'):
-                run_review(self.orch, claim['run_id'], execute=True)
+                run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         run.assert_not_called()
         self.assertEqual(victim.read_bytes(), before)
         self.assertTrue(events.is_symlink())
@@ -1410,10 +1420,11 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch(
             'orch.codex_review.subscription_preflight',
-            return_value={'status': 'PASS'},
+            return_value=self.review_preflight_fixture(),
         ), mock.patch('orch.codex_review.subprocess.run') as run:
             with self.assertRaisesRegex(ValueError, 'review_report_preexisting'):
-                run_review(self.orch, claim['run_id'], execute=True)
+                run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         run.assert_not_called()
         self.assertEqual(victim.read_bytes(), before)
         self.assertTrue(report.is_symlink())
@@ -1434,13 +1445,14 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch(
             'orch.codex_review.subscription_preflight',
-            return_value={'status': 'PASS'},
+            return_value=self.review_preflight_fixture(),
         ), mock.patch(
             'orch.codex_review.REVIEW_EVENTS_MAX_BYTES', 8
         ), mock.patch(
             'orch.codex_review.subprocess.run', side_effect=fake_run
         ):
-            result = run_review(self.orch, claim['run_id'], execute=True)
+            result = run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         self.assertEqual(result['status'], 'BLOCKED')
         self.assertEqual(result['reason'], 'review_events_too_large')
         self.assertFalse(Path(prepared['report']).exists())
@@ -1453,6 +1465,13 @@ class OrchestratorTests(unittest.TestCase):
         prepared = prepare_review(self.orch, claim['run_id'])
 
         def fake_run(cmd, **kwargs):
+            self.assertEqual(cmd[cmd.index('--model') + 1], 'gpt-5.6-sol')
+            self.assertIn('model_reasoning_effort="high"', cmd)
+            self.assertIn('model_provider="openai"', cmd)
+            self.assertIn('--ignore-user-config', cmd)
+            self.assertEqual(cmd[cmd.index('--sandbox') + 1], 'read-only')
+            self.assertEqual(cmd[cmd.index('-a') + 1], 'never')
+            self.assertIn('plugins', cmd)
             kwargs['stdout'].write('{"event":"complete"}\n')
             kwargs['stdout'].flush()
             report = Path(cmd[cmd.index('-o') + 1])
@@ -1469,11 +1488,12 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch(
             'orch.codex_review.subscription_preflight',
-            return_value={'status': 'PASS'},
+            return_value=self.review_preflight_fixture(),
         ), mock.patch(
             'orch.codex_review.subprocess.run', side_effect=fake_run
         ):
-            result = run_review(self.orch, claim['run_id'], execute=True)
+            result = run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         self.assertEqual(result['status'], 'COMPLETE')
         self.assertEqual(result['imported']['status'], 'PASS')
         events = Path(result['events'])
@@ -1496,11 +1516,12 @@ class OrchestratorTests(unittest.TestCase):
             'orch.codex_review.prepare_review', return_value=prepared
         ), mock.patch(
             'orch.codex_review.subscription_preflight',
-            return_value={'status': 'PASS'},
+            return_value=self.review_preflight_fixture(),
         ), mock.patch(
             'orch.codex_review.subprocess.run', side_effect=timeout_run
         ):
-            result = run_review(self.orch, claim['run_id'], execute=True)
+            result = run_review(self.orch, claim['run_id'], execute=True,
+                           model='gpt-5.6-sol', reasoning_effort='high')
         self.assertEqual(result['status'], 'BLOCKED')
         self.assertEqual(result['reason'], 'review_timeout')
         self.assertTrue(Path(result['events']).is_file())

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .codex_review import CODEX_BIN, subscription_preflight
+from .codex_review import resolve_codex_binary, subscription_preflight
 from .config import ensure_home
 from .dispatcher import read_rdc
 
@@ -21,12 +21,16 @@ def run_doctor(home: Path, *, check_codex: bool = True) -> Dict[str, Any]:
     writable = os.access(str(home), os.W_OK)
     checks.append({"id": "orch_home", "status": "PASS" if writable else "BLOCKED", "detail": str(home)})
     if check_codex:
+        try:
+            codex = resolve_codex_binary()
+        except (OSError, ValueError):
+            codex = None
         checks.append({
             "id": "codex_binary",
-            "status": "PASS" if CODEX_BIN.is_file() else "OPTIONAL_MISSING",
-            "detail": str(CODEX_BIN),
+            "status": "PASS" if codex else "OPTIONAL_MISSING",
+            "detail": str(codex) if codex else "supported bundled binary unavailable",
         })
-        if CODEX_BIN.is_file():
+        if codex:
             preflight = subscription_preflight(home)
             checks.append({
                 "id": "codex_subscription",

@@ -223,8 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     abort.add_argument("--reason", required=True)
     abort.add_argument("--retry", action="store_true")
     abort.add_argument("--process-inactivity-confirmed", action="store_true")
-    sub.add_parser("codex-preflight")
+    codex_preflight = sub.add_parser("codex-preflight")
+    codex_preflight.add_argument("--model")
+    codex_preflight.add_argument("--reasoning-effort")
     codex_review = sub.add_parser("codex-review"); codex_review.add_argument("--run-id", required=True); codex_review.add_argument("--execute", action="store_true")
+    codex_review.add_argument("--model")
+    codex_review.add_argument("--reasoning-effort")
     return parser
 
 
@@ -720,9 +724,10 @@ def main(argv=None) -> int:
                 args.process_inactivity_confirmed,
             )
         elif args.command == "codex-preflight":
-            result = subscription_preflight(root)
+            result = subscription_preflight(root, model=args.model, reasoning_effort=args.reasoning_effort)
         elif args.command == "codex-review":
-            result = run_review(orch, args.run_id, execute=args.execute)
+            result = run_review(orch, args.run_id, execute=args.execute,
+                                model=args.model, reasoning_effort=args.reasoning_effort)
         else:
             parser.error("unknown command")
             return 2

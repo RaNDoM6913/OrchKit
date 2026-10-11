@@ -24,6 +24,11 @@ With P0-1 through P0-3 complete, the immediate bounded ordinary-Chat sequence ha
 
 ## Release discipline
 
+The [review adapter recovery plan](docs/review-adapter-recovery-plan.md) tracks
+the current native-review compatibility repair, verified-runtime rollout and
+remaining quality gates. Source fixes do not patch the frozen 0.11.0 release or
+an already-installed runtime; deployment and release evidence remain separate.
+
 - The frozen `orchkit` 0.11.0 wheel and sdist were published on PyPI with a matching GitHub Release on October 8, 2026; subsequent releases remain owner-gated by `docs/release-process.md`.
 - Expand the documented compatibility matrix only from reproducible OS, architecture, Python, and Git test evidence; current macOS/arm64 CI covers CPython 3.9 through 3.14 and is recorded in `docs/compatibility.md`.
 - Private vulnerability reporting is enabled and the response process is documented in `SECURITY.md`; keep that channel available for every release.
