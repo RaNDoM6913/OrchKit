@@ -37,7 +37,14 @@ an already-installed runtime; deployment and release evidence remain separate.
 
 ## P1: two or three independent projects
 
-The 0.11.0 publication gate closed on October 8, 2026. P1 implementation remains planned and has not started.
+The 0.11.0 publication gate closed on October 8, 2026. Subsequent source work
+has completed the disposable multi-project scheduler checks and transport
+contract/storage separation, plus local session authority, bounded file
+read/list, directory grants, original-content preflight and durable patch-intent
+inspection/readback. These source capabilities do not alter frozen 0.11.0
+artifacts or prove independent ordinary-Chat Bridge workers. Actual workspace
+mutation, owned processes, a Bridge service/broker and the remote route remain
+unimplemented.
 
 The first target is one operator, one Mac, and up to three independent project workers. Preserve one active writer per existing `writer_key`; linked worktrees that share a Git common directory remain serialized.
 
@@ -47,7 +54,11 @@ The first target is one operator, one Mac, and up to three independent project w
 4. **P1-E/F — connect and accept the everyday workflow.** Add the remote MCP route, streaming, and idempotency; then verify independent ordinary-Chat workers on one Mac.
 5. **P1-G — compare transports before migration.** Keep RDC available until equivalent fresh acceptance evidence exists.
 
-These are planned milestones, not capabilities shipped in 0.11.0. The [detailed Bridge plan](docs/multi-project-bridge.md) includes acceptance gates and the deferred same-repository, multi-device, and hosted phases.
+The sequence includes completed local foundations and the remaining integration
+and real-worker acceptance gates; those foundations are not capabilities shipped
+in frozen 0.11.0 distributions. The [detailed Bridge plan](docs/multi-project-bridge.md)
+records exact implemented boundaries and the deferred same-repository,
+multi-device and hosted phases.
 
 ## Distribution and interfaces
 

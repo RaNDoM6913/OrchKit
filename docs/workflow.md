@@ -39,6 +39,36 @@ The OrchKit state directory contains the ledger and private operational artifact
 
 The current workflow uses a connected ChatGPT/RDC bridge for its automated worker path. The connection is an operational prerequisite, not evidence of an OS security boundary.
 
+## Inspecting local operation intents
+
+Source builds with the local intent-journal package can inspect one recorded
+operation without opening a worker session:
+
+```sh
+orch --root /absolute/state/home bridge operation inspect \
+  --run-id RUN_ID --operation-id OPERATION_ID
+```
+
+`RECORDED` means that validated intent metadata was observed. `ABSENT` means
+that the requested record was absent beneath valid inspected anchors; `UNKNOWN`
+means that unsafe, incomplete or unreadable evidence prevents a conclusion.
+The command returns no payload or capability and does not create directories,
+repair permissions, release a writer, apply a patch or recommend replay.
+
+Trusted local preparation requires current run authority and original-content
+preflight for a new ID. Matching repeated IDs return existing intent metadata;
+changed requests conflict. Independent content observations distinguish the
+original, replacement, other content and unavailable observations without
+claiming who wrote a file or whether an operation completed. This API is not a
+connected Bridge worker route.
+
+`orch recovery inspect` also surfaces terminal/orphaned or invalid intents.
+Journal evidence causes an attention state until its meaning is reconciled; a
+fresh chat or stale heartbeat does not resolve it. Backup/verification/restore
+preserve these records, refuse incomplete coverage, and retain the prohibition
+on backing up active runs. Ordinary evidence pruning does not delete intents.
+The journal persists metadata only; it cannot reconstruct replacement bytes.
+
 ## Bounded execution and current limits
 
 The current CLI admits and displays a versioned bounded-execution contract, but its time/context budget remains advisory and does not enforce worker suspension or termination.
