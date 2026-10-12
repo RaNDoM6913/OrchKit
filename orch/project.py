@@ -127,6 +127,27 @@ def _safe_git_bytes(repo: Path, *args: str, timeout: int = 15) -> subprocess.Com
     )
 
 
+def _git_inspection_metadata(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    # These exact forms read repository identity/configuration or enumerate names;
+    # none consumes worktree bytes. All content and generic commands use the
+    # wrappers above, which discover and neutralize filters before every call.
+    if args not in {
+        ("rev-parse", "--show-toplevel"),
+        ("branch", "--show-current"),
+        ("rev-parse", "HEAD"),
+        ("remote", "get-url", "origin"),
+        ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+        ("config", "--get", "core.hooksPath"),
+        ("rev-parse", "--git-common-dir"),
+    }:
+        raise ValueError("git_inspection_metadata_form_refused")
+    return subprocess.run(
+        _git_base(repo) + list(args), env=_git_env(), capture_output=True,
+        text=args[0] != "ls-files", timeout=15, check=False,
+    )
+
+
 def _slug(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-._")
     return normalized or "project"
@@ -194,22 +215,22 @@ def inspect_project(path: Path) -> Dict[str, Any]:
     requested = path.expanduser().resolve()
     if not requested.is_dir():
         raise ValueError("project_directory_not_found")
-    root_probe = _safe_git(requested, "rev-parse", "--show-toplevel")
+    root_probe = _git_inspection_metadata(requested, "rev-parse", "--show-toplevel")
     if root_probe.returncode != 0:
         raise ValueError("not_a_git_repository")
     root = Path(root_probe.stdout.strip()).resolve()
-    branch = _safe_git(root, "branch", "--show-current")
-    head = _safe_git(root, "rev-parse", "HEAD")
-    remote = _safe_git(root, "remote", "get-url", "origin")
+    branch = _git_inspection_metadata(root, "branch", "--show-current")
+    head = _git_inspection_metadata(root, "rev-parse", "HEAD")
+    remote = _git_inspection_metadata(root, "remote", "get-url", "origin")
     origin_url = remote.stdout.strip() if remote.returncode == 0 else None
     transport = inspect_transport_url(origin_url, root) if origin_url else None
-    upstream = _safe_git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    upstream = _git_inspection_metadata(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
     status = _safe_git(root, "status", "--porcelain=v2", "--branch", "--untracked-files=normal")
     staged = _safe_git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only", "-z")
     dirty = _safe_git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z")
-    untracked = _safe_git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
-    hooks = _safe_git(root, "config", "--get", "core.hooksPath")
-    common_probe = _safe_git(root, "rev-parse", "--git-common-dir")
+    untracked = _git_inspection_metadata(root, "ls-files", "--others", "--exclude-standard", "-z")
+    hooks = _git_inspection_metadata(root, "config", "--get", "core.hooksPath")
+    common_probe = _git_inspection_metadata(root, "rev-parse", "--git-common-dir")
     if common_probe.returncode == 0 and common_probe.stdout.strip():
         common_raw = Path(common_probe.stdout.strip())
         common_dir = common_raw.resolve() if common_raw.is_absolute() else (root / common_raw).resolve()

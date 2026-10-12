@@ -23,6 +23,121 @@ OrchKit coordinates development work whose durable authority must outlive a sing
 
 Use `orch --help` and the relevant subcommand help for exact arguments. The tool intentionally does not infer a task's allowed paths, verification command, or publication policy from a chat request.
 
+## Snapshot-bound repair claims
+
+After a verified run ends in `NEEDS_FIX`, keep its reviewed bytes in place and
+explicitly claim its next attempt from a fresh ChatGPT conversation:
+
+```sh
+orch --root /absolute/state/home claim --worker NEW_WORKER \
+  --project PROJECT_ID --repair-from PREVIOUS_RUN_ID
+```
+
+`--repair-from` selects only the previous run's existing task. Admission requires
+its latest run to be terminal `NEEDS_FIX` with passing verification and an intact
+SHA-bound snapshot manifest for that run, task, workspace and Git base. The
+current bytes, sizes, modes and exact dirty-path set must match that snapshot;
+staging must be empty. Branch/base, protected sentinels and registered check
+authority must still match, and ambiguous file types, symlinks or hardlinks are
+rejected. Divergence blocks admission before a fresh run or capability is issued.
+
+Git workspace claims record the current HEAD and branch when available, even
+when publication is `none`, including the default safe profile. Capturing that
+identity does not enable committing or pushing. A repair requires the original
+claim's recorded identity; older runs that did not capture it remain blocked
+with `repair_claim_git_identity_missing`. Ordinary non-Git tasks retain their
+existing claim and completion behavior. Ordinary claims also preserve detached
+HEAD and unborn-repository behavior; snapshot-bound Git repair requires a usable
+HEAD and named branch recorded at the original claim.
+
+The same operation can recover a task marked `BLOCKED` only when its latest
+task-specific event is `TASK_BLOCKED_AT_CLAIM` for `claim_workspace_dirty`, with no
+subsequent divergent state. This covers an ordinary claim refusing the retained
+repair bytes. It is not a general unblock command; ordinary claims still require
+a clean workspace.
+
+Admission preserves attempt limits, dependency checks, pauses, writer exclusion,
+and checks for live capabilities or pending publication. It creates a new run
+bound to the previous run and snapshot, preserving prior receipts, verification
+and review evidence. Rejected preflight consumes no attempt. After a new run is
+committed, a capability-creation failure retains the normal fail-closed aborted
+attempt rather than undoing its recorded history. The new worker may then repair
+within the existing allowed paths; submission, quiescence, fresh
+verification, review/owner gates and publication still follow the normal
+lifecycle. A repair claim does not complete the task, replay prior operations or
+resume the previous conversation.
+
+## Readmitting a dependent task onto an accepted base
+
+When a verified repair candidate needs newly accepted infrastructure, an operator
+can transfer its durable context into a **new task and clean registered workspace**:
+
+```sh
+orch --root /absolute/state/home readmit \
+  --previous-run PREVIOUS_RUN_ID --dependency-run DEPENDENCY_RUN_ID \
+  --plan /absolute/new-single-task-plan.json \
+  --operator-authorization-confirmed --process-inactivity-confirmed
+```
+
+The two assertions serve separate purposes. The operator must authorize the
+source/base transfer and independently confirm that the source and dependency
+actors are inactive. Existing run-bound cooperative quiescence must follow any
+active or unknown checkpoint. This remains an operator assertion with a
+cooperative helper boundary; it does not fence OS processes. Terminal status,
+absent capabilities, elapsed time and authorization alone do not prove inactivity.
+
+The source must be its task's latest terminal `NEEDS_FIX` run with passing
+verification, an intact review and canonical snapshot, exact current bytes,
+modes, lengths, receipts, sentinels and check authority. A narrowly recorded
+ordinary dirty-claim refusal can qualify; arbitrary `BLOCKED` states cannot.
+The source checkout is left intact. Its run, receipt, snapshot, review and
+immutable task payload are retained.
+
+The dependency must have completed independent verification, passing review and
+native Git publication. Its actual commit must have the source snapshot's base
+as its sole parent and match the published snapshot's changed paths, bytes and
+modes. Retained receipt, verification, review and publication evidence must agree.
+Local Git publication is sufficient for this transfer; remote publication of the
+new task still follows its own configured gates.
+
+The destination must be clean, with empty staging including intent-to-add, and
+HEAD exactly at that dependency commit on its configured branch. Its registered
+repository origin must match the source and dependency, and it must share the
+dependency's Git common directory. Global/project pauses, active writers, live
+capability artifacts and pending publication block admission. Fresh project and
+Git checks run within the admission transaction and again before insertion.
+
+The one-task plan may retain or narrow allowed paths and add protected paths or
+dependencies. It must retain the original dependencies, sentinels, registered
+commands, check deadlines/output bounds/actions, executable identity, original
+check-authority paths, review and owner requirements, and publication/registered
+project permissions. Authority hashes are rebound only to the accepted tracked
+dependency bytes. A risk-based retry must explicitly require review so the new
+local attempt number cannot erase its retry review gate.
+
+The new task can use at most the original maximum attempts minus all recorded
+runs of the source task. For example, one run from a two-attempt task leaves only
+one attempt in the new task. Admission atomically inserts the new immutable
+plan/task, cancels the old task and records `TASK_READMITTED` with source,
+dependency, evidence, remaining budget and both operator assertions. It neither
+claims the new task nor issues a capability. Claim it in a fresh conversation
+before applying source edits. Its bounded context includes the original feedback,
+run/snapshot and dependency proof from the ledger.
+
+At claim, the recorded `TASK_READMITTED.dependency_commit` must equal the actual
+claim HEAD, including when the new task uses `publication.kind: none`. A clean
+checkout at a newer commit is refused before a run, writer reservation or
+capability is issued, without consuming an attempt. After context preparation,
+claim checks the workspace, check authority, HEAD and branch again before run
+insertion. HEAD or branch drift during preparation is refused for every Git
+publication mode. Retrieved context keeps the stored claim HEAD and durable
+dependency proof, so subsequent worker edits do not invalidate that context.
+
+An exact request replay returns the same admission, including after the new task
+has been claimed and edited. A different plan digest, dependency or admission
+identity conflicts without mutation. This is a specific source/base transfer,
+not a generic unblock, lease expiry or permission to overwrite a frozen payload.
+
 ## Operator overview
 
 `orch overview` is the normal read-only control view for setup and day-to-day operation. It can be run before the ledger exists and summarizes the configured profile, RDC binding state, registered projects, private-state layout health, and explicit `next_steps`. With `--project`, it adds the existing project-readiness audit summary, including task, active-writer, pending-publication, and pause counts.

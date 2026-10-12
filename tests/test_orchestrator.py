@@ -1,9 +1,11 @@
 import hashlib
+from contextlib import closing
 import json
 import os
 import sqlite3
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -295,6 +297,958 @@ class OrchestratorTests(unittest.TestCase):
                 (claim["run_id"],),
             ).fetchone()
         self.assertEqual(row["claim_git_head"], expected)
+
+    def _snapshot_repair_fixture(self, name="repair", *, max_attempts=2,
+                                 protected=False, checks=False, publication_kind="git_local"):
+        self.orch = Orchestrator(self.root / name)
+        repo = self._make_git_workspace(name)
+        sentinel = repo / "owner.txt"
+        support = repo / "check.py"
+        if protected or checks:
+            sentinel.write_text("owner bytes\n", encoding="utf-8")
+            support.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "owner.txt", "check.py"],
+                           check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "support"],
+                           check=True)
+        task = self.task(name, review=True, max_attempts=max_attempts,
+                         protected={"owner.txt": hashlib.sha256(
+                             sentinel.read_bytes()).hexdigest()} if protected else {},
+                         checks=([{"id": "support", "argv": [sys.executable, "check.py"],
+                                   "cwd": ".", "timeout_sec": 5}] if checks is True
+                                 else checks if isinstance(checks, list) else []))
+        task["workspace"] = str(repo)
+        task["allowed_paths"] = [name + ".json", "extra.json"]
+        if publication_kind != "none":
+            task["publication"] = {"kind": publication_kind, "branch": "main",
+                                   "commit_message": "repair fixture"}
+        self.load([task], revision=name)
+        first = self.orch.claim("first")
+        source = repo / (name + ".json")
+        source.write_bytes(b'{"retained":true}\n')
+        receipt = Path(first["receipt_file"])
+        receipt.write_text(json.dumps({"run_id": first["run_id"], "task_id": name,
+                                       "changed_paths": [name + ".json"]}))
+        lease = self.orch.lease_from_capability(first["run_id"],
+                                               Path(first["capability_file"]))
+        self.orch.submit(first["run_id"], lease, receipt)
+        self.orch.quiesce(first["run_id"], lease)
+        verified = self.orch.verify(first["run_id"])
+        self.assertEqual(verified["status"], "REVIEWING")
+        report = Path(prepare_review(self.orch, first["run_id"])["report"])
+        report.write_text(json.dumps({"run_id": first["run_id"],
+                                      "snapshot_id": verified["snapshot_id"],
+                                      "verdict": "NEEDS_FIX", "findings": [{
+                                          "severity": "important", "path": name + ".json",
+                                          "evidence": "retained edit requires repair",
+                                          "impact": "repair fixture"}], "uncertainty": []}))
+        self.orch.import_review(first["run_id"], report)
+        return first, verified, repo, source
+
+    def test_snapshot_repair_safe_profile_captures_git_identity_without_publication(self):
+        first, verified, repo, source = self._snapshot_repair_fixture(
+            "repair-safe", publication_kind="none")
+        original = source.read_bytes()
+        expected_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True).stdout.strip()
+        admitted = self._claim_snapshot_repair(first)
+        self.assertEqual(admitted["status"], "CLAIMED", admitted)
+        self.assertEqual(first["context"]["claim_git_head"], expected_head)
+        self.assertEqual(admitted["context"]["claim_git_head"], expected_head)
+        self.assertEqual(admitted["context"]["publication"], {"kind": "none"})
+        self.assertEqual(admitted["context"]["previous_snapshot_id"], verified["snapshot_id"])
+        self.assertEqual(admitted["attempt"], 2)
+        self.assertNotEqual(admitted["run_id"], first["run_id"])
+        self.assertEqual(source.read_bytes(), original)
+        with self.orch.connect() as conn:
+            prior = conn.execute("SELECT verify_status,review_status,state FROM runs WHERE run_id=?",
+                                 (first["run_id"],)).fetchone()
+            self.assertEqual(tuple(prior), ("PASS", "NEEDS_FIX", "NEEDS_FIX"))
+            branches = [json.loads(row["payload_json"])["claim_branch"] for row in conn.execute(
+                "SELECT payload_json FROM events WHERE kind='RUN_CLAIMED' ORDER BY seq")]
+            publication = conn.execute("SELECT * FROM publications").fetchall()
+        self.assertEqual(branches, ["main", "main"])
+        self.assertEqual(publication, [])
+
+    def test_safe_profile_non_git_claim_preserves_ordinary_completion(self):
+        self.load([self.task("SAFE-PLAIN")], revision="safe-plain")
+        first = self.orch.claim("ordinary-safe")
+        self.assertEqual(first["status"], "CLAIMED")
+        self.assertIsNone(first["context"]["claim_git_head"])
+        with closing(self.orch.connect()) as conn:
+            claimed_event = conn.execute("SELECT payload_json FROM events WHERE kind='RUN_CLAIMED'").fetchone()
+        self.assertIsNone(json.loads(claimed_event["payload_json"])["claim_branch"])
+        self.assertEqual(self.write_result(first, "SAFE-PLAIN")["status"], "VERIFIED")
+        self.assertEqual(self.orch.complete(first["run_id"])["status"], "COMPLETE")
+
+    def test_safe_profile_ordinary_git_claim_preserves_detached_and_unborn_compatibility(self):
+        for case in ("detached", "unborn"):
+            with self.subTest(case=case):
+                name = "safe-ordinary-" + case
+                self.orch = Orchestrator(self.root / name)
+                if case == "detached":
+                    repo = self._make_git_workspace(name)
+                    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "--detach"],
+                                   check=True)
+                    expected_head = subprocess.run(
+                        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                        capture_output=True, text=True).stdout.strip()
+                else:
+                    repo = Path(self.tmp.name) / name
+                    repo.mkdir()
+                    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+                    expected_head = None
+                task = self.task(name)
+                task["workspace"] = str(repo)
+                self.load([task], revision=name)
+                claimed = self.orch.claim("ordinary-safe")
+                self.assertEqual(claimed["status"], "CLAIMED", claimed)
+                self.assertEqual(claimed["context"]["claim_git_head"], expected_head)
+                with closing(self.orch.connect()) as conn:
+                    claimed_event = conn.execute("SELECT payload_json FROM events WHERE kind='RUN_CLAIMED'").fetchone()
+                self.assertIsNone(json.loads(claimed_event["payload_json"])["claim_branch"])
+                self.assertEqual(claimed["context"]["publication"], {"kind": "none"})
+
+    def test_snapshot_repair_safe_profile_rejects_drift_and_missing_prior_identity(self):
+        executable = self.root / "safe-repair-check"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        cases = (("head", "repair_snapshot_base_mismatch"),
+                 ("branch", "repair_snapshot_branch_mismatch"),
+                 ("authority", "check_authority_changed:support:executable_hash_changed"),
+                 ("legacy-head", "repair_claim_git_identity_missing"),
+                 ("legacy-branch", "repair_claim_git_identity_missing"))
+        for (case, reason), first, verified, repo, source in self._snapshot_repair_cases(
+                cases, "repair-safe-drift", publication_kind="none", checks=[{
+                    "id": "support", "argv": [str(executable)], "cwd": ".", "timeout_sec": 5}]):
+            with self.subTest(case=case):
+                executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+                if case == "head":
+                    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty",
+                                    "-qm", "foreign"], check=True)
+                elif case == "branch":
+                    subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "foreign"],
+                                   check=True)
+                elif case == "authority":
+                    executable.write_bytes(b"#!/bin/sh\nexit 9\n")
+                else:
+                    with closing(self.orch.connect()) as conn:
+                        if case == "legacy-head":
+                            conn.execute("UPDATE runs SET claim_git_head=NULL WHERE run_id=?",
+                                         (first["run_id"],))
+                        else:
+                            event = conn.execute(
+                                "SELECT seq,payload_json FROM events WHERE run_id=? AND kind='RUN_CLAIMED'",
+                                (first["run_id"],)).fetchone()
+                            payload = json.loads(event["payload_json"])
+                            payload["claim_branch"] = None
+                            conn.execute("UPDATE events SET payload_json=? WHERE seq=?",
+                                         (canonical_json(payload), event["seq"]))
+                before = self._repair_admission_state(first)
+                refused = self._claim_snapshot_repair(first)
+                self.assertEqual(refused["status"], "BLOCKED", refused)
+                self.assertEqual(refused["reason"], reason)
+                self.assertEqual(self._repair_admission_state(first), before)
+
+    def _snapshot_repair_cases(self, cases, name, *, fresh_cases=None, **kwargs):
+        # Prepare via the real lifecycle, then restore only disposable test bytes.
+        # Every case still runs current Git, snapshot and check-authority guards.
+        first, verified, repo, source = self._snapshot_repair_fixture(name, **kwargs)
+        prepared_orch = self.orch
+        fixture_root = self.orch.root
+        archive = Path(self.tmp.name) / (name + "-prepared")
+        archive.mkdir()
+        with closing(self.orch.connect()) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        shutil.copytree(fixture_root, archive / "control", symlinks=True)
+        shutil.copytree(repo, archive / "repo", symlinks=True)
+        for index, case in enumerate(cases):
+            if fresh_cases and case in fresh_cases:
+                yield (case, *self._snapshot_repair_fixture(
+                    name + "-" + case, **dict(kwargs, **fresh_cases[case])))
+                continue
+            if index:
+                self.orch = prepared_orch
+                shutil.rmtree(fixture_root)
+                shutil.rmtree(repo)
+                shutil.copytree(archive / "control", fixture_root, symlinks=True)
+                shutil.copytree(archive / "repo", repo, symlinks=True)
+            yield case, first, verified, repo, source
+
+    def _readmission_fixture(self, name="readmission", *, project_sentinel_only=False,
+                             source_mode=None):
+        from orch.project import ProjectRegistry
+        self.orch = Orchestrator(self.root / name)
+        repo = self._make_git_workspace(name)
+        for relative, data in {"check.py": b"raise SystemExit(0)\n",
+                               "authority.dat": b"old authority\n",
+                               "owner.txt": b"owner bytes\n"}.items():
+            (repo / relative).write_bytes(data)
+        def git(where, *args):
+            return subprocess.run(["git", "-C", str(where), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git(repo, "add", "check.py", "authority.dat", "owner.txt")
+        git(repo, "commit", "-qm", "readmission base")
+        git(repo, "remote", "add", "origin", "https://example.invalid/readmission.git")
+        base = git(repo, "rev-parse", "HEAD")
+        registry = ProjectRegistry(self.orch.root)
+        if project_sentinel_only:
+            (repo / "owner.txt").write_bytes(b"registered owner sentinel\n")
+        old_project = registry.add(repo, profile="standard", review_mode="required",
+                                   allow_push=False)["project"]
+        if project_sentinel_only:
+            git(repo, "commit", "-qam", "preserve registered sentinel bytes")
+            base = git(repo, "rev-parse", "HEAD")
+        protected = {} if project_sentinel_only else {"owner.txt": hashlib.sha256(
+            (repo / "owner.txt").read_bytes()).hexdigest()}
+        old = self.task(name, review=True, protected=protected, checks=[{
+                "id": "support", "argv": [sys.executable, "check.py"], "cwd": ".",
+                "timeout_sec": 600, "authority_paths": ["authority.dat"]}])
+        old.update(workspace=str(repo), project_id=old_project["project_id"],
+                   writer_key=old_project["writer_key"],
+                   allowed_paths=["candidate.json", "extra.json"] + (["owner.txt"] if project_sentinel_only else []),
+                   review={"mode": "required", "reviewer": "codex", "placement": "pre_publish"},
+                   publication={"kind": "git_local", "branch": "main", "expected_base": base,
+                                "commit_message": "previous candidate"})
+        self.load([old], revision=name + "-old")
+        first = self.orch.claim("source-worker")
+        source = repo / "candidate.json"
+        source.write_bytes(b'{"retained":true}\n')
+        if source_mode is not None:
+            source.chmod(source_mode)
+        def submit(claim, changed):
+            receipt = Path(claim["receipt_file"])
+            receipt.write_text(json.dumps({"run_id": claim["run_id"],
+                                           "task_id": claim["task_id"], "changed_paths": changed}))
+            lease = self.orch.lease_from_capability(claim["run_id"], Path(claim["capability_file"]))
+            self.orch.submit(claim["run_id"], lease, receipt)
+            self.orch.quiesce(claim["run_id"], lease)
+            return self.orch.verify(claim["run_id"])
+        def review(claim, verified, verdict):
+            report = Path(prepare_review(self.orch, claim["run_id"])["report"])
+            report.write_text(json.dumps({"run_id": claim["run_id"],
+                                          "snapshot_id": verified["snapshot_id"], "verdict": verdict,
+                                          "findings": [] if verdict == "PASS" else [{
+                                              "severity": "important", "path": "candidate.json",
+                                              "evidence": "retained candidate needs repair",
+                                              "impact": "fixture repair"}], "uncertainty": []}))
+            self.orch.import_review(claim["run_id"], report)
+        verified = submit(first, [source.name])
+        self.assertEqual(verified["status"], "REVIEWING")
+        review(first, verified, "NEEDS_FIX")
+        dep_repo = Path(self.tmp.name) / (name + "-dependency")
+        git(repo, "worktree", "add", "-qb", name + "-dependency", str(dep_repo), base)
+        dep_project = registry.add(dep_repo, profile="standard", review_mode="required",
+                                   allow_push=False)["project"]
+        dependency = self.task(name + "-dependency", review=True,
+                               checks=[{"id": "dependency", "argv": [sys.executable, "-c", "pass"],
+                                        "timeout_sec": 600}])
+        dependency.update(workspace=str(dep_repo), project_id=dep_project["project_id"],
+                          writer_key=dep_project["writer_key"], allowed_paths=["authority.dat"],
+                          review=old["review"], publication={"kind": "git_local",
+                              "branch": name + "-dependency", "expected_base": base,
+                              "commit_message": "accepted dependency"})
+        self.load([dependency], revision=name + "-dependency")
+        dep = self.orch.claim("dependency-worker", project_id=dep_project["project_id"])
+        (dep_repo / "authority.dat").write_bytes(b"accepted dependency authority\n")
+        dep_verified = submit(dep, ["authority.dat"])
+        self.assertEqual(dep_verified["status"], "REVIEWING")
+        review(dep, dep_verified, "PASS")
+        publication = self.orch.publish(dep["run_id"])
+        self.assertEqual(publication["status"], "COMPLETE")
+        new_repo = Path(self.tmp.name) / (name + "-new")
+        git(repo, "worktree", "add", "-qb", name + "-new", str(new_repo), publication["commit"])
+        new_project = registry.add(new_repo, profile="standard", review_mode="required",
+                                   allow_push=False)["project"]
+        new_task = json.loads(json.dumps(old))
+        new_task.update(id=name + "-new", workspace=str(new_repo),
+                        project_id=new_project["project_id"], writer_key=new_project["writer_key"],
+                        dependencies=[dep["task_id"]], max_attempts=1)
+        new_task["publication"].update(branch=name + "-new", expected_base=publication["commit"])
+        plan = {"schema_version": 1, "plan_revision": name + "-new", "tasks": [new_task]}
+        path = self.orch.root / "readmission.json"
+        path.write_text(json.dumps(plan))
+        return {"first": first, "verified": verified, "repo": repo, "source": source,
+                "dep": dep, "dep_verified": dep_verified, "dep_repo": dep_repo,
+                "commit": publication["commit"], "new_repo": new_repo, "task": new_task,
+                "plan": plan, "path": path, "old_project": old_project,
+                "new_project": new_project, "base": base}
+
+    def _readmit_fixture(self, fixture, **kwargs):
+        self.assertTrue(callable(getattr(self.orch, "readmit", None)),
+                        "operator readmission is not implemented")
+        return self.orch.readmit(fixture["first"]["run_id"], fixture["dep"]["run_id"],
+                                fixture["path"], operator_authorization_confirmed=True,
+                                process_inactivity_confirmed=True, **kwargs)
+
+    def _readmission_state(self):
+        with closing(self.orch.connect()) as conn:
+            return {table: [dict(row) for row in conn.execute("SELECT * FROM " + table)]
+                    for table in ("plans", "tasks", "runs", "snapshots", "events", "publications")}
+
+    def _readmission_cases(self, cases, name):
+        fixture = self._readmission_fixture(name)
+        with closing(self.orch.connect()) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        archive = Path(self.tmp.name) / (name + "-archive")
+        archive.mkdir()
+        paths = [self.orch.root, fixture["repo"], fixture["dep_repo"], fixture["new_repo"]]
+        for index, path in enumerate(paths):
+            shutil.copytree(path, archive / str(index), symlinks=True)
+        for index, case in enumerate(cases):
+            if index:
+                for offset, path in enumerate(paths):
+                    shutil.rmtree(path)
+                    shutil.copytree(archive / str(offset), path, symlinks=True)
+            yield case, fixture
+
+    def test_readmission_real_published_dependency_preserves_history_and_remaining_budget(self):
+        f = self._readmission_fixture()
+        before = self._readmission_state()
+        original = f["source"].read_bytes()
+        result = self._readmit_fixture(f)
+        self.assertEqual(result["status"], "READMITTED")
+        self.assertEqual(result["remaining_attempts"], 1)
+        self.assertEqual(result["dependency_commit"], f["commit"])
+        after = self._readmission_state()
+        self.assertEqual(after["runs"], before["runs"])
+        self.assertEqual(after["snapshots"], before["snapshots"])
+        old = next(t for t in after["tasks"] if t["task_id"] == f["first"]["task_id"])
+        self.assertEqual(old["status"], "CANCELLED")
+        self.assertEqual(old["payload_json"], before["tasks"][0]["payload_json"])
+        new = next(t for t in after["tasks"] if t["task_id"] == f["task"]["id"])
+        admitted = json.loads(new["payload_json"])
+        self.assertEqual(admitted["max_attempts"], 1)
+        self.assertEqual(admitted["checks"][0]["timeout_sec"], 600)
+        authority = {b["path"]: b["sha256"] for b in admitted["checks"][0]["authority_files"]}
+        self.assertEqual(authority["authority.dat"], hashlib.sha256(
+            (f["new_repo"] / "authority.dat").read_bytes()).hexdigest())
+        self.assertNotEqual(authority["authority.dat"], hashlib.sha256(
+            (f["repo"] / "authority.dat").read_bytes()).hexdigest())
+        claimed = self.orch.claim("fresh-readmitted-worker", project_id=f["task"]["project_id"])
+        self.assertEqual(claimed["status"], "CLAIMED", claimed)
+        self.assertEqual(claimed["attempt"], 1)
+        self.assertEqual(claimed["context"]["previous_run_id"], f["first"]["run_id"])
+        self.assertEqual(claimed["context"]["previous_snapshot_id"], f["verified"]["snapshot_id"])
+        self.assertEqual(claimed["context"]["feedback"]["verdict"], "NEEDS_FIX")
+        self.assertEqual(claimed["context"]["readmission"]["dependency_commit"], f["commit"])
+        self.assertEqual(self.orch.context(claimed["run_id"]), claimed["context"])
+        self.assertEqual(f["source"].read_bytes(), original)
+        (f["new_repo"] / "candidate.json").write_bytes(b"new worker bytes\n")
+        replay_before = self._readmission_state()
+        self.assertEqual(self._readmit_fixture(f), result)
+        self.assertEqual(self._readmission_state(), replay_before)
+
+    def test_readmission_none_publication_claim_binds_accepted_dependency(self):
+        f = self._readmission_fixture("readmission-none-accepted")
+        f["task"]["publication"] = {"kind": "none"}
+        f["path"].write_text(json.dumps(f["plan"]))
+        admitted = self._readmit_fixture(f)
+        self.assertEqual(admitted["status"], "READMITTED")
+        claimed = self.orch.claim("readmitted-none-worker", project_id=f["task"]["project_id"])
+        self.assertEqual(claimed["status"], "CLAIMED", claimed)
+        self.assertEqual(claimed["attempt"], 1)
+        self.assertEqual(claimed["context"]["publication"], {"kind": "none"})
+        self.assertEqual(claimed["context"]["claim_git_head"], f["commit"])
+        self.assertEqual(claimed["context"]["readmission"]["dependency_commit"], f["commit"])
+        self.assertEqual(claimed["context"]["previous_run_id"], f["first"]["run_id"])
+        self.assertEqual(claimed["context"]["previous_snapshot_id"], f["verified"]["snapshot_id"])
+        self.assertEqual(claimed["context"]["feedback"]["verdict"], "NEEDS_FIX")
+        with closing(self.orch.connect()) as conn:
+            run = conn.execute("SELECT claim_git_head FROM runs WHERE run_id=?",
+                               (claimed["run_id"],)).fetchone()
+        self.assertEqual(run["claim_git_head"], f["commit"])
+        (f["new_repo"] / "candidate.json").write_bytes(b"new worker bytes\n")
+        for args in (("add", "--", "candidate.json"), ("commit", "-qm", "later worker fixture bytes")):
+            subprocess.run(["git", "-C", str(f["new_repo"]), *args], check=True,
+                           capture_output=True, text=True)
+        later_head = subprocess.run(["git", "-C", str(f["new_repo"]), "rev-parse", "HEAD"],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(later_head, f["commit"])
+        self.assertEqual(self.orch.context(claimed["run_id"]), claimed["context"])
+        before_replay = self._readmission_state()
+        self.assertEqual(self._readmit_fixture(f), admitted)
+        self.assertEqual(self._readmission_state(), before_replay)
+
+    def _assert_readmission_claim_unissued(self, fixture, before, capabilities):
+        after = self._readmission_state()
+        for table in ("runs", "snapshots", "publications"):
+            self.assertEqual(after[table], before[table], table)
+        self.assertFalse(any(run["task_id"] == fixture["task"]["id"] for run in after["runs"]))
+        task = next(task for task in after["tasks"] if task["task_id"] == fixture["task"]["id"])
+        self.assertEqual(json.loads(task["payload_json"])["max_attempts"], 1)
+        self.assertEqual(sorted((self.orch.runtime / "claims").glob("*.json")), capabilities)
+        with closing(self.orch.connect()) as conn:
+            self.assertEqual(self.orch._active_writer_locks(conn), {})
+
+    def test_readmission_none_publication_rejects_changed_clean_claim_head(self):
+        f = self._readmission_fixture("readmission-none-foreign-head")
+        f["task"]["publication"] = {"kind": "none"}
+        f["path"].write_text(json.dumps(f["plan"]))
+        self.assertEqual(self._readmit_fixture(f)["status"], "READMITTED")
+        (f["new_repo"] / "candidate.json").write_bytes(b'{"unreviewed_base":true}\n')
+        for args in (("add", "--", "candidate.json"),
+                     ("commit", "-qm", "unreviewed clean destination base")):
+            subprocess.run(["git", "-C", str(f["new_repo"]), *args], check=True,
+                           capture_output=True, text=True)
+        head = subprocess.run(["git", "-C", str(f["new_repo"]), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(head, f["commit"])
+        clean = subprocess.run(["git", "-C", str(f["new_repo"]), "status", "--porcelain"],
+                               check=True, capture_output=True, text=True).stdout
+        self.assertEqual(clean, "")
+        before = self._readmission_state()
+        capabilities = sorted((self.orch.runtime / "claims").glob("*.json"))
+        refused = self.orch.claim("foreign-base-worker", project_id=f["task"]["project_id"])
+        self.assertEqual(refused["status"], "BLOCKED", refused.get("reason"))
+        self.assertEqual(refused["reason"], "readmission_claim_base_mismatch")
+        self._assert_readmission_claim_unissued(f, before, capabilities)
+
+    def test_readmission_claim_rechecks_head_and_branch_after_context_preparation(self):
+        for case, f in self._readmission_cases(("head", "branch"), "readmission-claim-race"):
+            with self.subTest(case=case):
+                f["task"]["publication"] = {"kind": "none"}
+                f["path"].write_text(json.dumps(f["plan"]))
+                self.assertEqual(self._readmit_fixture(f)["status"], "READMITTED")
+                before = self._readmission_state()
+                capabilities = sorted((self.orch.runtime / "claims").glob("*.json"))
+                original = self.orch._build_context_pack
+                def build_then_change(*args, **kwargs):
+                    pack = original(*args, **kwargs)
+                    if case == "head":
+                        git_args = ("commit", "--allow-empty", "-qm", "foreign context-preparation head")
+                    else:
+                        git_args = ("checkout", "-qb", "foreign-context-preparation-branch")
+                    subprocess.run(["git", "-C", str(f["new_repo"]), *git_args], check=True,
+                                   capture_output=True, text=True)
+                    return pack
+                with mock.patch.object(self.orch, "_build_context_pack", side_effect=build_then_change):
+                    refused = self.orch.claim("context-race-worker", project_id=f["task"]["project_id"])
+                self.assertEqual(refused["status"], "BLOCKED", refused.get("reason"))
+                self.assertEqual(refused["reason"], "claim_git_head_changed_during_preflight"
+                                 if case == "head" else "claim_branch_changed_during_preflight")
+                self._assert_readmission_claim_unissued(f, before, capabilities)
+
+    def test_ordinary_claim_rechecks_git_identity_after_context_preparation(self):
+        for kind in ("none", "git_local", "git"):
+            for case in ("head", "branch"):
+                with self.subTest(kind=kind, case=case):
+                    name = "ordinary-claim-race-" + kind + "-" + case
+                    self.orch = Orchestrator(self.root / name)
+                    repo = self._make_git_workspace(name)
+                    task = self.task(name)
+                    task["workspace"] = str(repo)
+                    task["publication"] = {"kind": kind}
+                    if kind != "none":
+                        task["publication"].update(branch="main", commit_message="dynamic claim")
+                    self.load([task], revision=name)
+                    original = self.orch._build_context_pack
+                    def build_then_change(*args, **kwargs):
+                        pack = original(*args, **kwargs)
+                        git_args = (("commit", "--allow-empty", "-qm", "foreign context-preparation head")
+                                    if case == "head" else ("checkout", "-qb", "foreign-context-preparation-branch"))
+                        subprocess.run(["git", "-C", str(repo), *git_args], check=True,
+                                       capture_output=True, text=True)
+                        return pack
+                    with mock.patch.object(self.orch, "_build_context_pack", side_effect=build_then_change):
+                        refused = self.orch.claim("ordinary-context-race-worker")
+                    self.assertEqual(refused["status"], "BLOCKED", refused.get("reason"))
+                    self.assertEqual(refused["reason"], "claim_git_head_changed_during_preflight"
+                                     if case == "head" else "claim_branch_changed_during_preflight")
+                    with closing(self.orch.connect()) as conn:
+                        self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+                        self.assertEqual(self.orch._active_writer_locks(conn), {})
+                    self.assertEqual(list((self.orch.runtime / "claims").glob("*.json")), [])
+
+    def test_readmission_cli_requires_operator_assertion(self):
+        from orch.cli import build_parser
+        args = build_parser().parse_args(["readmit", "--previous-run", "PREVIOUS",
+                                   "--dependency-run", "DEPENDENCY", "--plan", "plan.json",
+                                   "--operator-authorization-confirmed"])
+        self.assertTrue(args.operator_authorization_confirmed)
+        f = self._readmission_fixture("readmission-operator")
+        self.assertTrue(callable(getattr(self.orch, "readmit", None)))
+        before = self._readmission_state()
+        with self.assertRaisesRegex(ValueError, "readmission_operator_authorization_required"):
+            self.orch.readmit(f["first"]["run_id"], f["dep"]["run_id"], f["path"])
+        self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_rejects_widened_contracts_without_any_ledger_mutation(self):
+        cases = ("allowed", "directory-grant", "protected", "check-argv", "check-deadline",
+                 "check-action", "check-output", "authority", "review", "owner",
+                 "attempts", "dependency", "publication", "transport", "project-push",
+                 "project-review", "project-owner", "multi-task", "existing-id", "existing-revision")
+        for case, f in self._readmission_cases(cases, "readmission-contract"):
+            with self.subTest(case=case):
+                plan = json.loads(f["path"].read_text())
+                task = plan["tasks"][0]
+                if case == "allowed": task["allowed_paths"].append("foreign.txt")
+                elif case == "directory-grant": task["allowed_paths"] = ["candidate.json/"]
+                elif case == "protected": task["protected_paths"] = {}
+                elif case == "check-argv": task["checks"][0]["argv"] = [sys.executable, "-c", "pass"]
+                elif case == "check-deadline": task["checks"][0]["timeout_sec"] = 599
+                elif case == "check-action": task["checks"][0]["timeout_action"] = "ignore"
+                elif case == "check-output": task["checks"][0]["output_tail_chars"] = 9000
+                elif case == "authority": task["checks"][0]["authority_paths"] = []
+                elif case == "review": task["review"]["mode"] = "off"
+                elif case == "owner":
+                    with closing(self.orch.connect()) as conn:
+                        row = conn.execute("SELECT payload_json FROM tasks WHERE task_id=?", (f["first"]["task_id"],)).fetchone()
+                        old = json.loads(row["payload_json"]); old["owner_acceptance"] = True
+                        conn.execute("UPDATE tasks SET payload_json=? WHERE task_id=?", (canonical_json(old), f["first"]["task_id"]))
+                elif case == "attempts": task["max_attempts"] = 2
+                elif case == "dependency": task["dependencies"] = []
+                elif case == "publication": task["publication"]["kind"] = "git"
+                elif case == "transport": task["publication"]["remote_url"] = "https://foreign.invalid/repo.git"
+                elif case.startswith("project-"):
+                    path = self.orch.root / "projects" / (task["project_id"] + ".json")
+                    project = json.loads(path.read_text())
+                    if case == "project-push": project["git"]["allow_push"] = True
+                    elif case == "project-review": project["review"]["mode"] = "off"
+                    else:
+                        old_path = self.orch.root / "projects" / (f["old_project"]["project_id"] + ".json")
+                        old_project = json.loads(old_path.read_text()); old_project["approval"]["default"] = "required"
+                        old_path.write_text(json.dumps(old_project))
+                        project["approval"]["default"] = "only_required_gates"
+                    path.write_text(json.dumps(project))
+                elif case == "multi-task": plan["tasks"].append(dict(task, id="EXTRA"))
+                elif case == "existing-id": task["id"] = f["dep"]["task_id"]
+                else: plan["plan_revision"] = "readmission-contract-old"
+                f["path"].write_text(json.dumps(plan))
+                before = self._readmission_state()
+                with self.assertRaises(ValueError): self._readmit_fixture(f)
+                self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_rejects_destination_publication_branch_or_ref_atomically(self):
+        for field, f in self._readmission_cases(("branch", "ref"), "readmission-publication-destination"):
+            with self.subTest(field=field):
+                plan = json.loads(f["path"].read_text())
+                plan["tasks"][0]["publication"][field] = "foreign-destination"
+                f["path"].write_text(json.dumps(plan))
+                before = self._readmission_state()
+                with self.assertRaisesRegex(ValueError, "readmission_publication_destination_mismatch"):
+                    self._readmit_fixture(f)
+                self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_requires_separate_process_inactivity_assertion(self):
+        from orch.cli import build_parser
+        args = build_parser().parse_args([
+            "readmit", "--previous-run", "PREVIOUS", "--dependency-run", "DEPENDENCY",
+            "--plan", "plan.json", "--operator-authorization-confirmed",
+        ])
+        self.assertFalse(args.process_inactivity_confirmed)
+        f = self._readmission_fixture("readmission-process-inactivity")
+        before = self._readmission_state()
+        with self.assertRaisesRegex(ValueError, "readmission_process_inactivity_confirmation_required"):
+            self.orch.readmit(f["first"]["run_id"], f["dep"]["run_id"], f["path"],
+                             operator_authorization_confirmed=True,
+                             process_inactivity_confirmed=False)
+        self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_preserves_project_only_sentinel_in_new_task(self):
+        f = self._readmission_fixture("readmission-project-sentinel", project_sentinel_only=True)
+        digest = hashlib.sha256((f["repo"] / "owner.txt").read_bytes()).hexdigest()
+        self.assertEqual(f["old_project"]["protected_paths"], {"owner.txt": digest})
+        self.assertEqual(f["task"]["protected_paths"], {})
+        before = self._readmission_state()
+        with self.assertRaisesRegex(ValueError, "readmission_protected_paths_widened"):
+            self._readmit_fixture(f)
+        self.assertEqual(self._readmission_state(), before)
+        plan = json.loads(f["path"].read_text())
+        plan["tasks"][0]["protected_paths"]["owner.txt"] = digest
+        f["path"].write_text(json.dumps(plan))
+        self.assertEqual(self._readmit_fixture(f)["status"], "READMITTED")
+        new = next(row for row in self._readmission_state()["tasks"]
+                   if row["task_id"] == f["task"]["id"])
+        self.assertEqual(json.loads(new["payload_json"])["protected_paths"], {"owner.txt": digest})
+
+    def test_readmission_accepts_exact_verified_private_source_permissions(self):
+        f = self._readmission_fixture("readmission-private-mode", source_mode=0o600)
+        original = f["source"].read_bytes()
+        before = self._readmission_state()
+        manifest = next(json.loads(row["manifest_json"]) for row in before["snapshots"]
+                        if row["run_id"] == f["first"]["run_id"])
+        self.assertEqual(manifest["files"]["candidate.json"]["mode"], "0o600")
+        self.assertEqual(self._readmit_fixture(f)["status"], "READMITTED")
+        self.assertEqual(self._readmission_state()["snapshots"], before["snapshots"])
+        self.assertEqual(f["source"].read_bytes(), original)
+        self.assertEqual(f["source"].stat().st_mode & 0o777, 0o600)
+
+    def test_readmission_rejects_changed_source_or_incomplete_dependency_evidence(self):
+        cases = ("source-bytes", "source-mode", "source-extra", "source-authority", "source-protected",
+                 "source-receipt", "source-review", "source-evidence", "source-manifest", "source-latest",
+                 "source-blocked", "source-checkpoint", "source-capability", "source-running", "budget",
+                 "dependency-state", "dependency-verify", "dependency-review", "dependency-report",
+                 "dependency-evidence", "dependency-manifest", "dependency-publication", "dependency-commit",
+                 "dependency-base", "dependency-capability", "pending-publication", "paused", "project-paused",
+                 "new-dirty", "new-staged", "new-ita", "new-head", "new-branch", "new-origin", "source-origin")
+        for case, f in self._readmission_cases(cases, "readmission-proof"):
+            with self.subTest(case=case):
+                run_id = f["dep"]["run_id"] if case.startswith("dependency-") else f["first"]["run_id"]
+                if case == "source-bytes": f["source"].write_bytes(b"foreign bytes\n")
+                elif case == "source-mode": f["source"].chmod(0o700)
+                elif case == "source-extra": (f["repo"] / "extra.json").write_text("foreign\n")
+                elif case == "source-authority": (f["repo"] / "authority.dat").write_text("foreign\n")
+                elif case == "source-protected": (f["repo"] / "owner.txt").write_text("foreign\n")
+                elif case == "source-receipt": Path(f["first"]["receipt_file"]).write_text("{}")
+                elif case in {"source-review", "dependency-report"}: self.orch._review_report_path(run_id).write_text("{}")
+                elif case in {"source-evidence", "dependency-evidence"}: (self.orch.logs / (run_id + "-scope.json")).write_text("{}")
+                elif case in {"source-capability", "dependency-capability"}: self.orch._capability_path(run_id).write_bytes(b"private fixture")
+                elif case in {"new-dirty", "new-staged", "new-ita"}:
+                    (f["new_repo"] / "candidate.json").write_text("foreign\n")
+                    if case != "new-dirty":
+                        args = ["git", "-C", str(f["new_repo"]), "add"]
+                        if case == "new-ita": args.append("-N")
+                        subprocess.run(args + ["candidate.json"], check=True)
+                elif case == "new-head": subprocess.run(["git", "-C", str(f["new_repo"]), "commit", "--allow-empty", "-qm", "foreign"], check=True)
+                elif case == "new-branch": subprocess.run(["git", "-C", str(f["new_repo"]), "checkout", "-qb", "foreign"], check=True)
+                elif case in {"new-origin", "source-origin"}: subprocess.run(["git", "-C", str(f["repo"]), "remote", "set-url", "origin", "https://foreign.invalid/repo.git"], check=True)
+                else:
+                    with closing(self.orch.connect()) as conn:
+                        if case in {"source-manifest", "dependency-manifest"}:
+                            sid = (f["dep_verified"] if case.startswith("dependency") else f["verified"])["snapshot_id"]
+                            row = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?", (sid,)).fetchone()
+                            manifest = json.loads(row["manifest_json"]); manifest["created_at"] = "foreign"
+                            conn.execute("UPDATE snapshots SET manifest_json=? WHERE snapshot_id=?", (canonical_json(manifest), sid))
+                        elif case == "source-latest":
+                            conn.execute("INSERT INTO runs(run_id,task_id,attempt,worker_id,state,lease_token,started_at,heartbeat_at) VALUES(?,?,?,?,?,?,?,?)", ("foreign-run", f["first"]["task_id"], 2, "fixture", "ABORTED", "private", "now", "now"))
+                        elif case == "source-blocked":
+                            conn.execute("UPDATE tasks SET status='BLOCKED' WHERE task_id=?", (f["first"]["task_id"],))
+                            self.orch._event(conn, "TASK_BLOCKED_CONTEXT", task_id=f["first"]["task_id"])
+                        elif case == "source-checkpoint": self.orch._event(conn, "WORKER_CHECKPOINT_RECORDED", task_id=f["first"]["task_id"], run_id=run_id, payload={"process_state": "unknown"})
+                        elif case in {"source-running", "dependency-state"}: conn.execute("UPDATE runs SET state='RUNNING' WHERE run_id=?", (run_id,))
+                        elif case == "dependency-verify": conn.execute("UPDATE runs SET verify_status='FAIL' WHERE run_id=?", (run_id,))
+                        elif case == "dependency-review": conn.execute("UPDATE runs SET review_status='BLOCKED' WHERE run_id=?", (run_id,))
+                        elif case == "dependency-publication": conn.execute("UPDATE publications SET status='COMMITTED' WHERE run_id=?", (run_id,))
+                        elif case == "dependency-commit": conn.execute("UPDATE publications SET commit_id=? WHERE run_id=?", (f["base"], run_id))
+                        elif case == "dependency-base": conn.execute("UPDATE publications SET expected_base=? WHERE run_id=?", ("0" * 40, run_id))
+                        elif case == "pending-publication": conn.execute("UPDATE publications SET status='INTENT' WHERE run_id=?", (f["dep"]["run_id"],))
+                        elif case in {"paused", "project-paused"}:
+                            key = "paused" if case == "paused" else "project_paused:" + f["task"]["project_id"]
+                            conn.execute("INSERT INTO settings VALUES(?,?,?)", (key, "{}", "now"))
+                        elif case == "budget":
+                            row = conn.execute("SELECT payload_json FROM tasks WHERE task_id=?", (f["first"]["task_id"],)).fetchone()
+                            payload = json.loads(row["payload_json"]); payload["max_attempts"] = 1
+                            conn.execute("UPDATE tasks SET payload_json=? WHERE task_id=?", (canonical_json(payload), f["first"]["task_id"]))
+                before = self._readmission_state()
+                with self.assertRaises(ValueError): self._readmit_fixture(f)
+                self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_dirty_claim_blocked_source_and_duplicate_conflicts(self):
+        f = self._readmission_fixture("readmission-blocked")
+        self.assertEqual(self.orch.claim("ordinary", project_id=f["old_project"]["project_id"])["status"], "BLOCKED")
+        result = self._readmit_fixture(f)
+        self.assertEqual(result["status"], "READMITTED")
+        before = self._readmission_state()
+        f["path"].write_text(f["path"].read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "readmission_replay_conflict"):
+            self._readmit_fixture(f)
+        self.assertEqual(self._readmission_state(), before)
+
+    def test_readmission_rechecks_before_insertion_and_rolls_back_atomic_failures(self):
+        for case, f in self._readmission_cases(("source", "new", "event"), "readmission-race"):
+            with self.subTest(case=case):
+                before = self._readmission_state()
+                if case == "event":
+                    original = self.orch._event
+                    def fail_proof(conn, kind, **kwargs):
+                        if kind == "TASK_READMITTED": raise RuntimeError("proof write failed")
+                        return original(conn, kind, **kwargs)
+                    with mock.patch.object(self.orch, "_event", side_effect=fail_proof):
+                        with self.assertRaisesRegex(RuntimeError, "proof write failed"):
+                            self._readmit_fixture(f)
+                else:
+                    original = self.orch._build_context_pack
+                    def build_then_change(*args, **kwargs):
+                        pack = original(*args, **kwargs)
+                        target = f["source"] if case == "source" else f["new_repo"] / "candidate.json"
+                        target.write_bytes(b"raced bytes\n")
+                        return pack
+                    with mock.patch.object(self.orch, "_build_context_pack", side_effect=build_then_change):
+                        with self.assertRaises(ValueError): self._readmit_fixture(f)
+                self.assertEqual(self._readmission_state(), before)
+
+    def _claim_snapshot_repair(self, first, **kwargs):
+        try:
+            return self.orch.claim("repair-worker", repair_from_run_id=first["run_id"],
+                                   **kwargs)
+        except TypeError as exc:
+            self.fail("Snapshot repair failed before producing an admission result: " + str(exc))
+
+    def _repair_admission_state(self, first):
+        with self.orch.connect() as conn:
+            task = dict(conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                     (first["task_id"],)).fetchone())
+            runs = [dict(row) for row in conn.execute(
+                "SELECT * FROM runs WHERE task_id=? ORDER BY attempt",
+                (first["task_id"],))]
+            snapshots = [dict(row) for row in conn.execute(
+                "SELECT * FROM snapshots WHERE run_id=?", (first["run_id"],))]
+            events = [dict(row) for row in conn.execute(
+                "SELECT * FROM events WHERE task_id=? ORDER BY seq",
+                (first["task_id"],))]
+        return task, runs, snapshots, events, sorted(
+            str(path) for path in (self.orch.runtime / "claims").glob("*.json"))
+
+    def test_snapshot_repair_claim_admits_verified_retained_bytes_in_fresh_run(self):
+        first, verified, repo, source = self._snapshot_repair_fixture()
+        before = self._repair_admission_state(first)
+        original = source.read_bytes()
+        admitted = self._claim_snapshot_repair(first)
+        self.assertEqual(admitted["status"], "CLAIMED")
+        self.assertEqual(admitted["task_id"], first["task_id"])
+        self.assertEqual(admitted["attempt"], 2)
+        self.assertNotEqual(admitted["run_id"], first["run_id"])
+        self.assertEqual(admitted["context"]["previous_run_id"], first["run_id"])
+        self.assertEqual(admitted["context"]["previous_snapshot_id"], verified["snapshot_id"])
+        self.assertEqual(admitted["context"]["feedback"]["kind"], "review")
+        after = self._repair_admission_state(first)
+        self.assertEqual(after[1][0], before[1][0])
+        self.assertEqual(after[2], before[2])
+        self.assertEqual(after[0]["payload_json"], before[0]["payload_json"])
+        claimed = json.loads(after[3][-1]["payload_json"])
+        self.assertEqual(claimed["repair_from_run_id"], first["run_id"])
+        self.assertEqual(claimed["repair_snapshot_id"], verified["snapshot_id"])
+        self.assertEqual(source.read_bytes(), original)
+        self.assertTrue(Path(admitted["capability_file"]).is_file())
+        source.write_bytes(b'{"retained":true,"fixed":true}\n')
+        receipt = Path(admitted["receipt_file"])
+        receipt.write_text(json.dumps({"run_id": admitted["run_id"],
+                                       "task_id": first["task_id"],
+                                       "changed_paths": [source.name]}))
+        lease = self.orch.lease_from_capability(admitted["run_id"],
+                                               Path(admitted["capability_file"]))
+        self.assertEqual(self.orch.submit(admitted["run_id"], lease, receipt)["status"],
+                         "RESULT_SUBMITTED")
+
+    def test_snapshot_repair_claim_recovers_only_dirty_claim_blocked_task(self):
+        first, verified, repo, source = self._snapshot_repair_fixture("repair-blocked")
+        refused = self.orch.claim("ordinary-second")
+        self.assertEqual(refused["status"], "BLOCKED")
+        self.assertEqual(refused["reason"], "claim_workspace_dirty:repair-blocked.json")
+        admitted = self._claim_snapshot_repair(first)
+        self.assertEqual(admitted["status"], "CLAIMED")
+        self.assertEqual(admitted["attempt"], 2)
+        self.assertEqual(source.read_bytes(), b'{"retained":true}\n')
+
+    def test_snapshot_repair_rejects_source_and_git_drift_without_consuming_attempt(self):
+        cases = ("bytes", "size", "mode", "missing", "extra", "staged", "intent-to-add", "head",
+                 "branch", "symlink", "broken-symlink", "hardlink", "directory",
+                 "sentinel", "authority", "evidence")
+        for case, first, verified, repo, source in self._snapshot_repair_cases(
+                cases, "repair-drift", protected=True, checks=True):
+            with self.subTest(case=case):
+                if case == "bytes":
+                    source.write_bytes(b'{"retained":null}\n')
+                elif case == "size":
+                    source.write_bytes(source.read_bytes() + b" ")
+                elif case == "mode":
+                    source.chmod(0o700)
+                elif case == "missing":
+                    source.unlink()
+                elif case == "extra":
+                    (repo / "extra.json").write_bytes(b"{}\n")
+                elif case == "staged":
+                    subprocess.run(["git", "-C", str(repo), "add", source.name], check=True)
+                elif case == "intent-to-add":
+                    subprocess.run(["git", "-C", str(repo), "add", "-N", source.name], check=True)
+                elif case == "head":
+                    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty",
+                                    "-qm", "foreign"], check=True)
+                elif case == "branch":
+                    subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "foreign"],
+                                   check=True)
+                elif case in {"symlink", "broken-symlink", "hardlink", "directory"}:
+                    original = source.read_bytes()
+                    source.unlink()
+                    target = self.root / (case + "-target")
+                    if case != "broken-symlink":
+                        target.write_bytes(original)
+                    if case in {"symlink", "broken-symlink"}:
+                        source.symlink_to(target)
+                    elif case == "hardlink":
+                        os.link(target, source)
+                    else:
+                        source.mkdir()
+                elif case == "sentinel":
+                    (repo / "owner.txt").write_text("foreign\n")
+                elif case == "authority":
+                    (repo / "check.py").write_text("raise SystemExit(9)\n")
+                elif case == "evidence":
+                    (self.orch.logs / (first["run_id"] + "-scope.json")).write_text("{}\n")
+                before = self._repair_admission_state(first)
+                result = self._claim_snapshot_repair(first)
+                self.assertEqual(result["status"], "BLOCKED")
+                self.assertEqual(self._repair_admission_state(first), before)
+
+    def test_snapshot_repair_rejects_ledger_binding_and_authority_conflicts(self):
+        cases = ("snapshot-hash", "snapshot-workspace", "snapshot-size", "receipt-invalid",
+                 "not-verified", "not-terminal", "snapshot-missing", "live-capability",
+                 "pending-publication", "arbitrary-block", "divergent-event", "max-attempts")
+        for case, first, verified, repo, source in self._snapshot_repair_cases(
+                cases, "repair-ledger", fresh_cases={"max-attempts": {"max_attempts": 1}}):
+            with self.subTest(case=case):
+                with closing(self.orch.connect()) as conn:
+                    if case.startswith("snapshot-") and case != "snapshot-missing":
+                        snap = conn.execute("SELECT manifest_json FROM snapshots WHERE snapshot_id=?",
+                                            (verified["snapshot_id"],)).fetchone()
+                        manifest = json.loads(snap["manifest_json"])
+                        if case == "snapshot-hash":
+                            manifest["created_at"] = "changed"
+                        elif case == "snapshot-workspace":
+                            manifest["workspace"] = str(self.ws)
+                        else:
+                            manifest["files"][source.name]["bytes"] += 1
+                        if case == "snapshot-hash":
+                            conn.execute("UPDATE snapshots SET manifest_json=? WHERE snapshot_id=?",
+                                         (canonical_json(manifest), verified["snapshot_id"]))
+                        else:
+                            new_id = "sha256:" + hashlib.sha256(
+                                canonical_json(manifest).encode()).hexdigest()
+                            conn.execute("UPDATE snapshots SET snapshot_id=?,manifest_json=? WHERE snapshot_id=?",
+                                         (new_id, canonical_json(manifest), verified["snapshot_id"]))
+                            conn.execute("UPDATE runs SET snapshot_id=? WHERE run_id=?",
+                                         (new_id, first["run_id"]))
+                    elif case == "not-verified":
+                        conn.execute("UPDATE runs SET verify_status='FAIL' WHERE run_id=?",
+                                     (first["run_id"],))
+                    elif case == "receipt-invalid":
+                        conn.execute("UPDATE runs SET receipt_json=? WHERE run_id=?",
+                                     (json.dumps({"run_id": first["run_id"], "task_id": first["task_id"],
+                                                  "changed_paths": 42}), first["run_id"]))
+                    elif case == "not-terminal":
+                        conn.execute("UPDATE runs SET state='REVIEWING' WHERE run_id=?",
+                                     (first["run_id"],))
+                    elif case == "snapshot-missing":
+                        conn.execute("DELETE FROM snapshots WHERE snapshot_id=?",
+                                     (verified["snapshot_id"],))
+                    elif case == "arbitrary-block":
+                        conn.execute("UPDATE tasks SET status='BLOCKED' WHERE task_id=?",
+                                     (first["task_id"],))
+                        self.orch._event(conn, "TASK_BLOCKED_CONTEXT", task_id=first["task_id"],
+                                         payload={"reason": "foreign"})
+                if case == "live-capability":
+                    Path(first["capability_file"]).write_bytes(b"private stale authority")
+                elif case == "pending-publication":
+                    self.orch._publication_update(first["run_id"], status="INTENT",
+                                                  operation_id="fixture", kind="git_local",
+                                                  expected_base=first["context"]["claim_git_head"])
+                elif case == "divergent-event":
+                    self.assertEqual(self.orch.claim("ordinary")["status"], "BLOCKED")
+                    with closing(self.orch.connect()) as conn:
+                        self.orch._event(conn, "TASK_BLOCKED_CONTEXT", task_id=first["task_id"],
+                                         payload={"reason": "divergent"})
+                before = self._repair_admission_state(first)
+                result = self._claim_snapshot_repair(first)
+                self.assertIn(result["status"], {"BLOCKED", "BUSY"})
+                self.assertEqual(self._repair_admission_state(first), before)
+
+    def test_snapshot_repair_rereads_workspace_before_run_insert(self):
+        executable = self.root / "repair-check"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        first, verified, repo, source = self._snapshot_repair_fixture("repair-race", checks=[{
+            "id": "support", "argv": [str(executable)], "cwd": ".", "timeout_sec": 5}])
+        original = self.orch._build_context_pack
+        for case in ("bytes", "branch", "staged", "executable"):
+            with self.subTest(case=case):
+                before = self._repair_admission_state(first)
+                def build_then_change(*args, **kwargs):
+                    pack = original(*args, **kwargs)
+                    if case == "bytes":
+                        source.write_bytes(b'{"foreign":true}\n')
+                    elif case == "branch":
+                        subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "foreign"],
+                                       check=True)
+                    elif case == "staged":
+                        subprocess.run(["git", "-C", str(repo), "add", source.name], check=True)
+                    else:
+                        executable.write_bytes(b"#!/bin/sh\nexit 9\n")
+                    return pack
+                try:
+                    with mock.patch.object(self.orch, "_build_context_pack", side_effect=build_then_change):
+                        result = self._claim_snapshot_repair(first)
+                    self.assertEqual(result["status"], "BLOCKED")
+                    self.assertEqual(self._repair_admission_state(first), before)
+                finally:
+                    source.write_bytes(b'{"retained":true}\n')
+                    (repo / "check.py").write_text("raise SystemExit(0)\n")
+                    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+                    if case == "branch":
+                        subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
+                    if case == "staged":
+                        subprocess.run(["git", "-C", str(repo), "restore", "--staged", "--", source.name],
+                                       check=True)
+
+    def test_snapshot_repair_preserves_pause_dependency_and_project_constraints(self):
+        first, verified, repo, source = self._snapshot_repair_fixture("repair-gates")
+        self.orch.pause("fixture pause")
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first)["status"], "PAUSED")
+        self.assertEqual(self._repair_admission_state(first), before)
+        self.orch.resume()
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first, project_id="other")["status"], "BLOCKED")
+        self.assertEqual(self._repair_admission_state(first), before)
+        with self.orch.connect() as conn:
+            original = conn.execute("SELECT payload_json FROM tasks WHERE task_id=?",
+                                    (first["task_id"],)).fetchone()[0]
+            payload = json.loads(original)
+            payload["dependencies"] = ["uncompleted-dependency"]
+            conn.execute("UPDATE tasks SET payload_json=? WHERE task_id=?",
+                         (canonical_json(payload), first["task_id"]))
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first)["reason"], "repair_dependencies_not_done")
+        self.assertEqual(self._repair_admission_state(first), before)
+        with self.orch.connect() as conn:
+            conn.execute("UPDATE tasks SET payload_json=?,project_id='repair-project' WHERE task_id=?",
+                         (original, first["task_id"]))
+            conn.execute("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?)",
+                         ("project_paused:repair-project", '{"reason":"fixture pause"}', "fixture"))
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first)["status"], "PROJECT_PAUSED")
+        self.assertEqual(self._repair_admission_state(first), before)
+
+    def test_snapshot_repair_rejects_nonlatest_and_cross_run_snapshot(self):
+        first, verified, repo, source = self._snapshot_repair_fixture("repair-latest", max_attempts=3)
+        admitted = self._claim_snapshot_repair(first)
+        self.assertEqual(admitted["status"], "CLAIMED")
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first)["status"], "BUSY")
+        self.assertEqual(self._repair_admission_state(first), before)
+        self.orch.abort(admitted["run_id"], "fixture completed inactivity", retry=True)
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(first)["reason"], "repair_run_not_latest")
+        self.assertEqual(self._repair_admission_state(first), before)
+        with self.orch.connect() as conn:
+            conn.execute("UPDATE runs SET state='NEEDS_FIX',verify_status='PASS',snapshot_id=? WHERE run_id=?",
+                         (verified["snapshot_id"], admitted["run_id"]))
+        before = self._repair_admission_state(first)
+        self.assertEqual(self._claim_snapshot_repair(admitted)["reason"], "repair_snapshot_run_mismatch")
+        self.assertEqual(self._repair_admission_state(first), before)
+
+    def test_snapshot_repair_rejects_same_inode_mutation_after_source_read(self):
+        source = self.ws / "read-race.json"
+        source.write_bytes(b'{"retained":true}\n')
+        original_bytes = source.read_bytes()
+        recorded = {"deleted": False, "sha256": hashlib.sha256(original_bytes).hexdigest(),
+                    "bytes": len(original_bytes), "mode": oct(source.stat().st_mode & 0o777)}
+        original = os.fdopen
+        def close_then_mutate(fd, *args, **kwargs):
+            handle = original(fd, *args, **kwargs)
+            class MutatingClose:
+                def __enter__(self):
+                    return handle.__enter__()
+                def __exit__(self, *exc):
+                    result = handle.__exit__(*exc)
+                    source.write_bytes(original_bytes.replace(b"true", b"null"))
+                    return result
+            return MutatingClose()
+        with mock.patch("orch.core.os.fdopen", side_effect=close_then_mutate):
+            with self.assertRaisesRegex(ValueError, "repair_snapshot_stale:read-race.json"):
+                self.orch._repair_source_current(self.ws, source.name,
+                                                recorded["sha256"], recorded=recorded)
 
     def test_foreign_commit_after_dynamic_claim_blocks_verification(self):
         repo = self._make_git_workspace("dynamic-race")
@@ -626,6 +1580,35 @@ class OrchestratorTests(unittest.TestCase):
             self.orch.cancel_task("ACTIVE-1", "must not cancel an active writer")
         repeated = self.orch.cancel_task("CANCEL-1", "idempotent")
         self.assertTrue(repeated["already_cancelled"])
+
+    def test_check_timeout_retains_decoded_bounded_partial_output(self):
+        check = {
+            "id": "timeout-output",
+            "argv": [sys.executable, "-c", (
+                "import os, time\n"
+                "os.write(1, b'discarded stdout prefix ' + "
+                "'\u20ac-STDOUT-TAIL'.encode('utf-8') + b'\\xff')\n"
+                "os.write(2, b'discarded stderr prefix ' + "
+                "'\u0416-STDERR-TAIL'.encode('utf-8') + b'\\xff')\n"
+                "time.sleep(10)\n"
+            )],
+            "executable_path": str(Path(sys.executable).resolve()),
+            "timeout_sec": 1,
+            "output_tail_chars": 14,
+        }
+        result = self.orch._run_check(self.ws, "timeout-output-run", check)
+
+        self.assertTrue(result["timed_out"])
+        self.assertIsNone(result["exit_code"])
+        self.assertEqual(check["timeout_sec"], 1)
+        self.assertGreaterEqual(result["duration_ms"], 900)
+        self.assertLess(result["duration_ms"], 5000)
+        self.assertEqual(result["output_tail_chars"], 14)
+        self.assertEqual(result["stdout"], "\u20ac-STDOUT-TAIL\ufffd")
+        self.assertEqual(result["stderr"], "\u0416-STDERR-TAIL\ufffd")
+        logged = json.loads(Path(result["log_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(logged["stdout"], "\u20ac-STDOUT-TAIL\ufffd")
+        self.assertEqual(logged["stderr"], "\u0416-STDERR-TAIL\ufffd")
 
     def test_check_executable_is_bound_and_executed_by_absolute_path(self):
         runner = self.ws / "runner.sh"

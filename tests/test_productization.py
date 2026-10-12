@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import orch.project as project_module
+
 from orch.cli import main as cli_main
 from orch.config import HOME_CONFIG_MAX_BYTES, configure_home
 from orch.doctor import run_doctor
@@ -36,6 +38,193 @@ class GitTransportAuthTests(unittest.TestCase):
     def test_non_github_or_non_https_has_no_helper(self):
         self.assertIsNone(_github_credential_helper("https://example.com/repo.git", "https"))
         self.assertIsNone(_github_credential_helper("git@github.com:example/repo.git", "ssh"))
+
+
+class ProjectGitInspectionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="orch-inspection-")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.repo = self.base / "repo"
+        self._git("init", "-q", "-b", "main", str(self.repo))
+        self._git("config", "user.email", "fixture@example.invalid")
+        self._git("config", "user.name", "Fixture")
+        (self.repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._git("add", "README.md")
+        self._git("commit", "-qm", "initial")
+
+    def _git(self, *args):
+        prefix = ["git", "-c", "core.hooksPath=/dev/null"]
+        if args[0] != "init":
+            prefix += ["-C", str(self.repo)]
+        return subprocess.run(
+            prefix + list(args), capture_output=True, text=True,
+            check=True, timeout=12,
+        )
+
+    def _filtered_file(self):
+        (self.repo / ".gitattributes").write_text("README.md filter=first\n")
+        self._git("add", ".gitattributes")
+        self._git("commit", "-qm", "attributes")
+        (self.repo / "README.md").write_text("changed fixture content\n")
+
+    def test_inventory_retains_all_git_fields_with_bounded_native_command_cost(self):
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        remote = self.base / "origin.git"
+        self._git("remote", "add", "origin", str(remote))
+        staged = "staged\nname.txt"
+        (self.repo / staged).write_text("staged\n")
+        self._git("add", "--", staged)
+        (self.repo / "README.md").write_text("changed fixture content\n")
+        (self.repo / "untracked.txt").write_text("untracked\n")
+        commands = []
+        real_run = subprocess.run
+
+        def traced(argv, **kwargs):
+            commands.append(tuple(argv))
+            return real_run(argv, **kwargs)
+
+        with mock.patch("orch.project.subprocess.run", side_effect=traced):
+            inventory = inspect_project(self.repo)
+
+        self.assertEqual(inventory["root"], str(self.repo.resolve()))
+        self.assertEqual(inventory["git_common_dir"], str((self.repo / ".git").resolve()))
+        self.assertRegex(inventory["writer_key"], r"^git:[a-f0-9]{32}$")
+        self.assertEqual(inventory["branch"], "main")
+        self.assertEqual(inventory["head"], head)
+        self.assertEqual(inventory["origin_url"], str(remote))
+        self.assertIsNone(inventory["upstream"])
+        self.assertEqual(inventory["hooks_path"], "/dev/null")
+        self.assertEqual(inventory["staged_paths"], [staged])
+        self.assertEqual(inventory["dirty_tracked_paths"], ["README.md"])
+        self.assertEqual(inventory["untracked_paths"], ["untracked.txt"])
+        self.assertTrue(any(line.startswith("1 ") for line in inventory["status_porcelain_v2"]))
+        self.assertLessEqual(len(commands), 17, commands)
+        # Each content consumer still gets its own fresh attribute census.
+        self.assertEqual(sum("check-attr" in command for command in commands), 3)
+
+    def test_repeated_inventory_observes_actual_head_branch_remote_and_content_drift(self):
+        self._git("remote", "add", "origin", str(self.base / "first.git"))
+        before = inspect_project(self.repo)
+        self._git("checkout", "-qb", "changed")
+        (self.repo / "README.md").write_text("new committed bytes\n")
+        self._git("add", "README.md")
+        self._git("commit", "-qm", "new head")
+        actual_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("remote", "set-url", "origin", str(self.base / "second.git"))
+        self._git("config", "branch.changed.remote", "origin")
+        self._git("config", "branch.changed.merge", "refs/heads/main")
+        self._git("update-ref", "refs/remotes/origin/main", actual_head)
+        (self.repo / "README.md").write_text("uncommitted bytes after new head\n")
+        (self.repo / "new.txt").write_text("new untracked bytes\n")
+        after = inspect_project(self.repo)
+        self.assertNotEqual(after["head"], before["head"])
+        self.assertEqual(after["head"], actual_head)
+        self.assertEqual(after["branch"], "changed")
+        self.assertEqual(after["origin_url"], str(self.base / "second.git"))
+        self.assertEqual(after["upstream"], "origin/main")
+        self.assertEqual(after["dirty_tracked_paths"], ["README.md"])
+        self.assertEqual(after["untracked_paths"], ["new.txt"])
+        self.assertEqual(after["git_common_dir"], before["git_common_dir"])
+        self.assertEqual(after["writer_key"], before["writer_key"])
+
+    def test_filters_are_neutralized_with_new_driver_census_before_each_content_command(self):
+        self._filtered_file()
+        sentinel = self.base / "filter-fired"
+        for driver in ("first", "second", "third", "fourth"):
+            command = f"sh -c 'echo fired > {sentinel}; cat'"
+            self._git("config", f"filter.{driver}.clean", command)
+            self._git("config", f"filter.{driver}.process", f"sh -c 'echo fired > {sentinel}; exit 1'")
+        real_run = subprocess.run
+        seen_drivers = []
+
+        def drift_after_content(argv, **kwargs):
+            result = real_run(argv, **kwargs)
+            if "check-attr" in argv:
+                seen_drivers.append(result.stdout.split(b"\0")[-2])
+            if "status" in argv:
+                (self.repo / ".gitattributes").write_text("README.md filter=second\n")
+            elif "diff" in argv and "--cached" in argv:
+                (self.repo / ".gitattributes").write_text("README.md filter=third\n")
+            return result
+
+        with mock.patch("orch.project.subprocess.run", side_effect=drift_after_content):
+            inventory = inspect_project(self.repo)
+        self.assertFalse(sentinel.exists())
+        self.assertEqual(seen_drivers, [b"first", b"second", b"third"])
+        self.assertIn("README.md", inventory["dirty_tracked_paths"])
+        # The generic wrappers also neutralize unknown content-consuming forms.
+        hashed = project_module._safe_git(self.repo, "hash-object", "--path", "README.md", "README.md")
+        self.assertEqual(hashed.returncode, 0, hashed.stderr)
+        expected = self._git("hash-object", "--no-filters", "README.md").stdout.strip()
+        self.assertEqual(hashed.stdout.strip(), expected)
+        self.assertFalse(sentinel.exists())
+        (self.repo / ".gitattributes").write_text("README.md filter=fourth\n")
+        (self.repo / "README.md").write_text("new bytes and driver on next inspection\n")
+        repeated = inspect_project(self.repo)
+        self.assertFalse(sentinel.exists())
+        self.assertIn("README.md", repeated["dirty_tracked_paths"])
+
+    def test_clean_filter_and_process_filter_commands_never_execute(self):
+        self._filtered_file()
+        sentinel = self.base / "clean-fired"
+        self._git("config", "filter.first.clean", f"sh -c 'echo fired > {sentinel}; cat'")
+        inventory = inspect_project(self.repo)
+        self.assertIn("README.md", inventory["dirty_tracked_paths"])
+        self.assertFalse(sentinel.exists())
+        process_sentinel = self.base / "process-fired"
+        self._git("config", "filter.first.process", f"sh -c 'echo fired > {process_sentinel}; exit 1'")
+        (self.repo / "README.md").write_text("second changed content after inspection\n")
+        inventory = inspect_project(self.repo)
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(process_sentinel.exists())
+        self.assertIn("README.md", inventory["dirty_tracked_paths"])
+
+    def test_metadata_runner_refuses_content_command_before_git_or_filter_execution(self):
+        self._filtered_file()
+        sentinel = self.base / "metadata-filter-fired"
+        self._git("config", "filter.first.clean", f"sh -c 'echo fired > {sentinel}; cat'")
+        before = (self.repo / "README.md").read_bytes()
+        real_run = subprocess.run
+        commands = []
+
+        def traced(argv, **kwargs):
+            commands.append(argv)
+            return real_run(argv, **kwargs)
+
+        with mock.patch("orch.project.subprocess.run", side_effect=traced):
+            with self.assertRaisesRegex(ValueError, "git_inspection_metadata_form_refused"):
+                project_module._git_inspection_metadata(
+                    self.repo, "hash-object", "--path", "README.md", "README.md"
+                )
+        self.assertEqual(commands, [])
+        self.assertEqual((self.repo / "README.md").read_bytes(), before)
+        self.assertFalse(sentinel.exists())
+
+    def test_inventory_refuses_unsafe_driver_and_failed_or_malformed_attribute_probe(self):
+        (self.repo / ".gitattributes").write_text("README.md filter=bad/driver\n")
+        with self.assertRaisesRegex(ValueError, "unsafe_git_filter_driver"):
+            inspect_project(self.repo)
+        (self.repo / ".gitattributes").write_text("README.md filter=first\n")
+        real_run = subprocess.run
+        for result, error in (
+            (subprocess.CompletedProcess([], 128, b"", b"fatal"), "git_filter_attribute_probe_failed"),
+            (subprocess.CompletedProcess([], 0, b"README.md\0filter\0", b""), "git_filter_attribute_probe_malformed"),
+        ):
+            with self.subTest(error=error):
+                content_commands = []
+
+                def failed_probe(argv, **kwargs):
+                    if "check-attr" in argv:
+                        return result
+                    if "status" in argv or "diff" in argv:
+                        content_commands.append(argv)
+                    return real_run(argv, **kwargs)
+
+                with mock.patch("orch.project.subprocess.run", side_effect=failed_probe):
+                    with self.assertRaisesRegex(ValueError, error):
+                        inspect_project(self.repo)
+                self.assertEqual(content_commands, [])
 
 
 class ProductizationTests(unittest.TestCase):

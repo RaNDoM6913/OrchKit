@@ -202,7 +202,19 @@ def build_parser() -> argparse.ArgumentParser:
     prune_ret.add_argument("--keep-backups", type=int, default=5)
     prune_ret.add_argument("--max-backup-mb", type=int, default=512)
     load = sub.add_parser("load-plan"); load.add_argument("plan")
-    claim = sub.add_parser("claim"); claim.add_argument("--worker", required=True); claim.add_argument("--project")
+    readmit = sub.add_parser("readmit", help="readmit verified repair context onto an accepted dependency commit")
+    readmit.add_argument("--previous-run", required=True)
+    readmit.add_argument("--dependency-run", required=True)
+    readmit.add_argument("--plan", required=True)
+    readmit.add_argument("--operator-authorization-confirmed", action="store_true")
+    readmit.add_argument("--process-inactivity-confirmed", action="store_true")
+    claim = sub.add_parser("claim")
+    claim.add_argument("--worker", required=True)
+    claim.add_argument("--project")
+    claim.add_argument(
+        "--repair-from", metavar="RUN",
+        help="claim a fresh repair attempt for the run's exact verified snapshot",
+    )
     context = sub.add_parser("context"); context.add_argument("--run-id", required=True)
     heartbeat = sub.add_parser("heartbeat"); heartbeat.add_argument("--run-id", required=True); heartbeat.add_argument("--lease"); heartbeat.add_argument("--cap")
     checkpoint = sub.add_parser("checkpoint")
@@ -690,8 +702,17 @@ def main(argv=None) -> int:
                 raise ValueError("unknown_state_command")
         elif args.command == "load-plan":
             result = orch.load_plan(Path(args.plan).expanduser())
+        elif args.command == "readmit":
+            result = orch.readmit(
+                args.previous_run, args.dependency_run, Path(args.plan).expanduser(),
+                operator_authorization_confirmed=args.operator_authorization_confirmed,
+                process_inactivity_confirmed=args.process_inactivity_confirmed,
+            )
         elif args.command == "claim":
-            result = orch.claim(args.worker, project_id=args.project)
+            result = orch.claim(
+                args.worker, project_id=args.project,
+                repair_from_run_id=args.repair_from,
+            )
         elif args.command == "context":
             result = orch.context(args.run_id)
         elif args.command == "heartbeat":
