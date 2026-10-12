@@ -127,7 +127,7 @@ IDs are not bearer permissions and a pause never revokes a running claim.
 Invalid mode, symlink, foreign/revoked capability, cross-project/attempt,
 branch/HEAD/writer drift and unknown session fail closed in disposable tests.
 Checks are point-in-time only: another same-user process is not fenced.
-There is **no authorized operation dispatch**, file I/O, canonical path access,
+This authority alone provides **no operation dispatch**, file I/O, canonical path access,
 process ownership, operation journal, external device trust or service.
 The existing verifier and Git publisher remain separate.
 
@@ -154,7 +154,7 @@ and a second no-follow descriptor acquisition that rechecks session,
 capability, run, allowlist, root and leaf identity. Reading is limited to the
 requested byte ceiling plus one sentinel byte; oversized/changed files return
 no partial bytes, and I/O errors do not disclose raw system exceptions.
-`file.list`, `file.patch` and processes are not implemented. This synchronous
+The reader dispatches no `file.list`, `file.patch` or process operation. This synchronous
 in-memory adapter is **not** a remote endpoint, durable operation journal or
 OS sandbox; malicious same-user races, hard links and changes after readback
 remain possible, and the original scope is not thread-safe.
@@ -200,7 +200,7 @@ and uses `LocalBoundedFileReader` twice: first compare the expected original,
 then independently reobserve the bytes through renewed live authority. Both
 observations must match; success returns no contents and grants no permission
 to write. Each read uses the existing request ceiling of at most 65,536 bytes.
-Actual `file.patch` requests remain refused. The companion input is local only;
+This preflight helper refuses actual `file.patch` requests. The companion input is local only;
 v1 fields, kinds, protocols, serialization and capability semantics do not
 change. This is original-content observation, not patch-payload validation,
 atomic compare-and-swap, durable replay or an OS fence.
@@ -247,11 +247,59 @@ coverage; the existing active-run backup prohibition remains. Retention does
 not prune these records as ordinary log evidence. Read-only recovery surfaces
 live, terminal, orphaned and invalid intent evidence while preserving writer,
 capability, native verification and Git publication authority. Existing homes
-without a journal retain their previous behavior. These are local trusted APIs,
-not a daemon/transport, workspace mutator, exactly-once executor or OS sandbox.
+without a journal retain their previous behavior. The intent-only package is a
+local trusted API, not a daemon/transport, workspace mutator, exactly-once
+executor or OS sandbox.
 
-**Still not implemented:** mutating `file.patch`/write adapters, external content
-transport, owned processes, journal/idempotency, daemon, multi-session broker,
+**P1-C2 — seventh bounded package (local existing-file replacement):**
+`LocalBoundedFilePatcher(authority, session_id, binding, capability_file)` exposes
+local `apply(request, FilePatchReplacement)` and `reconcile(request)`. Apply
+replaces one existing allowed regular file; both original and complete
+replacement are at most 65,536 bytes. It refuses missing targets/parents,
+symlinks, nonregular files, hardlinks, foreign uid, special mode bits and file
+flags. Native macOS descriptor APIs verify ordinary uid/gid/mode and bounded
+xattrs, including resource forks (32 names, 4,096 name bytes, 65,536 aggregate
+value bytes); unsupported ACL/inheritance or unprovable preservation refuses.
+One owned random sibling scratch file is internal staging for that exact target,
+not authority to create or delete workspace targets.
+
+One nonblocking advisory lock on the existing private runtime directory fd
+serializes participating apply/reconcile and core submit/quiesce/abort. Unresolved
+execution evidence or an unsafe complete census blocks those state transitions,
+retaining writer and capability authority. Strict append-once execution records
+in `.runtime/patch_execution` bind dispatch, publication and result to the
+immutable intent and predecessor hashes. Dispatch is durable before staging;
+publication is durable before rename. An `APPLIED` receipt requires parent fsync
+and independent inode/content/metadata readback. Payload, capability and raw
+xattr values are never persisted. Uncertain publication/rename/fsync/readback
+returns `UNKNOWN` and preserves evidence.
+
+`orch bridge execution inspect` reads validated metadata only; the existing
+`orch bridge operation inspect` intent view is unchanged. Explicit
+`orch bridge execution reconcile --run-id RUN --operation-id OP --cap FILE`
+rebuilds the validated stored request under a fresh active session. It performs
+no dispatch, staging, replacement-byte replay or rename. Exact staged-inode
+readback can append `APPLIED`; exact unchanged original plus proven owned-stage
+cleanup, or dispatch-only strict scratch absence, can append `NOT_APPLIED`.
+Missing/substituted/ambiguous scratch stays `UNKNOWN` and is preserved. Terminal
+IDs cannot be reused; returned existing receipts are historical, even if later
+content changes. A historical service reply or core closure requires renewed
+acknowledgement of every existing phase record, linked intent and pinned
+directory through home under the same runtime lock, followed by independent
+exact-byte and identity readback. Failure preserves evidence and returns
+`UNKNOWN` or refuses closure; it never replays a patch or rewrites current
+workspace content. Structural terminal inspection, recovery and
+backup/verify/restore do not renew acknowledgement. Backup/verify/restore
+preserve the chain and exact intent linkage; retention leaves execution
+evidence and scratch intact, and active-run backups remain prohibited.
+
+This is a trusted local source API with a pending product Bridge endpoint.
+Cooperative provenance is not OS compare-and-swap or same-user fencing;
+process/fault fixtures do not establish actual power-loss recovery. Native
+verifier/publisher and current source/PR/merge acceptance gates remain separate.
+
+**Still not implemented:** general write/create/delete adapters, external content
+transport, owned processes, general operation replay, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any
 first ordinary-Chat route without RDC; do not relabel this foundation as a
 working Bridge or relax P1-C1/verifier/publisher authority.

@@ -59,13 +59,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     overview.add_argument("--project")
 
-    bridge = sub.add_parser("bridge", help="inspect local worker-operation records")
+    bridge = sub.add_parser("bridge", help="inspect or reconcile local worker-operation records")
     bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
     operation = bridge_sub.add_parser("operation")
     operation_sub = operation.add_subparsers(dest="operation_command", required=True)
     operation_inspect = operation_sub.add_parser("inspect")
     operation_inspect.add_argument("--run-id", required=True)
     operation_inspect.add_argument("--operation-id", required=True)
+
+    execution = bridge_sub.add_parser("execution", help="local bounded patch execution evidence")
+    execution_sub = execution.add_subparsers(dest="execution_command", required=True)
+    execution_inspect = execution_sub.add_parser("inspect", help="read-only execution record inspection")
+    execution_inspect.add_argument("--run-id", required=True)
+    execution_inspect.add_argument("--operation-id", required=True)
+    execution_reconcile = execution_sub.add_parser("reconcile", help="resolve stored evidence without replaying a patch")
+    execution_reconcile.add_argument("--run-id", required=True)
+    execution_reconcile.add_argument("--operation-id", required=True)
+    execution_reconcile.add_argument("--cap", required=True, help="path to the current run capability file")
 
     rdc = sub.add_parser("rdc", help="record or inspect ChatGPT-to-RDC device binding")
     rdc_sub = rdc.add_subparsers(dest="rdc_command", required=True)
@@ -318,6 +328,45 @@ def _initialize_fresh_or_existing_orchestrator(root: Path) -> Orchestrator:
 
     return Orchestrator(root)
 
+
+def _reconcile_patch_execution(
+    root: Path, run_id: str, operation_id: str, capability_file: Path
+) -> dict:
+    from .bridge_authorization import LocalRunSessionAuthority
+    from .bridge_file_patch import LocalBoundedFilePatcher
+    from .bridge_patch_execution import PatchExecutionStore
+    from .worker_operations import WorkerOperationRequest, WorkerRunBinding
+
+    unknown = {
+        "status": "UNKNOWN", "historical": False,
+        "operation_id": operation_id,
+        "error_code": "patch_reconciliation_required",
+    }
+    try:
+        stored = PatchExecutionStore(root).inspect(run_id, operation_id)
+        if stored["status"] != "RECORDED":
+            return unknown
+        # Inspection validates the complete chain against the immutable intent.
+        # Only that stored request supplies scope; command-line IDs select it.
+        saved_request = dict(stored["records"]["dispatch"]["request"])
+        binding = WorkerRunBinding(**saved_request.pop("binding"))
+        request = WorkerOperationRequest(binding=binding, **saved_request)
+        if (binding.run_id != run_id or request.operation_id != operation_id
+                or request.kind != "file.patch"):
+            return unknown
+        authority = LocalRunSessionAuthority(
+            _open_existing_orchestrator(root, inspect_only=True)
+        )
+        session_id = authority.open_session(binding, capability_file)
+        try:
+            return LocalBoundedFilePatcher(
+                authority, session_id, binding, capability_file
+            ).reconcile(request)
+        finally:
+            authority.close_session(session_id)
+    except (OSError, TypeError, ValueError):
+        return unknown
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -343,13 +392,27 @@ def main(argv=None) -> int:
         elif args.command == "overview":
             result = operator_overview(root, project_id=args.project)
         elif args.command == "bridge":
-            from .bridge_operation_journal import OperationIntentJournal
-            try:
-                journal = OperationIntentJournal(root)
-            except (OSError, TypeError, ValueError):
-                result = {"status": "UNKNOWN", "error_code": "journal_home_unavailable"}
+            if args.bridge_command == "operation":
+                from .bridge_operation_journal import OperationIntentJournal
+                try:
+                    journal = OperationIntentJournal(root)
+                except (OSError, TypeError, ValueError):
+                    result = {"status": "UNKNOWN", "error_code": "journal_home_unavailable"}
+                else:
+                    result = journal.inspect(args.run_id, args.operation_id)
+            elif args.execution_command == "inspect":
+                from .bridge_patch_execution import PatchExecutionStore
+                try:
+                    store = PatchExecutionStore(root)
+                except (OSError, TypeError, ValueError):
+                    result = {"status": "UNKNOWN", "error_code": "patch_execution_home_unavailable"}
+                else:
+                    result = store.inspect(args.run_id, args.operation_id)
             else:
-                result = journal.inspect(args.run_id, args.operation_id)
+                result = _reconcile_patch_execution(
+                    root, args.run_id, args.operation_id,
+                    Path(args.cap).expanduser(),
+                )
         elif args.command == "rdc":
             if args.rdc_command == "record":
                 result = record_rdc(root, device_id=args.device_id, device_name=args.device_name)

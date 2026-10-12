@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import os
@@ -71,6 +72,603 @@ class StateMaintenanceTests(unittest.TestCase):
                 (run_id,),
             ).fetchone()
         return WorkerRunBinding(**dict(row))
+
+    def _execution_fixture(self, *, binding=None, operation_id="state-execution",
+                           home=None, phases=("dispatch", "publication", "result"),
+                           disposition="APPLIED"):
+        home = (home or self.orch.root).resolve()
+        intent_path, _, intent = self._journal_fixture(
+            binding=binding, operation_id=operation_id, home=home,
+        )
+        request = intent["request"]
+        common = {
+            "schema_version": 1, "request": request,
+            "intent_fingerprint": intent["fingerprint"],
+            "created_at": "2026-10-11T00:00:00.000000Z",
+        }
+        original = {
+            "identity": {"dev": 1, "ino": 2, "mode": 0o100600,
+                         "uid": os.getuid(), "gid": os.getgid(), "nlink": 1,
+                         "size": 7, "mtime_ns": 1, "ctime_ns": 1, "flags": 0},
+            "sha256": hashlib.sha256(b"before\n").hexdigest(),
+            "size_bytes": 7, "xattrs_digest": hashlib.sha256(b"{}").hexdigest(),
+        }
+        staged = {
+            "identity": dict(original["identity"], ino=3, size=6),
+            "sha256": hashlib.sha256(b"after\n").hexdigest(),
+            "size_bytes": 6, "xattrs_digest": original["xattrs_digest"],
+        }
+        dispatch = dict(common, phase="DISPATCH", anchors={
+            "root": [1, 10], "parents": [[1, 10]], "parent": [1, 10],
+        }, original=original, temp_name=".orch-patch-" + "a" * 32 + ".tmp")
+
+        def record_hash(record):
+            return hashlib.sha256(json.dumps(
+                record, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True, allow_nan=False,
+            ).encode("ascii")).hexdigest()
+
+        publication = dict(common, phase="PUBLICATION",
+                           dispatch_sha256=record_hash(dispatch), staged=staged)
+        result = dict(common, phase="RESULT", dispatch_sha256=record_hash(dispatch),
+                      publication_sha256=record_hash(publication), disposition="APPLIED",
+                      basis={"kind": "APPLY", "target": staged, "temp_absent": True})
+        if disposition == "NOT_APPLIED":
+            result["disposition"] = "NOT_APPLIED"
+            result["publication_sha256"] = (record_hash(publication)
+                                             if "publication" in phases else None)
+            result["basis"] = {
+                "kind": ("RECONCILE_STAGED" if "publication" in phases
+                         else "RECONCILE_NO_PUBLICATION"),
+                "target": original, "temp_absent": True,
+            }
+        records = {"dispatch": dispatch, "publication": publication, "result": result}
+        run_hash = hashlib.sha256(request["binding"]["run_id"].encode()).hexdigest()
+        operation_hash = hashlib.sha256(operation_id.encode()).hexdigest()
+        execution = home / ".runtime" / "patch_execution"
+        directory = execution / run_hash / operation_hash
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for parent in (execution, directory.parent, directory):
+            os.chmod(parent, 0o700)
+        files = {}
+        for phase in phases:
+            path = directory / (phase + ".json")
+            raw = (json.dumps(records[phase], sort_keys=True, indent=2) + "\n").encode()
+            path.write_bytes(raw)
+            os.chmod(path, 0o600)
+            files[path] = raw
+        return directory, files, records, intent_path
+
+    def _execution_evidence_snapshot(self, home):
+        home = home.resolve()
+        evidence = {}
+        for name in ("patch_execution", "operation_journal"):
+            root = home / ".runtime" / name
+            if not root.exists():
+                continue
+            for path in (root, *sorted(root.rglob("*"))):
+                info = path.lstat()
+                evidence[path.relative_to(home).as_posix()] = (
+                    (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                     info.st_gid, info.st_nlink, info.st_size,
+                     info.st_mtime_ns, info.st_ctime_ns),
+                    path.read_bytes() if path.is_file() else None,
+                )
+        return evidence
+
+    @contextmanager
+    def _execution_observation_traps(self, home, *, archive_outputs=False):
+        from orch.bridge_operation_journal import OperationIntentJournal
+        from orch.bridge_patch_execution import PatchExecutionStore
+
+        home = home.resolve()
+        before = self._execution_evidence_snapshot(home)
+        directories = {home, home / ".runtime"}
+        directories.update(home / name for name, (_, raw) in before.items() if raw is None)
+        pinned = {item[:2] for item, _ in before.values()}
+        for path in directories:
+            info = path.stat()
+            pinned.add((info.st_dev, info.st_ino))
+        directory_paths = {
+            (path.stat().st_dev, path.stat().st_ino): path for path in directories
+        }
+        fsync = os.fsync
+        open_file = os.open
+
+        def source_evidence(path, *, dir_fd=None):
+            if isinstance(path, int):
+                info = os.fstat(path)
+                return (info.st_dev, info.st_ino) in pinned
+            candidate = Path(path)
+            if not candidate.is_absolute() and dir_fd is not None:
+                info = os.fstat(dir_fd)
+                parent = directory_paths.get((info.st_dev, info.st_ino))
+                if parent is None:
+                    return False
+                candidate = parent / candidate
+            candidate = Path(os.path.abspath(candidate))
+            return candidate in (home, home / ".runtime") or any(
+                candidate.is_relative_to(home / ".runtime" / name)
+                for name in ("patch_execution", "operation_journal")
+            )
+
+        def reject_evidence_sync(fd):
+            info = os.fstat(fd)
+            # Archive/extraction outputs have their own sync, separate from source evidence.
+            if not archive_outputs or (info.st_dev, info.st_ino) in pinned:
+                raise AssertionError("observer acknowledged execution evidence")
+            return fsync(fd)
+
+        def readonly_open(path, flags, *args, **kwargs):
+            writable = flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+            if writable and (not archive_outputs or source_evidence(path, dir_fd=kwargs.get("dir_fd"))):
+                raise AssertionError("observer opened writable filesystem state")
+            return open_file(path, flags, *args, **kwargs)
+
+        def mutation_trap(name, original):
+            def guarded(*args, **kwargs):
+                operands = ((args[0], kwargs.get("dir_fd")),)
+                if name in ("link", "replace", "rename"):
+                    operands = ((args[0], kwargs.get("src_dir_fd")),
+                                (args[1], kwargs.get("dst_dir_fd")))
+                if not archive_outputs or any(source_evidence(path, dir_fd=fd) for path, fd in operands):
+                    raise AssertionError("observer mutated execution evidence")
+                return original(*args, **kwargs)
+            return guarded
+
+        with ExitStack() as traps:
+            traps.enter_context(mock.patch.object(os, "fsync", side_effect=reject_evidence_sync))
+            for cls, method in ((PatchExecutionStore, "append"),
+                                (PatchExecutionStore, "acknowledge_existing"),
+                                (OperationIntentJournal, "create")):
+                traps.enter_context(mock.patch.object(
+                    cls, method, create=True,
+                    side_effect=AssertionError("observer changed or acknowledged records"),
+                ))
+            traps.enter_context(mock.patch.object(os, "open", side_effect=readonly_open))
+            for name in ("write", "mkdir", "rmdir", "link", "unlink", "replace", "rename",
+                         "fchmod", "fchown", "truncate", "ftruncate"):
+                traps.enter_context(mock.patch.object(
+                    os, name, side_effect=mutation_trap(name, getattr(os, name)),
+                ))
+            yield
+        self.assertEqual(self._execution_evidence_snapshot(home), before)
+
+    def _retained_result_ack_failure(self, home, disposition):
+        from orch.bridge_patch_execution import PatchExecutionStore, runtime_operation_lock
+
+        home = home.resolve()
+        directory, files, records, intent_path = self._execution_fixture(
+            home=home, phases=("dispatch", "publication"), disposition=disposition,
+        )
+        info = directory.stat()
+        operation_inode = (info.st_dev, info.st_ino)
+        fsync = os.fsync
+        failed = []
+
+        def fail_result_directory_ack(fd):
+            current = os.fstat(fd)
+            if ((current.st_dev, current.st_ino) == operation_inode
+                    and (directory / "result.json").exists()):
+                failed.append(True)
+                raise OSError("retained RESULT directory acknowledgement failed")
+            return fsync(fd)
+
+        with runtime_operation_lock(home), mock.patch.object(
+            os, "fsync", side_effect=fail_result_directory_ack,
+        ):
+            result = PatchExecutionStore(home).append(records["result"], authorize=lambda: None)
+        self.assertEqual(result["status"], "UNKNOWN", result)
+        self.assertEqual(len(failed), 1)
+        files[directory / "result.json"] = (directory / "result.json").read_bytes()
+        files[intent_path] = intent_path.read_bytes()
+        return records, files
+
+    def test_patch_execution_retained_failed_ack_observers_remain_read_only(self):
+        from orch import cli
+        from orch.bridge_patch_execution import PatchExecutionStore, execution_inventory
+
+        for disposition in ("APPLIED", "NOT_APPLIED"):
+            with self.subTest(disposition=disposition), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                orch = Orchestrator(home)
+                home = orch.root
+                records, _ = self._retained_result_ack_failure(home, disposition)
+                request = records["dispatch"]["request"]
+                run_id = request["binding"]["run_id"]
+                operation_id = request["operation_id"]
+                with self._execution_observation_traps(home):
+                    observed = PatchExecutionStore(home).inspect(run_id, operation_id)
+                    inventory = execution_inventory(home)
+                    recovered = recovery_inspect(orch)
+                    self.assertEqual(check_state(orch)["status"], "READY")
+                    with mock.patch.object(cli, "emit") as emitted:
+                        self.assertEqual(cli.main([
+                            "--root", str(home), "bridge", "execution", "inspect",
+                            "--run-id", run_id, "--operation-id", operation_id,
+                        ]), 0)
+                self.assertEqual(observed, {"status": "RECORDED", "records": records,
+                                            "terminal": True})
+                self.assertEqual(inventory["status"], "READY")
+                self.assertTrue(inventory["operations"][0]["terminal"])
+                operation = recovered["patch_execution"]["operations"][0]
+                self.assertTrue(operation["terminal"])
+                self.assertTrue(operation["historical"])
+                self.assertEqual(operation["disposition"], disposition)
+                self.assertEqual(operation["classification"], "ORPHAN_EXECUTION")
+                emitted.assert_called_once_with(observed)
+
+    def test_patch_execution_failed_ack_archive_roundtrip_never_renews_ack(self):
+        for disposition in ("APPLIED", "NOT_APPLIED"):
+            with self.subTest(disposition=disposition), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                orch = Orchestrator(home)
+                home = orch.root
+                records, files = self._retained_result_ack_failure(home, disposition)
+                archive = Path(tmp) / "failed-ack.zip"
+                destination = Path(tmp) / "restored"
+                with self._execution_observation_traps(home, archive_outputs=True):
+                    self.assertEqual(backup_state(orch, archive)["status"], "BACKED_UP")
+                    self.assertEqual(verify_backup_archive(archive)["status"], "VERIFIED")
+                    self.assertEqual(restore_backup_archive(archive, destination)["status"], "RESTORED")
+                restored_orch = Orchestrator(destination)
+                with self._execution_observation_traps(destination):
+                    recovered = recovery_inspect(restored_orch)
+                for source, raw in files.items():
+                    self.assertEqual((destination / source.relative_to(home)).read_bytes(), raw)
+                operation = recovered["patch_execution"]["operations"][0]
+                self.assertTrue(operation["terminal"])
+                self.assertEqual(operation["disposition"], records["result"]["disposition"])
+
+    def test_patch_execution_backup_restore_preserves_exact_incomplete_and_terminal_evidence(self):
+        cases = ((("dispatch",), "APPLIED"), (("dispatch", "publication"), "APPLIED"),
+                 (("dispatch", "publication", "result"), "APPLIED"),
+                 (("dispatch", "result"), "NOT_APPLIED"),
+                 (("dispatch", "publication", "result"), "NOT_APPLIED"))
+        for phases, disposition in cases:
+            with self.subTest(phases=phases, disposition=disposition), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                orch = Orchestrator(home)
+                _, files, _, _ = self._execution_fixture(home=home, phases=phases,
+                                                       disposition=disposition)
+                output = Path(tmp) / "execution.zip"
+                backup_state(orch, output)
+                with zipfile.ZipFile(output) as bundle:
+                    for path, raw in files.items():
+                        name = "files/" + path.relative_to(orch.root).as_posix()
+                        self.assertIn(name, bundle.namelist())
+                        self.assertEqual(bundle.read(name), raw)
+                self.assertEqual(verify_backup_archive(output)["status"], "VERIFIED")
+                destination = Path(tmp) / "restored"
+                restore_backup_archive(output, destination)
+                for path, raw in files.items():
+                    restored = destination / path.relative_to(orch.root)
+                    self.assertEqual(restored.read_bytes(), raw)
+                    self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(restored.parent.stat().st_mode & 0o777, 0o700)
+                operation = recovery_inspect(Orchestrator(destination))["patch_execution"]["operations"][0]
+                self.assertEqual(operation["terminal"], "result" in phases)
+                self.assertEqual(operation["classification"], "ORPHAN_EXECUTION")
+                self.assertEqual(operation["phases"], list(phases))
+                self.assertEqual(set((destination / ".runtime" / "claims").iterdir()), set())
+
+    def test_patch_execution_backup_refuses_unsafe_namespace(self):
+        external = Path(self.tmp.name) / "external-execution"
+        external.mkdir()
+        (self.orch.runtime / "patch_execution").symlink_to(external, target_is_directory=True)
+        output = Path(self.tmp.name) / "unsafe-execution.zip"
+        with self.assertRaisesRegex(ValueError, "patch_execution"):
+            backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_patch_execution_recovery_unsafe_evidence_is_read_only(self):
+        directory = self.orch.runtime / "patch_execution"
+        directory.mkdir(mode=0o700)
+        private = directory / "unexpected.json"
+        private.write_bytes(b'{"private":"never-return-this"}')
+        before = private.stat()
+        result = recovery_inspect(self.orch)
+        self.assertEqual(result["status"], "ATTENTION")
+        self.assertEqual(result["patch_execution"]["inventory_status"], "UNKNOWN")
+        self.assertEqual(result["patch_execution"]["operations"], [])
+        self.assertNotIn("never-return-this", json.dumps(result))
+        self.assertEqual(private.read_bytes(), b'{"private":"never-return-this"}')
+        after = private.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns, before.st_mode),
+                         (after.st_ino, after.st_mtime_ns, after.st_mode))
+
+    def _execution_archive_fixture(self):
+        source = Path(backup_state(self.orch)["path"])
+        directory, files, records, intent_path = self._execution_fixture()
+        files[intent_path] = intent_path.read_bytes()
+        target = Path(self.tmp.name) / "imported-execution.zip"
+
+        def add_records(members):
+            manifest_info, manifest_raw = members["state/manifest.json"]
+            manifest = json.loads(manifest_raw)
+            for path, raw in files.items():
+                name = "files/" + path.relative_to(self.orch.root).as_posix()
+                info = zipfile.ZipInfo(name)
+                info.external_attr = 0o100600 << 16
+                members[name] = (info, raw)
+                manifest["file_evidence"][name] = {
+                    "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+                }
+            members["state/manifest.json"] = (manifest_info, json.dumps(manifest).encode())
+
+        self._rewrite_backup(source, target, add_records)
+        return target, directory, records, intent_path
+
+    def _rehash_archive_files(self, members):
+        info, raw = members["state/manifest.json"]
+        manifest = json.loads(raw)
+        manifest["file_evidence"] = {
+            name: {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+            for name, (_, data) in members.items() if name.startswith("files/")
+        }
+        members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+    def test_patch_execution_backup_fails_closed_on_invalid_or_incomplete_census(self):
+        defects = ("malformed", "duplicate-key", "symlink", "fifo", "hardlink",
+                   "record-mode", "directory-mode", "foreign-entry", "wrong-operation",
+                   "missing-dispatch", "missing-intent", "fingerprint")
+        for defect in defects:
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as tmp:
+                orch = Orchestrator(Path(tmp) / "home")
+                directory, files, _, intent_path = self._execution_fixture(home=orch.root)
+                path = directory / "dispatch.json"
+                raw = files[path]
+                if defect == "malformed":
+                    path.write_bytes(b'{"schema_version":1}')
+                elif defect == "duplicate-key":
+                    path.write_bytes(raw.replace(b'{', b'{"schema_version":99,', 1))
+                elif defect == "symlink":
+                    outside = Path(tmp) / "outside.json"
+                    outside.write_bytes(raw)
+                    path.unlink()
+                    path.symlink_to(outside)
+                elif defect == "fifo":
+                    path.unlink()
+                    os.mkfifo(path, 0o600)
+                elif defect == "hardlink":
+                    os.link(path, Path(tmp) / "alias.json")
+                elif defect == "record-mode":
+                    os.chmod(path, 0o644)
+                elif defect == "directory-mode":
+                    os.chmod(directory, 0o755)
+                elif defect == "foreign-entry":
+                    (directory / "dispatch.tmp").write_bytes(b"unknown")
+                elif defect == "wrong-operation":
+                    directory.rename(directory.with_name("f" * 64))
+                elif defect == "missing-dispatch":
+                    path.unlink()
+                elif defect == "missing-intent":
+                    intent_path.unlink()
+                else:
+                    record = json.loads(raw)
+                    record["intent_fingerprint"] = "0" * 64
+                    path.write_text(json.dumps(record))
+                output = Path(tmp) / "blocked.zip"
+                with self.assertRaisesRegex(ValueError, "patch_execution"):
+                    backup_state(orch, output)
+                self.assertFalse(output.exists())
+
+    def test_patch_execution_backup_refuses_missing_selected_phase(self):
+        directory, _, _, _ = self._execution_fixture()
+        omitted = directory / "publication.json"
+        original = state_module._backup_members
+        output = Path(self.tmp.name) / "missing-phase.zip"
+        with mock.patch.object(state_module, "_backup_members", side_effect=lambda orch: [
+            member for member in original(orch) if member != omitted
+        ]):
+            with self.assertRaisesRegex(ValueError, "backup_patch_execution_coverage_mismatch"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_patch_execution_backup_detects_absent_to_present_race(self):
+        directory, files, _, _ = self._execution_fixture()
+        for path in files:
+            path.unlink()
+        directory.rmdir()
+        directory.parent.rmdir()
+        directory.parent.parent.rmdir()
+        original = state_module._backup_members
+        output = Path(self.tmp.name) / "appearing-execution.zip"
+
+        def appear_after_selection(orch):
+            selected = original(orch)
+            directory.mkdir(parents=True, mode=0o700)
+            for parent in (directory, directory.parent, directory.parent.parent):
+                os.chmod(parent, 0o700)
+            for path, raw in files.items():
+                path.write_bytes(raw)
+                os.chmod(path, 0o600)
+            return selected
+
+        with mock.patch.object(state_module, "_backup_members", side_effect=appear_after_selection):
+            with self.assertRaisesRegex(ValueError, "patch_execution"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_patch_execution_backup_detects_changed_bytes_after_streaming(self):
+        directory, _, _, _ = self._execution_fixture()
+        path = directory / "result.json"
+        original = state_module._stream_backup_member
+        output = Path(self.tmp.name) / "changed-execution.zip"
+
+        def mutate_after_stream(archive, orch, member):
+            result = original(archive, orch, member)
+            if member == path:
+                record = json.loads(path.read_text())
+                record["created_at"] = "2026-10-11T01:00:00.000000Z"
+                path.write_text(json.dumps(record))
+            return result
+
+        with mock.patch.object(state_module, "_stream_backup_member", side_effect=mutate_after_stream):
+            with self.assertRaisesRegex(ValueError, "backup_patch_execution_changed_during_backup"):
+                backup_state(self.orch, output)
+        self.assertFalse(output.exists())
+
+    def test_patch_execution_archive_verifier_requires_hash_coverage(self):
+        source, _, _, _ = self._execution_archive_fixture()
+        target = Path(self.tmp.name) / "unbound-execution.zip"
+
+        def remove_evidence(members):
+            info, raw = members["state/manifest.json"]
+            manifest = json.loads(raw)
+            manifest.pop("file_evidence")
+            members["state/manifest.json"] = (info, json.dumps(manifest).encode())
+
+        self._rewrite_backup(source, target, remove_evidence)
+        checked = verify_backup_archive(target)
+        self.assertEqual(checked["status"], "BLOCKED")
+        self.assertIn("backup_patch_execution_evidence_missing", checked["errors"])
+        with self.assertRaisesRegex(ValueError, "backup_not_verified"):
+            restore_backup_archive(target, Path(self.tmp.name) / "unbound-execution")
+
+    def test_patch_execution_archive_verifier_rejects_spliced_or_unbound_chain(self):
+        source, directory, _, intent_path = self._execution_archive_fixture()
+        prefix = "files/" + directory.relative_to(self.orch.root).as_posix() + "/"
+        intent_name = "files/" + intent_path.relative_to(self.orch.root).as_posix()
+        for defect in ("no-intent", "no-dispatch", "no-publication", "fingerprint",
+                       "predecessor", "request", "wrong-path", "duplicate-key", "oversized",
+                       "nested-json", "fifo"):
+            with self.subTest(defect=defect):
+                target = Path(self.tmp.name) / (defect + "-execution.zip")
+
+                def corrupt(members):
+                    if defect == "no-intent":
+                        members.pop(intent_name)
+                    elif defect == "no-dispatch":
+                        members.pop(prefix + "dispatch.json")
+                    elif defect == "no-publication":
+                        members.pop(prefix + "publication.json")
+                    else:
+                        name = prefix + "result.json"
+                        info, raw = members.pop(name)
+                        record = json.loads(raw)
+                        if defect == "fingerprint":
+                            record["intent_fingerprint"] = "0" * 64
+                        elif defect == "predecessor":
+                            record["publication_sha256"] = "0" * 64
+                        elif defect == "request":
+                            record["request"]["target"] = "other.json"
+                        elif defect == "wrong-path":
+                            name = name.replace(directory.name, "f" * 64)
+                            info.filename = name
+                        elif defect == "fifo":
+                            info.external_attr = 0o010600 << 16
+                        data = json.dumps(record).encode()
+                        if defect == "duplicate-key":
+                            data = raw.replace(b'{', b'{"schema_version":99,', 1)
+                        elif defect == "oversized":
+                            data = raw + b" " * 8192
+                        elif defect == "nested-json":
+                            data = b"[" * 1500 + b"0" + b"]" * 1500
+                        members[name] = (info, data)
+                    self._rehash_archive_files(members)
+
+                self._rewrite_backup(source, target, corrupt)
+                checked = verify_backup_archive(target)
+                self.assertEqual(checked["status"], "BLOCKED", checked)
+                self.assertIn("backup_patch_execution_invalid", checked["errors"])
+
+    def test_patch_execution_recovery_surfaces_historical_orphan_unresolved_and_mismatch(self):
+        import dataclasses
+
+        self._load_recovery_task("EXECUTION-RECOVERY")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = self._journal_binding_for_run(claim["run_id"])
+        self._execution_fixture(binding=binding, operation_id="terminal")
+        self._execution_fixture(binding=binding, operation_id="unresolved", phases=("dispatch",))
+        self._execution_fixture(operation_id="orphan")
+        forged = dataclasses.replace(binding, project_id="forged-project", attempt=2)
+        self._execution_fixture(binding=forged, operation_id="mismatch")
+        with self.orch.connect() as conn:
+            before = [tuple(row) for row in conn.execute("SELECT * FROM runs ORDER BY run_id")]
+        with mock.patch.object(self.orch, "lease_from_capability", side_effect=AssertionError("authority read")), \
+                mock.patch.object(state_module.os, "fsync", side_effect=AssertionError("recovery fsync")), \
+                mock.patch.object(state_module.os, "replace", side_effect=AssertionError("recovery rename")), \
+                mock.patch.object(state_module.os, "unlink", side_effect=AssertionError("recovery cleanup")):
+            result = recovery_inspect(self.orch)
+        operations = result["patch_execution"]["operations"]
+        self.assertEqual({item["classification"] for item in operations}, {
+            "TERMINAL_HISTORICAL_EXECUTION", "UNRESOLVED_EXECUTION",
+            "ORPHAN_EXECUTION", "BINDING_MISMATCH",
+        })
+        terminal = next(item for item in operations if item["operation_id"] == "terminal")
+        self.assertTrue(terminal["historical"])
+        self.assertEqual(terminal["disposition"], "APPLIED")
+        self.assertEqual(terminal["run_state"], "ABORTED")
+        filtered = recovery_inspect(self.orch, project_id="recovery-project")["patch_execution"]["operations"]
+        self.assertEqual({item["operation_id"] for item in filtered}, {"terminal", "unresolved", "mismatch"})
+        self.assertEqual(recovery_inspect(self.orch, project_id="unrelated")["patch_execution"]["operations"], [])
+        self.assertNotIn("safe_next_steps", result["patch_execution"])
+        self.assertNotIn("lease_token", json.dumps(result))
+        self.assertFalse(Path(claim["capability_file"]).exists())
+        with self.orch.connect() as conn:
+            after = [tuple(row) for row in conn.execute("SELECT * FROM runs ORDER BY run_id")]
+        self.assertEqual(after, before)
+
+    def test_patch_execution_running_inspection_retains_writer_and_backup_gate(self):
+        self._load_recovery_task("EXECUTION-ACTIVE")
+        claim = self.orch.claim("fixture")
+        binding = self._journal_binding_for_run(claim["run_id"])
+        directory, files, _, _ = self._execution_fixture(binding=binding, phases=("dispatch",))
+        result = recovery_inspect(self.orch, run_id=claim["run_id"])
+        self.assertEqual(result["patch_execution"]["operations"][0]["classification"], "UNRESOLVED_EXECUTION")
+        self.assertEqual(result["items"][0]["classification"], "WORKER_MAY_STILL_BE_ACTIVE")
+        self.assertTrue(Path(claim["capability_file"]).exists())
+        with self.assertRaisesRegex(ValueError, "active_runs_present"):
+            backup_state(self.orch, Path(self.tmp.name) / "active.zip")
+        self.assertEqual((directory / "dispatch.json").read_bytes(), files[directory / "dispatch.json"])
+
+    def test_patch_execution_retention_preserves_evidence_and_workspace_scratch(self):
+        self._load_recovery_task("EXECUTION-RETENTION")
+        claim = self.orch.claim("fixture")
+        self.orch.abort(claim["run_id"], "fixture ended", retry=False)
+        binding = self._journal_binding_for_run(claim["run_id"])
+        _, files, _, _ = self._execution_fixture(binding=binding, phases=("dispatch", "publication"))
+        workspace = Path(self.tmp.name) / "ws-execution-retention"
+        scratch = workspace / (".orch-patch-" + "a" * 32 + ".tmp")
+        scratch.write_bytes(b"unresolved replacement")
+        log = self.orch.runtime / "logs" / (claim["run_id"] + "-scope.json")
+        log.write_bytes(b'{"old":true}')
+        prune_retention(self.orch, max_evidence_bytes=0, keep_recent_runs=0,
+                        keep_backups=1, max_backup_bytes=0)
+        self.assertFalse(log.exists())
+        for path, raw in files.items():
+            self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(scratch.read_bytes(), b"unresolved replacement")
+
+    def test_patch_execution_absent_keeps_legacy_recovery_shape(self):
+        from orch import cli
+        from orch.bridge_patch_execution import PatchExecutionStore, execution_inventory
+
+        with self._execution_observation_traps(self.root):
+            self.assertEqual(PatchExecutionStore(self.orch.root).inspect("legacy", "absent"),
+                             {"status": "ABSENT"})
+            self.assertEqual(execution_inventory(self.orch.root)["status"], "ABSENT")
+            self.assertNotIn("patch_execution", recovery_inspect(self.orch))
+            self.assertEqual(check_state(self.orch)["status"], "READY")
+            with mock.patch.object(cli, "emit") as emitted:
+                self.assertEqual(cli.main([
+                    "--root", str(self.root), "bridge", "execution", "inspect",
+                    "--run-id", "legacy", "--operation-id", "absent",
+                ]), 0)
+            emitted.assert_called_once_with({"status": "ABSENT"})
+        destination = Path(self.tmp.name) / "legacy-no-execution"
+        with self._execution_observation_traps(self.root, archive_outputs=True):
+            archive = Path(backup_state(self.orch)["path"])
+            self.assertEqual(verify_backup_archive(archive)["status"], "VERIFIED")
+            restore_backup_archive(archive, destination)
+        restored = Orchestrator(destination)
+        with self._execution_observation_traps(destination):
+            self.assertNotIn("patch_execution", recovery_inspect(restored))
+        self.assertFalse((self.root / ".runtime" / "patch_execution").exists())
+        self.assertFalse((destination / ".runtime" / "patch_execution").exists())
 
     def _rewrite_backup(self, source, target, transform):
         with zipfile.ZipFile(source) as bundle:

@@ -154,7 +154,7 @@ The OrchKit state directory contains the ledger and private operational artifact
 
 The current workflow uses a connected ChatGPT/RDC bridge for its automated worker path. The connection is an operational prerequisite, not evidence of an OS security boundary.
 
-## Inspecting local operation intents
+## Inspecting and reconciling local patch evidence
 
 Source builds with the local intent-journal package can inspect one recorded
 operation without opening a worker session:
@@ -183,6 +183,54 @@ fresh chat or stale heartbeat does not resolve it. Backup/verification/restore
 preserve these records, refuse incomplete coverage, and retain the prohibition
 on backing up active runs. Ordinary evidence pruning does not delete intents.
 The journal persists metadata only; it cannot reconstruct replacement bytes.
+
+Source builds also expose separate execution inspection and explicit local
+reconciliation:
+
+```sh
+orch --root /absolute/state/home bridge execution inspect \
+  --run-id RUN_ID --operation-id OPERATION_ID
+orch --root /absolute/state/home bridge execution reconcile \
+  --run-id RUN_ID --operation-id OPERATION_ID --cap /absolute/run/capability
+```
+
+Execution inspection validates the append-once `dispatch`, `publication` and
+`result` chain against its intent. `RECORDED` includes whether a terminal result
+exists; an existing `APPLIED` or `NOT_APPLIED` receipt is historical evidence,
+not a claim about current bytes. Terminal presence describes validated record
+structure; it does not acknowledge durability for a service reply or run
+closure. Inspection creates no state, opens no session and performs no fsync,
+cleanup or content-based recovery.
+
+Reconciliation takes its request only from validated stored evidence and opens
+a fresh session with current `RUNNING` run/capability authority. It never
+replays replacement bytes, dispatches, stages or renames a patch. Exact recorded
+inode/content/metadata observations may close the ID as `APPLIED` or
+`NOT_APPLIED`; ambiguity stays `UNKNOWN`. A scratch file without proven recorded
+ownership is preserved. Every terminal ID stays closed, including `NOT_APPLIED`.
+Keep capability contents private; supply only the file path.
+
+Trusted local `LocalBoundedFilePatcher.apply(request, replacement)` supplies a
+complete replacement of at most 65,536 bytes for one existing, allowed regular
+file whose original is also bounded. The target must be current-user owned and
+single-link; native macOS checks preserve ordinary uid/gid/mode and bounded
+xattrs, while unsupported metadata is refused. Apply, reconciliation and core
+submit/quiesce/abort use the same private runtime directory descriptor lock.
+Unresolved or unsafe execution evidence blocks those transitions and preserves
+writer/capability authority. Historical service replies and closure of runs with
+terminal execution evidence require renewed acknowledgement under that lock:
+fsync every existing phase record, its linked intent and all pinned directories
+through home, then independently reread exact bytes and identities. A failed
+renewal stays `UNKNOWN` for the service and refuses core closure. The records
+are preserved, and later workspace edits remain untouched. Backups preserve
+exact execution evidence and its intent linkage; ordinary retention does not
+prune it or patch scratch files.
+
+There is no replacement-byte CLI, remote patch endpoint or accepted ordinary
+ChatGPT Bridge route. Cooperative locks and descriptor checks do not establish
+OS compare-and-swap, same-user isolation or power-loss guarantees. Native byte
+verification and Git publication remain independent gates; fault fixtures alone
+do not prove real power-loss recovery.
 
 ## Bounded execution and current limits
 

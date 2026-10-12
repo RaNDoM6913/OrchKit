@@ -297,6 +297,219 @@ class LocalFileScopeTests(unittest.TestCase):
         self.assertFalse(hasattr(module.LocalFileScope, "patch"))
         self.assertFalse(hasattr(module.LocalFileScope, "start_process"))
 
+    def test_patch_recheck_uses_uncached_live_git_and_capability_authority(self):
+        with self._scope() as scope:
+            with scope.open_patch_target(self._request(kind="file.patch")) as target:
+                self._cap().chmod(0o644)
+                with self.assertRaisesRegex(ValueError, "bridge_capability_denied"):
+                    target.recheck()
+                self._cap().chmod(0o600)
+                self._git("-C", str(self._root()), "switch", "-q", "-c", "patch-drift")
+                with self.assertRaisesRegex(ValueError, "bridge_project_binding_denied"):
+                    target.recheck()
+
+
+class PatchScopeDescriptorTests(unittest.TestCase):
+    """Fast descriptor fault matrix; production authority is never cached."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="orch-patch-scope-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "file").write_bytes(b"original")
+        self.binding = WorkerRunBinding("fixture", "writer", "task", "run", 1)
+        self.request = WorkerOperationRequest(self.binding, "operation", "file.patch", "docs/file")
+        self.allowed = ["docs/file", "missing", "missing-parent/file", "link", "fifo"]
+        self.authority = object.__new__(LocalRunSessionAuthority)
+        self.live = mock.patch.object(LocalFileScope, "_live_scope",
+                                      side_effect=lambda: (self.root, list(self.allowed)))
+        self.live_mock = self.live.start()
+        self.addCleanup(self.live.stop)
+
+    def _scope(self):
+        return LocalFileScope(self.authority, "session", self.binding, self.root / "unused-cap")
+
+    def test_patch_handle_owns_fds_and_anchors_and_rechecks_fresh_scope(self):
+        with self._scope() as scope:
+            root_fd = scope._root_fd
+            with scope.open_patch_target(self.request) as target:
+                parent_fd, fd = target.parent_fd, target.fd
+                self.assertEqual(target.leaf, "file")
+                self.assertEqual(os.read(fd, 100), b"original")
+                self.assertEqual(target.anchors["root"], [os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino])
+                self.assertEqual(target.anchors["parent"], [os.fstat(parent_fd).st_dev, os.fstat(parent_fd).st_ino])
+                self.assertEqual(target.anchors["parents"][0], target.anchors["root"])
+                self.assertEqual(target.anchors["parents"][-1], target.anchors["parent"])
+                calls = self.live_mock.call_count
+                target.recheck()
+                self.assertGreater(self.live_mock.call_count, calls)
+                self.allowed = []
+                with self.assertRaisesRegex(ValueError, "bridge_file_scope_"):
+                    target.recheck()
+            for closed in (parent_fd, fd):
+                with self.assertRaises(OSError):
+                    os.fstat(closed)
+            with self.assertRaisesRegex(ValueError, "bridge_file_scope_closed"):
+                target.recheck()
+
+    def test_named_original_substitution_refuses_then_parent_only_gate_accepts(self):
+        with self._scope() as scope:
+            with scope.open_patch_target(self.request) as target:
+                path = self.root / "docs" / "file"
+                path.rename(self.root / "docs" / "old")
+                path.write_bytes(b"replacement")
+                with self.assertRaisesRegex(ValueError, "bridge_file_scope_path_changed"):
+                    target.recheck()
+                target.recheck(original_required=False)
+
+    def test_same_inode_metadata_or_content_drift_refuses_original_gate(self):
+        for change in (lambda path: path.write_bytes(b"drift"), lambda path: path.chmod(0o600)):
+            with self.subTest(change=change):
+                path = self.root / "docs" / "file"
+                path.write_bytes(b"original")
+                path.chmod(0o644)
+                with self._scope() as scope:
+                    with scope.open_patch_target(self.request) as target:
+                        change(path)
+                        with self.assertRaisesRegex(ValueError, "bridge_file_scope_path_changed"):
+                            target.recheck()
+
+    def test_replaced_ancestor_and_root_refuse_even_parent_only_recheck(self):
+        with self._scope() as scope:
+            with scope.open_patch_target(self.request) as target:
+                (self.root / "docs").rename(self.root / "old-docs")
+                (self.root / "docs").mkdir()
+                with self.assertRaisesRegex(ValueError, "bridge_file_scope_path_changed"):
+                    target.recheck(original_required=False)
+
+    def test_replaced_root_refuses_parent_only_recheck(self):
+        previous = self.root.with_name(self.root.name + "-previous")
+        try:
+            with self._scope() as scope:
+                with scope.open_patch_target(self.request) as target:
+                    self.root.rename(previous)
+                    self.root.mkdir()
+                    with self.assertRaisesRegex(ValueError, "bridge_file_scope_root_changed"):
+                        target.recheck(original_required=False)
+        finally:
+            if previous.exists():
+                self.root.rmdir()
+                previous.rename(self.root)
+
+    def test_parent_acl_including_inheritance_refuses(self):
+        parent = os.stat(self.root / "docs")
+
+        def acl(fd):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
+                raise ValueError("patch_metadata_acl_unsupported")
+
+        with self._scope() as scope, mock.patch.object(module, "require_no_acl", side_effect=acl):
+            with self.assertRaisesRegex(ValueError, "patch_metadata_acl_unsupported"):
+                with scope.open_patch_target(self.request):
+                    self.fail("parent ACL was accepted")
+        with self._scope() as scope:
+            with scope.open_patch_target(self.request) as target:
+                with mock.patch.object(module, "require_no_acl", side_effect=acl):
+                    with self.assertRaisesRegex(ValueError, "patch_metadata_acl_unsupported"):
+                        target.recheck(original_required=False)
+
+    def test_special_modes_hardlinks_and_oversize_original_refuse(self):
+        path = self.root / "docs" / "file"
+        for change in (lambda: path.chmod(0o4644),
+                       lambda: os.link(path, self.root / "hardlink"),
+                       lambda: path.write_bytes(b"x" * 65537)):
+            with self.subTest(change=change):
+                with self._scope() as scope:
+                    change()
+                    with self.assertRaisesRegex(ValueError, "patch_metadata_target_unsafe"):
+                        with scope.open_patch_target(self.request):
+                            pass
+                path.chmod(0o644)
+                if (self.root / "hardlink").exists():
+                    (self.root / "hardlink").unlink()
+                path.write_bytes(b"original")
+
+    def test_missing_symlink_and_fifo_never_create_or_open_write(self):
+        (self.root / "link").symlink_to(self.root / "docs" / "file")
+        os.mkfifo(self.root / "fifo")
+        with self._scope() as scope:
+            for name in ("missing", "missing-parent/file", "link", "fifo"):
+                request = dataclasses.replace(self.request, target=name)
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, "bridge_file_scope_"):
+                        with scope.open_patch_target(request):
+                            pass
+        self.assertFalse((self.root / "missing").exists())
+        self.assertFalse((self.root / "missing-parent").exists())
+
+    def test_caller_exception_closes_handles_and_scope_close_is_busy(self):
+        with self._scope() as scope:
+            with self.assertRaisesRegex(RuntimeError, "caller"):
+                with scope.open_patch_target(self.request) as target:
+                    parent_fd, fd = target.parent_fd, target.fd
+                    with self.assertRaisesRegex(ValueError, "bridge_file_scope_busy"):
+                        scope.close()
+                    raise RuntimeError("caller")
+            for closed in (parent_fd, fd):
+                with self.assertRaises(OSError):
+                    os.fstat(closed)
+
+    def test_failed_metadata_gate_closes_all_new_descriptors(self):
+        opened = []
+        original_open, original_dup = os.open, os.dup
+
+        def record_open(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def record_dup(*args, **kwargs):
+            fd = original_dup(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        with self._scope() as scope:
+            with mock.patch.object(module.os, "open", side_effect=record_open), \
+                 mock.patch.object(module.os, "dup", side_effect=record_dup), \
+                 mock.patch.object(module, "read_file_metadata", side_effect=ValueError("patch_metadata_unreadable")):
+                # A wrapped os.open must still advertise the existing primitive.
+                supports = set(os.supports_dir_fd) | {module.os.open}
+                with mock.patch.object(module.os, "supports_dir_fd", supports):
+                    with self.assertRaisesRegex(ValueError, "patch_metadata_unreadable"):
+                        with scope.open_patch_target(self.request):
+                            pass
+            self.assertTrue(opened)
+            for fd in set(opened):
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
+    def test_patch_rejects_wrong_kind_and_unsupported_descriptor_rename(self):
+        with self._scope() as scope:
+            with self.assertRaisesRegex(ValueError, "bridge_file_scope_kind_unsupported"):
+                with scope.open_patch_target(dataclasses.replace(self.request, kind="file.read")):
+                    pass
+            supports = set(os.supports_dir_fd) - {os.rename}
+            with mock.patch.object(module.os, "supports_dir_fd", supports):
+                with self.assertRaisesRegex(ValueError, "bridge_file_scope_unsupported"):
+                    with scope.open_patch_target(self.request):
+                        pass
+
+    def test_native_descriptor_relative_replace_operates_on_anchored_parent(self):
+        with self._scope() as scope:
+            with scope.open_patch_target(self.request) as target:
+                scratch = os.open("owned-temp", os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                  0o600, dir_fd=target.parent_fd)
+                os.write(scratch, b"replacement")
+                staged = os.fstat(scratch)
+                os.close(scratch)
+                os.replace("owned-temp", target.leaf, src_dir_fd=target.parent_fd,
+                           dst_dir_fd=target.parent_fd)
+                target.recheck(original_required=False)
+                actual = os.stat(target.leaf, dir_fd=target.parent_fd, follow_symlinks=False)
+                self.assertEqual((actual.st_dev, actual.st_ino), (staged.st_dev, staged.st_ino))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,11 +40,19 @@ an already-installed runtime; deployment and release evidence remain separate.
 The 0.11.0 publication gate closed on October 8, 2026. Subsequent source work
 has completed the disposable multi-project scheduler checks and transport
 contract/storage separation, plus local session authority, bounded file
-read/list, directory grants, original-content preflight and durable patch-intent
-inspection/readback. These source capabilities do not alter frozen 0.11.0
-artifacts or prove independent ordinary-Chat Bridge workers. Actual workspace
-mutation, owned processes, a Bridge service/broker and the remote route remain
-unimplemented.
+read/list, directory grants, original-content preflight, durable patch-intent
+inspection/readback and bounded trusted-local existing-file replacement with
+explicit crash reconciliation. The replacement API is macOS-only, preserves
+bounded metadata, uses append-once execution evidence and the same cooperative
+runtime lock as guarded run transitions, and never replays an unresolved ID.
+Inspection exposes structural terminal evidence; historical service replies
+and run closure require renewed acknowledgement of the exact existing chain
+and linked intent under that lock. Failed renewal preserves evidence and blocks
+closure. Returned receipts remain historical after later workspace edits. These
+source capabilities do not alter frozen 0.11.0 artifacts, prove power-loss or
+same-user isolation, or accept independent ordinary-Chat Bridge workers. General
+write/create/delete operations, owned processes, a product Bridge service/broker
+and the remote route remain unimplemented.
 
 The first target is one operator, one Mac, and up to three independent project workers. Preserve one active writer per existing `writer_key`; linked worktrees that share a Git common directory remain serialized.
 

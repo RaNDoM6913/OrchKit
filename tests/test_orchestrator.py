@@ -1,11 +1,14 @@
 import hashlib
 from contextlib import closing
+import dataclasses
 import json
 import os
 import sqlite3
 from pathlib import Path
+import select
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,8 @@ from unittest import mock
 
 from orch.core import Orchestrator, _begin_immediate, canonical_json
 from orch.codex_review import prepare_review, run_review, _binary_info
+from orch import bridge_operation_journal, bridge_patch_execution
+from orch.worker_operations import WorkerOperationRequest, WorkerRunBinding
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -52,6 +57,425 @@ class OrchestratorTests(unittest.TestCase):
         self.orch.submit(claim['run_id'],lease,receipt)
         self.orch.quiesce(claim['run_id'],lease)
         return self.orch.verify(claim['run_id'])
+
+    def _patch_transition_fixture(self, transition, *, project_id="guard-project"):
+        # Each case uses ordinary admission/claim/receipt APIs and independent
+        # immutable evidence; no ledger states or capabilities are forged.
+        number = len(list(self.root.glob("patch-home-*"))) + 1
+        home = (self.root / f"patch-home-{number}").resolve()
+        home.mkdir()
+        orch = Orchestrator(home)
+        tid = f"PATCH-GUARD-{number}"
+        target = self.ws / f"{tid}.json"
+        target.write_bytes(b"original")
+        task = self.task(tid)
+        if project_id is not None:
+            task["project_id"] = project_id
+        plan = home / "plan.json"
+        plan.write_text(json.dumps({"schema_version": 1,
+                                   "plan_revision": "patch-guard",
+                                   "tasks": [task]}))
+        orch.load_plan(plan)
+        claim = orch.claim("patch-transition-worker")
+        capability = Path(claim["capability_file"])
+        lease = orch.lease_from_capability(claim["run_id"], capability)
+        receipt = Path(claim["receipt_file"])
+        receipt.write_text(json.dumps({"run_id": claim["run_id"],
+                                       "task_id": tid,
+                                       "changed_paths": [target.name]}))
+        if transition == "quiesce":
+            orch.submit(claim["run_id"], lease, receipt)
+        with orch.connect() as conn:
+            row = conn.execute(
+                "SELECT r.task_id,r.attempt,t.project_id,t.writer_key "
+                "FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE r.run_id=?",
+                (claim["run_id"],),
+            ).fetchone()
+        binding = dict(project_id=row["project_id"], writer_key=row["writer_key"],
+                       task_id=row["task_id"], run_id=claim["run_id"],
+                       attempt=row["attempt"])
+        return {"orch": orch, "home": home, "claim": claim, "lease": lease,
+                "capability": capability, "receipt": receipt,
+                "target": target, "binding": binding, "transition": transition}
+
+    @staticmethod
+    def _patch_transition_invoke(fixture):
+        orch, run_id = fixture["orch"], fixture["claim"]["run_id"]
+        if fixture["transition"] == "submit":
+            return orch.submit(run_id, fixture["lease"], fixture["receipt"])
+        if fixture["transition"] == "quiesce":
+            return orch.quiesce(run_id, fixture["lease"])
+        return orch.abort(run_id, "patch transition fixture")
+
+    @staticmethod
+    def _patch_transition_state(fixture):
+        with fixture["orch"].connect() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE run_id=?",
+                               (fixture["claim"]["run_id"],)).fetchone()
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                (run["task_id"],)).fetchone()
+            events = [dict(row) for row in conn.execute("SELECT * FROM events ORDER BY seq")]
+        return dict(run), dict(task), events, fixture["capability"].read_bytes()
+
+    def _patch_transition_records(self, fixture, *, disposition=None, binding_changes=None,
+                                  operation_id="guard-operation", fail_result_sync=False):
+        binding = dict(fixture["binding"], **(binding_changes or {}))
+        request = WorkerOperationRequest(WorkerRunBinding(**binding), operation_id,
+                                         "file.patch", fixture["target"].name)
+        original_bytes, replacement_bytes = b"original", b"replacement"
+        replacement = {"schema_version": 1,
+                       "baseline": {"sha256": hashlib.sha256(original_bytes).hexdigest(),
+                                    "size_bytes": len(original_bytes)},
+                       "sha256": hashlib.sha256(replacement_bytes).hexdigest(),
+                       "size_bytes": len(replacement_bytes)}
+        intent = bridge_operation_journal.build_intent_record(request, replacement)
+        created = bridge_operation_journal.OperationIntentJournal(fixture["home"]).create(
+            intent, authorize=lambda: None)
+        self.assertEqual(created["status"], "CREATED", created)
+
+        def content(path, raw):
+            info = path.stat()
+            signature = {"dev": info.st_dev, "ino": info.st_ino, "mode": info.st_mode,
+                         "uid": info.st_uid, "gid": info.st_gid, "nlink": info.st_nlink,
+                         "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                         "ctime_ns": info.st_ctime_ns, "flags": getattr(info, "st_flags", 0)}
+            return {"identity": signature, "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size_bytes": len(raw), "xattrs_digest": "0" * 64}
+
+        info = self.ws.stat()
+        parent = [info.st_dev, info.st_ino]
+        common = {"schema_version": 1, "request": dataclasses.asdict(request),
+                  "intent_fingerprint": intent["fingerprint"],
+                  "created_at": "2026-10-11T12:00:00.000000Z"}
+        dispatch = dict(common, phase="DISPATCH",
+                        anchors={"root": parent, "parents": [parent], "parent": parent},
+                        original=content(fixture["target"], original_bytes),
+                        temp_name=".orch-patch-" + "a" * 32 + ".tmp")
+        store = bridge_patch_execution.PatchExecutionStore(fixture["home"])
+        with bridge_patch_execution.runtime_operation_lock(fixture["home"]):
+            self.assertEqual(store.append(dispatch, authorize=lambda: None)["status"], "CREATED")
+            if disposition is not None:
+                publication = None
+                target = dispatch["original"]
+                basis = "RECONCILE_NO_PUBLICATION"
+                if disposition == "APPLIED":
+                    staged = self.ws / dispatch["temp_name"]
+                    staged.write_bytes(replacement_bytes)
+                    staged.chmod(stat.S_IMODE(fixture["target"].stat().st_mode))
+                    publication = dict(common, phase="PUBLICATION",
+                                       dispatch_sha256=bridge_patch_execution.execution_record_hash(dispatch),
+                                       staged=content(staged, replacement_bytes))
+                    self.assertEqual(store.append(publication, authorize=lambda: None)["status"], "CREATED")
+                    os.replace(staged, fixture["target"])
+                    target, basis = content(fixture["target"], replacement_bytes), "APPLY"
+                result = dict(common, phase="RESULT",
+                              dispatch_sha256=bridge_patch_execution.execution_record_hash(dispatch),
+                              publication_sha256=(bridge_patch_execution.execution_record_hash(publication)
+                                                  if publication else None),
+                              disposition=disposition,
+                              basis={"kind": basis, "target": target, "temp_absent": True})
+                if fail_result_sync:
+                    operation = (fixture["home"] / ".runtime" / "patch_execution"
+                                 / hashlib.sha256(binding["run_id"].encode()).hexdigest()
+                                 / hashlib.sha256(operation_id.encode()).hexdigest())
+                    real_sync = os.fsync
+                    def sync(fd):
+                        info, directory = os.fstat(fd), operation.stat()
+                        if (operation / "result.json").exists() and (
+                                info.st_dev, info.st_ino) == (directory.st_dev, directory.st_ino):
+                            raise OSError("retained RESULT directory acknowledgement failed")
+                        return real_sync(fd)
+                    with mock.patch.object(bridge_patch_execution.os, "fsync", side_effect=sync):
+                        self.assertEqual(store.append(result, authorize=lambda: None)["status"], "UNKNOWN")
+                    self.assertTrue(store.inspect(binding["run_id"], operation_id)["terminal"])
+                else:
+                    self.assertEqual(store.append(result, authorize=lambda: None)["status"], "CREATED")
+        return store
+
+    @staticmethod
+    def _patch_transition_lock_probe(home):
+        code = (
+            "import sys; sys.path.insert(0," + repr(str(Path(__file__).resolve().parents[1])) + "); "
+            "from pathlib import Path; from orch.bridge_patch_execution import runtime_operation_lock; "
+            "\ntry:\n with runtime_operation_lock(Path(sys.argv[1])): print('ACQUIRED')"
+            "\nexcept ValueError as error: print(str(error))"
+        )
+        return subprocess.run([sys.executable, "-I", "-B", "-c", code, str(home)],
+                              capture_output=True, text=True, timeout=10)
+
+    def test_patch_transition_unresolved_dispatch_preserves_run_task_events_and_capability(self):
+        for transition in ("submit", "quiesce", "abort"):
+            with self.subTest(transition=transition):
+                fixture = self._patch_transition_fixture(transition)
+                store = self._patch_transition_records(fixture)
+                before = self._patch_transition_state(fixture)
+                with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                    self._patch_transition_invoke(fixture)
+                self.assertEqual(self._patch_transition_state(fixture), before)
+                self.assertFalse(store.inspect(fixture["claim"]["run_id"], "guard-operation")["terminal"])
+
+    def test_patch_transition_unknown_inventory_preserves_run_and_capability(self):
+        for transition in ("submit", "quiesce", "abort"):
+            with self.subTest(transition=transition):
+                fixture = self._patch_transition_fixture(transition)
+                directory = fixture["home"] / ".runtime" / "patch_execution"
+                directory.mkdir(mode=0o700)
+                (directory / "unrecognized-evidence").write_bytes(b"partial")
+                before = self._patch_transition_state(fixture)
+                self.assertEqual(bridge_patch_execution.execution_inventory(fixture["home"])["status"], "UNKNOWN")
+                with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                    self._patch_transition_invoke(fixture)
+                self.assertEqual(self._patch_transition_state(fixture), before)
+
+    def test_patch_transition_terminal_foreign_ledger_binding_is_blocked(self):
+        changes = (({"project_id": "foreign-project"}, "guard-project"),
+                   ({"writer_key": "foreign:key"}, "guard-project"),
+                   ({"task_id": "FOREIGN-TASK"}, "guard-project"),
+                   ({"attempt": 2}, "guard-project"),
+                   ({"project_id": "guard-project"}, None),
+                   ({"project_id": "guard-project"}, "LegacyProject"))
+        for transition in ("submit", "quiesce", "abort"):
+            for change, project_id in changes:
+                with self.subTest(transition=transition, change=change, project_id=project_id):
+                    fixture = self._patch_transition_fixture(transition, project_id=project_id)
+                    self._patch_transition_records(fixture, disposition="NOT_APPLIED", binding_changes=change)
+                    before = self._patch_transition_state(fixture)
+                    with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                        self._patch_transition_invoke(fixture)
+                    self.assertEqual(self._patch_transition_state(fixture), before)
+
+    def test_patch_transition_terminal_chains_and_legacy_absence_pass(self):
+        cases = (("APPLIED", "guard-project"), ("NOT_APPLIED", "guard-project"),
+                 (None, None), (None, "LegacyProject"))
+        expected = {"submit": "RESULT_SUBMITTED", "quiesce": "VERIFYING", "abort": "ABORTED"}
+        for transition in ("submit", "quiesce", "abort"):
+            for disposition, project_id in cases:
+                with self.subTest(transition=transition, disposition=disposition, project_id=project_id):
+                    fixture = self._patch_transition_fixture(transition, project_id=project_id)
+                    if disposition:
+                        self._patch_transition_records(fixture, disposition=disposition)
+                    result = self._patch_transition_invoke(fixture)
+                    self.assertEqual(result["status"], expected[transition])
+                    self.assertEqual(fixture["capability"].exists(), transition == "submit")
+                    if disposition is None:
+                        self.assertFalse((fixture["home"] / ".runtime" / "patch_execution").exists())
+
+    def test_patch_transition_retained_result_and_multioperation_sync_failure_refuse_atomically(self):
+        for transition in ("submit", "quiesce", "abort"):
+            for disposition in ("APPLIED", "NOT_APPLIED"):
+                with self.subTest(transition=transition, disposition=disposition):
+                    fixture = self._patch_transition_fixture(transition)
+                    self._patch_transition_records(fixture, disposition="NOT_APPLIED",
+                                                   operation_id="acknowledged-first")
+                    self._patch_transition_records(fixture, disposition=disposition,
+                                                   fail_result_sync=True)
+                    census = bridge_patch_execution.execution_inventory(fixture["home"])
+                    before = self._patch_transition_state(fixture)
+                    failed_result = (fixture["home"] / ".runtime" / "patch_execution"
+                                     / hashlib.sha256(fixture["claim"]["run_id"].encode()).hexdigest()
+                                     / hashlib.sha256(b"guard-operation").hexdigest() / "result.json")
+                    failures = []
+                    real_sync = os.fsync
+                    def sync(fd):
+                        info, retained = os.fstat(fd), failed_result.stat()
+                        if (info.st_dev, info.st_ino) == (retained.st_dev, retained.st_ino):
+                            failures.append(fd)
+                            raise OSError("persistent terminal record sync failure")
+                        return real_sync(fd)
+                    with mock.patch.object(bridge_patch_execution.os, "fsync", side_effect=sync):
+                        with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                            self._patch_transition_invoke(fixture)
+                    self.assertEqual(len(failures), 1)
+                    self.assertEqual(self._patch_transition_state(fixture), before)
+                    self.assertEqual(bridge_patch_execution.execution_inventory(fixture["home"]), census)
+                    with fixture["orch"].connect() as conn:
+                        locks = fixture["orch"]._active_writer_locks(conn)
+                    self.assertIn(fixture["binding"]["writer_key"], locks)
+                    self.assertEqual(self._patch_transition_invoke(fixture)["status"],
+                                     {"submit": "RESULT_SUBMITTED", "quiesce": "VERIFYING",
+                                      "abort": "ABORTED"}[transition])
+
+    def test_patch_transition_renewal_rechecks_caller_authority_before_and_after(self):
+        for transition in ("submit", "quiesce", "abort"):
+            for boundary in ("before", "after"):
+                with self.subTest(transition=transition, boundary=boundary):
+                    fixture = self._patch_transition_fixture(transition)
+                    self._patch_transition_records(fixture, disposition="NOT_APPLIED")
+                    before = self._patch_transition_state(fixture)
+                    original_guard = bridge_patch_execution.require_execution_resolved
+                    synced = [];real_sync = os.fsync
+                    def sync(fd):
+                        real_sync(fd);synced.append(fd)
+                    def guard(home, run_id, binding, *, authorize=None):
+                        self.assertTrue(callable(authorize), "transition lacks live caller authority")
+                        calls = []
+                        def authority():
+                            calls.append(None)
+                            if boundary == "before" or synced:
+                                raise ValueError("caller authority revoked")
+                            return authorize()
+                        return original_guard(home, run_id, binding, authorize=authority)
+                    with mock.patch("orch.core.require_execution_resolved", side_effect=guard), \
+                         mock.patch.object(bridge_patch_execution.os, "fsync", side_effect=sync):
+                        with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                            self._patch_transition_invoke(fixture)
+                    self.assertEqual(self._patch_transition_state(fixture), before)
+                    self.assertEqual(bool(synced), boundary == "after")
+
+    def test_patch_transition_authority_callback_reads_fresh_transaction_state(self):
+        for transition in ("submit", "quiesce", "abort"):
+            for drift in ("lease", "state", "binding"):
+                with self.subTest(transition=transition, drift=drift):
+                    fixture = self._patch_transition_fixture(transition)
+                    self._patch_transition_records(fixture, disposition="NOT_APPLIED")
+                    before = self._patch_transition_state(fixture)
+                    real_connect = fixture["orch"].connect
+                    connections = []
+                    def connect():
+                        connection = real_connect();connections.append(connection)
+                        return connection
+                    real_sync = os.fsync;injected = []
+                    def sync(fd):
+                        real_sync(fd)
+                        if not injected:
+                            if drift == "lease":
+                                connections[-1].execute("UPDATE runs SET lease_token=? WHERE run_id=?",
+                                                       ("changed during sync", fixture["claim"]["run_id"]))
+                            elif drift == "state":
+                                connections[-1].execute("UPDATE runs SET state='ABORTED' WHERE run_id=?",
+                                                       (fixture["claim"]["run_id"],))
+                            else:
+                                connections[-1].execute("UPDATE tasks SET writer_key=? WHERE task_id=?",
+                                                       ("foreign:writer", fixture["claim"]["task_id"]))
+                            injected.append(True)
+                    with mock.patch.object(fixture["orch"], "connect", side_effect=connect), \
+                         mock.patch.object(bridge_patch_execution.os, "fsync", side_effect=sync):
+                        with self.assertRaisesRegex(ValueError, "patch_execution_unresolved"):
+                            self._patch_transition_invoke(fixture)
+                    self.assertTrue(injected)
+                    self.assertEqual(self._patch_transition_state(fixture), before)
+
+    def test_patch_transition_external_flock_blocks_before_connect_or_receipt_read(self):
+        code = "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); fcntl.flock(fd,fcntl.LOCK_EX); print('LOCKED',flush=True); sys.stdin.read(1)"
+        for transition in ("submit", "quiesce", "abort"):
+            with self.subTest(transition=transition):
+                fixture = self._patch_transition_fixture(transition)
+                before = self._patch_transition_state(fixture)
+                process = subprocess.Popen([sys.executable, "-I", "-B", "-c", code,
+                                            str(fixture["home"] / ".runtime")],
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(select.select([process.stdout], [], [], 10)[0],
+                                    "external flock holder did not become ready")
+                    self.assertEqual(process.stdout.readline().strip(), "LOCKED")
+                    with mock.patch.object(fixture["orch"], "connect", side_effect=AssertionError("connect before lock")):
+                        with mock.patch.object(fixture["orch"], "_load_worker_receipt", side_effect=AssertionError("receipt before lock")):
+                            with self.assertRaisesRegex(ValueError, "patch_execution_busy"):
+                                self._patch_transition_invoke(fixture)
+                    self.assertEqual(self._patch_transition_state(fixture), before)
+                finally:
+                    process.communicate("x", timeout=10)
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(self._patch_transition_invoke(fixture)["status"],
+                                 {"submit": "RESULT_SUBMITTED", "quiesce": "VERIFYING", "abort": "ABORTED"}[transition])
+
+    def test_patch_transition_lock_covers_validation_census_commit_and_revocation(self):
+        for transition in ("submit", "quiesce", "abort"):
+            with self.subTest(transition=transition):
+                fixture = self._patch_transition_fixture(transition)
+                self._patch_transition_records(fixture, disposition="NOT_APPLIED")
+                orch = fixture["orch"]
+                observed = []
+
+                def locked(stage):
+                    observed.append(stage)
+                    probe = self._patch_transition_lock_probe(fixture["home"])
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    self.assertEqual(probe.stdout.strip(), "patch_execution_busy", stage)
+
+                connect, revoke, receipt_load = orch.connect, orch._revoke_capability, orch._load_worker_receipt
+                real_sync = os.fsync
+
+                class TracedConnection:
+                    def __init__(self, connection):
+                        self.connection = connection
+                    def __enter__(self):
+                        self.connection.__enter__()
+                        return self
+                    def __exit__(self, *args):
+                        return self.connection.__exit__(*args)
+                    def execute(self, sql, *args):
+                        if sql.startswith("UPDATE ") or sql.startswith("INSERT "):
+                            locked("mutation")
+                        result = self.connection.execute(sql, *args)
+                        if sql in ("BEGIN IMMEDIATE", "COMMIT"):
+                            locked(sql)
+                        return result
+
+                def traced_connect():
+                    locked("connect")
+                    return TracedConnection(connect())
+
+                def census(home, run_id, binding, *, authorize=None):
+                    locked("census")
+                    self.assertEqual(home, fixture["home"])
+                    self.assertEqual(run_id, fixture["claim"]["run_id"])
+                    self.assertEqual(binding, WorkerRunBinding(**fixture["binding"]))
+                    def authority():
+                        locked("authority")
+                        return authorize()
+                    return bridge_patch_execution.require_execution_resolved(
+                        home, run_id, binding, authorize=authority)
+
+                def traced_revoke(run_id):
+                    locked("revoke")
+                    return revoke(run_id)
+
+                def traced_receipt(*args):
+                    locked("receipt")
+                    return receipt_load(*args)
+
+                def traced_sync(fd):
+                    if "sync" not in observed:
+                        locked("sync")
+                    return real_sync(fd)
+
+                with mock.patch.object(orch, "connect", side_effect=traced_connect), \
+                        mock.patch.object(orch, "_revoke_capability", side_effect=traced_revoke), \
+                        mock.patch.object(orch, "_load_worker_receipt", side_effect=traced_receipt), \
+                        mock.patch("orch.core.require_execution_resolved", side_effect=census), \
+                        mock.patch.object(bridge_patch_execution.os, "fsync", side_effect=traced_sync):
+                    self._patch_transition_invoke(fixture)
+                self.assertLess(observed.index("census"), observed.index("COMMIT"))
+                self.assertLess(observed.index("census"), observed.index("mutation"))
+                self.assertLess(observed.index("sync"), observed.index("mutation"))
+                self.assertGreater(observed.count("authority"), 1)
+                self.assertEqual(observed[:3], (["receipt", "connect", "BEGIN IMMEDIATE"]
+                                                if transition == "submit" else ["connect", "BEGIN IMMEDIATE", "census"]))
+                if transition != "submit":
+                    self.assertGreater(observed.index("revoke"), observed.index("COMMIT"))
+                probe = self._patch_transition_lock_probe(fixture["home"])
+                self.assertEqual(probe.stdout.strip(), "ACQUIRED", probe.stderr)
+
+    def test_patch_transition_existing_validation_precedes_census(self):
+        for transition in ("submit", "quiesce", "abort"):
+            with self.subTest(transition=transition):
+                fixture = self._patch_transition_fixture(transition)
+                self._patch_transition_records(fixture)
+                if transition == "abort":
+                    fixture["orch"].checkpoint(fixture["claim"]["run_id"], fixture["lease"],
+                                                "unknown external worker", "unknown")
+                    error = "process_inactivity_confirmation_required"
+                else:
+                    fixture["lease"] = "incorrect-lease"
+                    error = "invalid_lease"
+                before = self._patch_transition_state(fixture)
+                with mock.patch("orch.core.require_execution_resolved") as census:
+                    with self.assertRaisesRegex(ValueError, error):
+                        self._patch_transition_invoke(fixture)
+                census.assert_not_called()
+                self.assertEqual(self._patch_transition_state(fixture), before)
 
     def test_connect_retries_transient_protocol_without_rewriting_wal_mode(self):
         original_connect = sqlite3.connect

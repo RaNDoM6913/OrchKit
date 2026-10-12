@@ -19,7 +19,9 @@ from .config import (atomic_write_json, ensure_private_dir,
                      ensure_private_file, read_bounded_json_object,
                      read_bounded_regular_file, regular_file_read_flags)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
+from .bridge_patch_execution import runtime_operation_lock, require_execution_resolved
 from .review_policy import decide_review, normalize_review_policy
+from .worker_operations import WorkerRunBinding
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
 WRITER_LOCK_RUN_STATES = ACTIVE_RUN_STATES | {"VERIFIED"}
@@ -75,6 +77,40 @@ def utc_now() -> str:
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _ledger_worker_binding(run: sqlite3.Row, task: sqlite3.Row):
+    binding = {
+        "project_id": task["project_id"], "writer_key": task["writer_key"],
+        "task_id": run["task_id"], "run_id": run["run_id"],
+        "attempt": run["attempt"],
+    }
+    project_id = binding["project_id"]
+    if project_id is None or re.fullmatch(r"[a-z0-9._-]{1,160}", project_id, re.ASCII) is None:
+        # Legacy tasks may lack a project ID or use the core's uppercase IDs.
+        # Preserve exact identity: absent execution stays usable, while a
+        # canonical recorded request cannot match these legacy project fields.
+        return binding
+    return WorkerRunBinding(**binding)
+
+
+def _execution_transition_authorizer(conn: sqlite3.Connection, run: sqlite3.Row,
+                                     task: sqlite3.Row):
+    """Renew the validated caller's authority inside its existing transaction."""
+    expected_binding = _ledger_worker_binding(run, task)
+    run_id, state, lease_token = run["run_id"], run["state"], run["lease_token"]
+
+    def authorize():
+        current = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if (not current or current["state"] != state
+                or not secrets.compare_digest(current["lease_token"], lease_token)):
+            raise ValueError("patch_execution_authority_changed")
+        current_task = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                    (current["task_id"],)).fetchone()
+        if current_task is None or _ledger_worker_binding(current, current_task) != expected_binding:
+            raise ValueError("patch_execution_authority_changed")
+
+    return authorize
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -2454,44 +2490,47 @@ class Orchestrator:
         }
 
     def submit(self, run_id: str, lease_token: str, receipt_path: Path) -> Dict[str, Any]:
-        receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
-            run_id, receipt_path
-        )
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            if not run or not secrets.compare_digest(run["lease_token"], lease_token):
-                conn.execute("ROLLBACK")
-                raise ValueError("invalid_lease")
-            if run["state"] != "RUNNING":
-                conn.execute("ROLLBACK")
-                raise ValueError("run_not_running")
-            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
-            payload = self._task_payload(task)
-            if receipt.get("run_id") != run_id or receipt.get("task_id") != run["task_id"]:
-                conn.execute("ROLLBACK")
-                raise ValueError("receipt_identity_mismatch")
-            changed = receipt.get("changed_paths")
-            if not isinstance(changed, list) or not changed:
-                conn.execute("ROLLBACK")
-                raise ValueError("receipt_changed_paths_required")
-            for relative in changed:
-                if not isinstance(relative, str) or not path_allowed(relative, payload.get("allowed_paths", [])):
-                    conn.execute("ROLLBACK")
-                    raise ValueError(f"path_not_allowed:{relative}")
-            now = utc_now()
-            conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
-                         (canonical_json(receipt), now, now, run_id))
-            self._event(
-                conn, "RESULT_SUBMITTED",
-                task_id=run["task_id"], run_id=run_id,
-                payload={
-                    "changed_paths": changed,
-                    "receipt_sha256": receipt_sha256,
-                    "receipt_bytes": receipt_bytes,
-                },
+        with runtime_operation_lock(self.root):
+            receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
+                run_id, receipt_path
             )
-            conn.execute("COMMIT")
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if not run or not secrets.compare_digest(run["lease_token"], lease_token):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("invalid_lease")
+                if run["state"] != "RUNNING":
+                    conn.execute("ROLLBACK")
+                    raise ValueError("run_not_running")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+                payload = self._task_payload(task)
+                if receipt.get("run_id") != run_id or receipt.get("task_id") != run["task_id"]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("receipt_identity_mismatch")
+                changed = receipt.get("changed_paths")
+                if not isinstance(changed, list) or not changed:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("receipt_changed_paths_required")
+                for relative in changed:
+                    if not isinstance(relative, str) or not path_allowed(relative, payload.get("allowed_paths", [])):
+                        conn.execute("ROLLBACK")
+                        raise ValueError(f"path_not_allowed:{relative}")
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
+                                           authorize=_execution_transition_authorizer(conn, run, task))
+                now = utc_now()
+                conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
+                             (canonical_json(receipt), now, now, run_id))
+                self._event(
+                    conn, "RESULT_SUBMITTED",
+                    task_id=run["task_id"], run_id=run_id,
+                    payload={
+                        "changed_paths": changed,
+                        "receipt_sha256": receipt_sha256,
+                        "receipt_bytes": receipt_bytes,
+                    },
+                )
+                conn.execute("COMMIT")
         return {
             "status": "RESULT_SUBMITTED",
             "run_id": run_id,
@@ -2500,20 +2539,24 @@ class Orchestrator:
         }
 
     def quiesce(self, run_id: str, lease_token: str) -> Dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT task_id,state,lease_token FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            if not row or not secrets.compare_digest(row["lease_token"], lease_token):
-                conn.execute("ROLLBACK")
-                raise ValueError("invalid_lease")
-            if row["state"] != "RESULT_SUBMITTED":
-                conn.execute("ROLLBACK")
-                raise ValueError("result_not_submitted")
-            conn.execute("UPDATE runs SET state='VERIFYING',heartbeat_at=? WHERE run_id=?", (utc_now(), run_id))
-            self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
-                        payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
-            conn.execute("COMMIT")
-        revoked = self._revoke_capability(run_id)
+        with runtime_operation_lock(self.root):
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if not row or not secrets.compare_digest(row["lease_token"], lease_token):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("invalid_lease")
+                if row["state"] != "RESULT_SUBMITTED":
+                    conn.execute("ROLLBACK")
+                    raise ValueError("result_not_submitted")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (row["task_id"],)).fetchone()
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(row, task),
+                                           authorize=_execution_transition_authorizer(conn, row, task))
+                conn.execute("UPDATE runs SET state='VERIFYING',heartbeat_at=? WHERE run_id=?", (utc_now(), run_id))
+                self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
+                            payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
+                conn.execute("COMMIT")
+            revoked = self._revoke_capability(run_id)
         return {"status": "VERIFYING", "residual_risk": "cooperative_direct_rdc_not_os_fenced",
                 "capability_revoked": revoked}
 
@@ -4094,52 +4137,56 @@ class Orchestrator:
         self, run_id: str, reason: str, retry: bool = False,
         process_inactivity_confirmed: bool = False,
     ) -> Dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id=?", (run_id,)
-            ).fetchone()
-            if not run or run["state"] not in ACTIVE_RUN_STATES:
-                conn.execute("ROLLBACK")
-                raise ValueError("run_not_active")
-            checkpoint = conn.execute(
-                "SELECT value_json FROM settings WHERE key=?",
-                (f"run_checkpoint:{run_id}",),
-            ).fetchone()
-            if (
-                run["state"] == "RUNNING"
-                and checkpoint is not None
-                and not process_inactivity_confirmed
-            ):
-                conn.execute("ROLLBACK")
-                raise ValueError("process_inactivity_confirmation_required")
-            now = utc_now()
-            state = "NEEDS_FIX" if retry else "BLOCKED"
-            conn.execute(
-                "UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?",
-                (reason[:1000], now, run_id),
-            )
-            conn.execute(
-                "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
-                (state, now, run["task_id"]),
-            )
-            payload = {
-                "reason": reason[:500],
-                "retry": retry,
-                "checkpoint_present": checkpoint is not None,
-                "process_inactivity_confirmation": (
-                    "operator_asserted"
-                    if checkpoint is not None and process_inactivity_confirmed
-                    else None
-                ),
-                "process_fencing": False,
-            }
-            self._event(
-                conn, "RUN_ABORTED", task_id=run["task_id"],
-                run_id=run_id, payload=payload,
-            )
-            conn.execute("COMMIT")
-        self._revoke_capability(run_id)
+        with runtime_operation_lock(self.root):
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                run = conn.execute(
+                    "SELECT * FROM runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+                if not run or run["state"] not in ACTIVE_RUN_STATES:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("run_not_active")
+                checkpoint = conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (f"run_checkpoint:{run_id}",),
+                ).fetchone()
+                if (
+                    run["state"] == "RUNNING"
+                    and checkpoint is not None
+                    and not process_inactivity_confirmed
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("process_inactivity_confirmation_required")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
+                                           authorize=_execution_transition_authorizer(conn, run, task))
+                now = utc_now()
+                state = "NEEDS_FIX" if retry else "BLOCKED"
+                conn.execute(
+                    "UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?",
+                    (reason[:1000], now, run_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
+                    (state, now, run["task_id"]),
+                )
+                payload = {
+                    "reason": reason[:500],
+                    "retry": retry,
+                    "checkpoint_present": checkpoint is not None,
+                    "process_inactivity_confirmation": (
+                        "operator_asserted"
+                        if checkpoint is not None and process_inactivity_confirmed
+                        else None
+                    ),
+                    "process_fencing": False,
+                }
+                self._event(
+                    conn, "RUN_ABORTED", task_id=run["task_id"],
+                    run_id=run_id, payload=payload,
+                )
+                conn.execute("COMMIT")
+            self._revoke_capability(run_id)
         return {
             "status": "ABORTED",
             "run_id": run_id,

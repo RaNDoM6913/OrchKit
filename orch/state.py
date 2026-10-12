@@ -19,6 +19,10 @@ from .bridge_operation_journal import (
     JOURNAL_DIRECTORY, JOURNAL_MAX_RECORDS, JOURNAL_MAX_RECORDS_PER_RUN,
     JOURNAL_RECORD_MAX_BYTES, journal_inventory, validate_intent_record,
 )
+from .bridge_patch_execution import (
+    EXECUTION_DIRECTORY, EXECUTION_MAX_OPERATIONS, EXECUTION_MAX_OPERATIONS_PER_RUN,
+    EXECUTION_RECORD_MAX_BYTES, execution_inventory, validate_execution_records,
+)
 from .core import (ACTIVE_RUN_STATES, STATE_SCHEMA_VERSION, WRITER_LOCK_RUN_STATES,
                    Orchestrator, sha256_file, utc_now)
 
@@ -257,6 +261,70 @@ def _operation_journal_recovery(
     return result
 
 
+def _patch_execution_recovery(
+    orch: Orchestrator, *, run_id: Optional[str], project_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    inventory = execution_inventory(orch.root)
+    if inventory["status"] == "ABSENT":
+        return None
+    result: Dict[str, Any] = {
+        "status": "ATTENTION" if inventory["status"] == "UNKNOWN" else "READY",
+        "inventory_status": inventory["status"],
+        "operations": [],
+    }
+    if inventory["status"] == "UNKNOWN":
+        result["error_code"] = inventory["error_code"]
+        return result
+    with orch.connect() as conn:
+        ledger = {
+            row["run_id"]: dict(row) for row in conn.execute(
+                "SELECT r.run_id,r.task_id,r.attempt,r.state,t.project_id,t.writer_key "
+                "FROM runs r JOIN tasks t ON t.task_id=r.task_id"
+            )
+        }
+    for operation in inventory["operations"]:
+        request = operation["request"]
+        binding = request["binding"]
+        row = ledger.get(binding["run_id"])
+        actual_project = row["project_id"] if row is not None else binding["project_id"]
+        if run_id is not None and binding["run_id"] != run_id:
+            continue
+        if project_id is not None and actual_project != project_id:
+            continue
+        matches = row is not None and all(
+            row[key] == value for key, value in binding.items()
+        )
+        terminal = operation["terminal"]
+        if row is None:
+            classification = "ORPHAN_EXECUTION"
+        elif not matches:
+            classification = "BINDING_MISMATCH"
+        elif terminal:
+            classification = "TERMINAL_HISTORICAL_EXECUTION"
+        else:
+            classification = "UNRESOLVED_EXECUTION"
+        records = operation["records"]
+        receipt = records.get("result")
+        result["operations"].append({
+            "run_id": binding["run_id"],
+            "operation_id": request["operation_id"],
+            "project_id": actual_project,
+            "run_state": row["state"] if row is not None else None,
+            "classification": classification,
+            "ledger_binding_matches": matches,
+            "stored_binding": dict(binding),
+            "intent_fingerprint": operation["intent_fingerprint"],
+            "phases": [phase for phase in ("dispatch", "publication", "result")
+                       if phase in records],
+            "terminal": terminal,
+            "disposition": receipt["disposition"] if receipt is not None else None,
+            "historical": terminal,
+        })
+    if result["operations"]:
+        result["status"] = "ATTENTION"
+    return result
+
+
 def recovery_inspect(
     orch: Orchestrator, *, run_id: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -483,6 +551,12 @@ def recovery_inspect(
         operation_journal is not None
         and operation_journal["status"] == "ATTENTION"
     )
+    patch_execution = _patch_execution_recovery(
+        orch, run_id=run_id, project_id=project_id,
+    )
+    attention = attention or (
+        patch_execution is not None and patch_execution["status"] == "ATTENTION"
+    )
     result = {
         "status": "ATTENTION" if attention else "CLEAN",
         "run_id": run_id,
@@ -497,6 +571,8 @@ def recovery_inspect(
     }
     if operation_journal is not None:
         result["operation_journal"] = operation_journal
+    if patch_execution is not None:
+        result["patch_execution"] = patch_execution
     return result
 
 
@@ -1754,6 +1830,8 @@ def _backup_members(orch: Orchestrator) -> List[Path]:
         )
     inventory = _backup_journal_inventory(orch)
     members.extend(orch.root / relative for relative in inventory["files"])
+    execution = _backup_execution_inventory(orch)
+    members.extend(orch.root / relative for relative in execution["files"])
     return sorted(set(members))
 
 
@@ -1761,6 +1839,13 @@ def _backup_journal_inventory(orch: Orchestrator) -> Dict[str, Any]:
     inventory = journal_inventory(orch.root)
     if inventory["status"] == "UNKNOWN":
         raise ValueError("backup_operation_journal_unknown:" + inventory["error_code"])
+    return inventory
+
+
+def _backup_execution_inventory(orch: Orchestrator) -> Dict[str, Any]:
+    inventory = execution_inventory(orch.root)
+    if inventory["status"] == "UNKNOWN":
+        raise ValueError("backup_patch_execution_unknown:" + inventory["error_code"])
     return inventory
 
 
@@ -2010,6 +2095,9 @@ def _verify_frozen_backup_archive(
 
             file_evidence = manifest.get("file_evidence")
             if file_evidence is None:
+                if any(name.startswith(_PATCH_EXECUTION_ARCHIVE_PREFIX) for name in names):
+                    base["errors"].append("backup_patch_execution_evidence_missing")
+                    return base
                 if any(name.startswith(_OPERATION_JOURNAL_ARCHIVE_PREFIX) for name in names):
                     base["errors"].append("backup_operation_journal_evidence_missing")
                     return base
@@ -2092,9 +2180,14 @@ def _verify_frozen_backup_archive(
                         return base
 
             try:
-                _verify_archived_operation_journal(archive)
+                intents = _verify_archived_operation_journal(archive)
             except ValueError:
                 base["errors"].append("backup_operation_journal_invalid")
+                return base
+            try:
+                _verify_archived_patch_execution(archive, intents)
+            except ValueError:
+                base["errors"].append("backup_patch_execution_invalid")
                 return base
 
             with tempfile.TemporaryDirectory(prefix="orch-backup-verify-") as tmp:
@@ -2178,6 +2271,7 @@ def _verify_frozen_backup_archive(
 
 
 _OPERATION_JOURNAL_ARCHIVE_PREFIX = "files/.runtime/" + JOURNAL_DIRECTORY + "/"
+_PATCH_EXECUTION_ARCHIVE_PREFIX = "files/.runtime/" + EXECUTION_DIRECTORY + "/"
 
 
 def _journal_archive_member(name: str) -> bool:
@@ -2189,7 +2283,7 @@ def _journal_archive_member(name: str) -> bool:
     ) is not None
 
 
-def _verify_archived_operation_journal(archive: zipfile.ZipFile) -> None:
+def _verify_archived_operation_journal(archive: zipfile.ZipFile) -> Dict[Tuple[str, str], Dict[str, Any]]:
     def unique_object(pairs):
         value = {}
         for key, item in pairs:
@@ -2203,6 +2297,7 @@ def _verify_archived_operation_journal(archive: zipfile.ZipFile) -> None:
 
     counts: Dict[str, int] = {}
     total = 0
+    records: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for info in archive.infolist():
         name = info.filename
         if not name.startswith(_OPERATION_JOURNAL_ARCHIVE_PREFIX):
@@ -2237,6 +2332,80 @@ def _verify_archived_operation_journal(archive: zipfile.ZipFile) -> None:
             or hashlib.sha256(request["operation_id"].encode()).hexdigest() + ".json" != operation_name
         ):
             raise ValueError("journal_identity_mismatch")
+        records[(run_hash, operation_name[:-5])] = record
+    return records
+
+
+def _execution_archive_member(name: str) -> bool:
+    import re
+
+    return re.fullmatch(
+        re.escape(_PATCH_EXECUTION_ARCHIVE_PREFIX)
+        + r"[0-9a-f]{64}/[0-9a-f]{64}/(?:dispatch|publication|result)\.json",
+        name,
+    ) is not None
+
+
+def _verify_archived_patch_execution(
+    archive: zipfile.ZipFile, intents: Dict[Tuple[str, str], Dict[str, Any]],
+) -> None:
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate_key")
+            value[key] = item
+        return value
+
+    def reject_constant(_value):
+        raise ValueError("invalid_constant")
+
+    operations: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for info in archive.infolist():
+        name = info.filename
+        if not name.startswith(_PATCH_EXECUTION_ARCHIVE_PREFIX):
+            continue
+        if (
+            not _execution_archive_member(name)
+            or info.is_dir()
+            or (info.external_attr >> 16) & 0o170000 not in {0, statmod.S_IFREG}
+            or info.file_size > EXECUTION_RECORD_MAX_BYTES
+        ):
+            raise ValueError("invalid_execution_member")
+        run_hash, operation_hash, phase_name = name[len(_PATCH_EXECUTION_ARCHIVE_PREFIX):].split("/")
+        phases = operations.setdefault((run_hash, operation_hash), {})
+        phase = phase_name[:-5]
+        if phase in phases:
+            raise ValueError("duplicate_execution_phase")
+        if len(operations) > EXECUTION_MAX_OPERATIONS:
+            raise ValueError("execution_inventory_limit")
+        try:
+            with archive.open(info, "r") as source:
+                raw = source.read(EXECUTION_RECORD_MAX_BYTES + 1)
+            if len(raw) > EXECUTION_RECORD_MAX_BYTES or len(raw) != info.file_size:
+                raise ValueError("invalid_execution_size")
+            phases[phase] = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=unique_object,
+                parse_constant=reject_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, KeyError,
+                RecursionError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise ValueError("invalid_execution_record") from exc
+    counts: Dict[str, int] = {}
+    for (run_hash, operation_hash), phases in operations.items():
+        counts[run_hash] = counts.get(run_hash, 0) + 1
+        if counts[run_hash] > EXECUTION_MAX_OPERATIONS_PER_RUN:
+            raise ValueError("execution_inventory_limit")
+        intent = intents.get((run_hash, operation_hash))
+        if intent is None:
+            raise ValueError("execution_intent_missing")
+        checked = validate_execution_records(phases, intent)
+        request = checked["dispatch"]["request"]
+        if (
+            hashlib.sha256(request["binding"]["run_id"].encode()).hexdigest() != run_hash
+            or hashlib.sha256(request["operation_id"].encode()).hexdigest() != operation_hash
+        ):
+            raise ValueError("execution_identity_mismatch")
 
 
 def _restorable_backup_member(name: str) -> bool:
@@ -2252,6 +2421,8 @@ def _restorable_backup_member(name: str) -> bool:
         return True
     if name.startswith(_OPERATION_JOURNAL_ARCHIVE_PREFIX):
         return _journal_archive_member(name)
+    if name.startswith(_PATCH_EXECUTION_ARCHIVE_PREFIX):
+        return _execution_archive_member(name)
     return any(
         name.startswith(prefix)
         for prefix in (
@@ -3605,6 +3776,7 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
     if health["active_runs"]:
         raise ValueError("active_runs_present")
     initial_journal = _backup_journal_inventory(orch)
+    initial_execution = _backup_execution_inventory(orch)
     backups = ensure_private_dir(orch.root / "backups")
     target = (
         Path(os.path.abspath(os.path.expanduser(str(output))))
@@ -3665,6 +3837,16 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
                     }
                     if journal_evidence != expected_journal_evidence:
                         raise ValueError("backup_operation_journal_coverage_mismatch")
+                    execution_evidence = {
+                        name[len("files/"):]: item for name, item in evidence.items()
+                        if name.startswith(_PATCH_EXECUTION_ARCHIVE_PREFIX)
+                    }
+                    expected_execution_evidence = {
+                        name: {"sha256": item["sha256"], "bytes": item["bytes"]}
+                        for name, item in initial_execution["files"].items()
+                    }
+                    if execution_evidence != expected_execution_evidence:
+                        raise ValueError("backup_patch_execution_coverage_mismatch")
                     archive.writestr(
                         "state/manifest.json",
                         json.dumps(
@@ -3680,6 +3862,9 @@ def backup_state(orch: Orchestrator, output: Path | None = None) -> Dict[str, An
             final_journal = _backup_journal_inventory(orch)
             if final_journal != initial_journal:
                 raise ValueError("backup_operation_journal_changed_during_backup")
+            final_execution = _backup_execution_inventory(orch)
+            if final_execution != initial_execution:
+                raise ValueError("backup_patch_execution_changed_during_backup")
             os.replace(str(temp_zip), str(target))
             temp_zip = None
             _fsync_directory(target.parent)
