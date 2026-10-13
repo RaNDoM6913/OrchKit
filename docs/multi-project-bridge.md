@@ -431,9 +431,9 @@ multi-device/hosted extensions remain separately gated.
 - `LocalFileScope` operates only for a trusted local caller with a live P1-C1
   session, active capability and matching ledger/project/writer authority. Its
   `file.read` scope is sourced from the task's existing `allowed_paths`, not a
-  second ACL or a supplied expected run. Only exact allowed **existing regular
-  files** currently receive a descriptor. `file.list`, `file.patch`, process
-  operations and file-content transfer remain unsupported.
+  second ACL or a supplied expected run. Its initial `open_readonly` foundation
+  returns descriptors for exact allowed **existing regular files**; separate
+  list/read/patch APIs are described below. It dispatches no process operation.
 - The registered canonical project root is pinned by a no-follow directory fd
   (device/inode). Each directory component is opened relative to an owned fd
   using `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`; the leaf uses read-only,
@@ -456,8 +456,8 @@ multi-device/hosted extensions remain separately gated.
   cannot be revoked retroactively by a ledger transition. No safe concurrent
   use of one scope instance across threads is claimed. At this foundation
   stage bounded reads were not included; a separate local read package follows
-  below. List/patch, writable file semantics, process ownership, durable
-  uncertain-outcome reconciliation and device trust remain future work.
+  below. That first package added no list/patch, writable file semantics,
+  process ownership, durable uncertain-outcome reconciliation or device trust.
 
 ### P1-C2 — bounded in-process file.read content (second package)
 
@@ -472,7 +472,7 @@ multi-device/hosted extensions remain separately gated.
   oversized, growing, changed or newly unauthorized file produces no partial
   bytes. Read failures are sanitized; no raw filesystem exception or lease
   token is sent in the outcome. No content is stored in a durable journal.
-- `file.list`, `file.patch`, and process operations remain unsupported. This
+- This reader does not dispatch `file.list`, `file.patch` or process operations. This
   does not add external content transfer, network connectivity, a daemon,
   relay/MCP, device authentication, or an arbitrary shell endpoint. Scope
   authorization and descriptor checks remain point-in-time; same-user
@@ -507,7 +507,7 @@ multi-device/hosted extensions remain separately gated.
   not fenced. The existing LocalFileScope remains non-thread-safe.
 - Both explicit plans and generated plans can retain literal `docs/`
   permission entries; the bounded plan-builder contract is described below.
-  There is still no patch/write, owned process, journal/reconnect, remote
+  This listing package adds no patch/write, owned process, journal/reconnect, remote
   transport, daemon/broker, MCP, device trust or ordinary-Chat replacement.
 
 ### P1-C2 — explicit directory grants in plan generation (fourth package)
@@ -551,8 +551,8 @@ not a `WorkerFileOperations.patch` implementation or a Bridge endpoint:
   malformed digests and out-of-range lengths are rejected. This local companion
   input does not extend `WorkerOperationRequest v1` or supply credentials.
 - `LocalFilePatchPreflight(scope).check(request, baseline)` accepts only the
-  existing `file.read` request. Actual `file.patch`, list and process requests
-  are refused before filesystem access. No patch bytes, output-file digest,
+  existing `file.read` request. This helper refuses `file.patch`, list and process
+  requests before filesystem access. No patch bytes, output-file digest,
   writable fd, approved pathname or application token is accepted/returned.
 - The unchanged `LocalBoundedFileReader` obtains the original under P1-C1 live
   session/run/capability and P1-C2 descriptor/allowlist authority. Compare the
@@ -631,17 +631,99 @@ remains. Old homes without journal records retain legacy behavior, and ordinary
 evidence retention leaves journal records intact. Payload bytes are unavailable
 from the journal and cannot be replayed after restart.
 
-**Remaining gate before real application:** recheck live authority, descriptor-anchored
-parents/leaf and original bytes at apply; specify hardlink, mode and replacement
-identity behavior. Establish data/journal/directory durability and restart
-reconciliation for failures before/after publication, including independent
-readback for lost responses and `UNKNOWN`. An atomic rename alone does not
-establish compare-and-swap against another same-user writer or crash recovery.
-The intent journal has no workspace publication protocol or automatic recovery
-action. Prove each additional mutator guarantee in disposable fault/race fixtures
-before adding mutation. The native verifier still checks actual resulting bytes/scope and
-registered commands after normal submission/quiescence; this preflight cannot
-replace that verification or authorize Git publication.
+### P1-C2 — bounded local file.patch execution (seventh package)
+
+`LocalBoundedFilePatcher(authority, session_id, binding, capability_file)` is a
+trusted local API. `apply(request, FilePatchReplacement)` accepts a complete
+replacement, not a unified diff, of 0–65,536 bytes. It replaces only one existing
+allowed regular file with an equally bounded original. Missing parents/targets,
+symlinks, nonregular files, hardlinks, foreign ownership, special mode bits and
+nonzero file flags are refused. Its descriptor-anchored parent/root/ancestor and
+leaf checks renew live run/session/capability and allowlist authority.
+
+Native macOS fd metadata operations preserve current-user uid, gid, ordinary
+mode and bounded xattrs, including resource forks: at most 32 names, 4,096 name
+bytes and 65,536 aggregate value bytes. Unsupported ACL/inheritance, unreadable
+or oversized metadata, and unprovable preservation refuse before rename. Raw
+xattr names/values remain local memory; records retain a canonical digest.
+One exclusive random `.orch-patch-<32hex>.tmp` sibling is internal staging for
+this exact allowed target. It starts at `0600`, receives verified metadata and
+replacement bytes, and is fsynced; it grants no general sibling-write authority.
+
+Apply, explicit reconciliation and core submit/quiesce/abort share one
+nonblocking advisory lock on the existing private `.runtime` directory fd.
+The lock inode is neither replaced nor deleted. It serializes participating
+callers through the unresolved census and state/capability transition, including
+first execution-directory creation; contention is `UNKNOWN`, without automatic
+retry. Unresolved chains or an unsafe complete census block those transitions
+and retain writer/capability authority.
+
+Owner-private append-once `dispatch.json`, `publication.json` and `result.json`
+records live under `.runtime/patch_execution/<runHash>/<opHash>`. Each bounded
+record binds the complete request, immutable intent and predecessor hashes.
+Records are at most 8,192 bytes, with 64 operations per run and 1,024 globally;
+capacity is not automatically reclaimed.
+The chain permits dispatch→negative result or dispatch→publication→result;
+there is no mutable status file. Dispatch is durable before scratch creation;
+publication binds the staged inode/content/metadata and is durable before
+descriptor-relative rename. Final fresh authority/original/staged checks precede
+rename; parent fsync and independent target reopen/readback precede `APPLIED`.
+Malformed, partial, spliced or unexpected evidence is `UNKNOWN`, not absence.
+Payload/capability/raw xattr values are not persisted. Uncertain append, rename,
+fsync or acknowledgement preserves evidence and never grants replay permission.
+
+`reconcile(request)` requires a fresh session and the same active `RUNNING`
+authority under that lock. It never dispatches, creates staging, accepts
+replacement bytes or renames:
+
+- A publication plus exact staged-inode/result-content/metadata target and
+  strict scratch absence can append `APPLIED` after parent fsync and renewed
+  independent readback.
+- An exact unchanged original plus the exact recorded staging inode can remove
+  only that owned inode and append `NOT_APPLIED` after fsync and independent
+  original/scratch-absence proof.
+- Dispatch-only evidence can append `NOT_APPLIED` only with exact original and
+  anchors plus strict absence of publication, result, scratch and ambiguity.
+- Missing, substituted or unrecorded scratch, authority drift, or any ambiguous
+  evidence remains `UNKNOWN`. A name or digest alone never proves scratch
+  ownership and does not authorize cleanup.
+
+Every terminal ID remains closed, including `NOT_APPLIED`. A terminal patch
+service reply returns the existing receipt as historical evidence only after
+renewed acknowledgement under the existing runtime lock. The complete existing
+phase prefix and linked intent must match the caller's request or ledger
+binding; every phase record, the linked intent file and each pinned directory
+through home are fsynced, followed by independent raw-byte, identity and chain
+readback. Duplicate append
+acknowledgement follows the same rule. Core submit/quiesce/abort acknowledge
+every terminal operation for the run and require an unchanged complete final
+census before closure. Any renewal
+failure preserves evidence and returns `UNKNOWN` or refuses the transition;
+it does not retry the failed call, create records or replay workspace work.
+Later edits cannot change that history or make it an assertion about current
+file content. `orch bridge execution inspect` is read-only, has no capability
+access, and never fsyncs, cleans or infers a terminal result from content. Explicit
+`orch bridge execution reconcile --run-id RUN --operation-id OP --cap FILE`
+obtains its request only from the validated stored chain, then opens a fresh
+local authority/session. The intent inspection command remains unchanged.
+There is no raw replacement-byte/file CLI or remote endpoint.
+
+Backup selection, verification and restore preserve exact execution bytes and
+their intent linkage through complete stable census checks. Retention prunes
+neither execution records nor patch scratch; active-run backup refusal remains.
+Read-only recovery distinguishes terminal, unresolved, orphaned and invalid
+evidence without authorizing a run transition or replay. Terminal presence in
+inspection, inventory, recovery or archives is structural evidence; those
+observational paths do not renew acknowledgement. Homes without execution
+evidence retain namespace absence through inspection and archive round trips.
+
+These are cooperative local provenance checks, not OS compare-and-swap or an
+OS fence against the same user. Process interruption and fault fixtures do not
+prove actual power-loss durability. The native verifier still checks resulting
+bytes/scope and registered commands after normal submission/quiescence; patch
+receipts do not replace verification or authorize Git publication. Product
+Bridge endpoint, ordinary-Chat Bridge acceptance and source/PR/merge gates are
+separate from this local API.
 
 Only after further owned-process, durable-operation and transport gates should
 a real Bridge endpoint be considered. These local packages are **not** an RDC

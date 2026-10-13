@@ -19,7 +19,9 @@ from .config import (atomic_write_json, ensure_private_dir,
                      ensure_private_file, read_bounded_json_object,
                      read_bounded_regular_file, regular_file_read_flags)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
+from .bridge_patch_execution import runtime_operation_lock, require_execution_resolved
 from .review_policy import decide_review, normalize_review_policy
+from .worker_operations import WorkerRunBinding
 
 ACTIVE_RUN_STATES = {"RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING"}
 WRITER_LOCK_RUN_STATES = ACTIVE_RUN_STATES | {"VERIFIED"}
@@ -75,6 +77,40 @@ def utc_now() -> str:
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _ledger_worker_binding(run: sqlite3.Row, task: sqlite3.Row):
+    binding = {
+        "project_id": task["project_id"], "writer_key": task["writer_key"],
+        "task_id": run["task_id"], "run_id": run["run_id"],
+        "attempt": run["attempt"],
+    }
+    project_id = binding["project_id"]
+    if project_id is None or re.fullmatch(r"[a-z0-9._-]{1,160}", project_id, re.ASCII) is None:
+        # Legacy tasks may lack a project ID or use the core's uppercase IDs.
+        # Preserve exact identity: absent execution stays usable, while a
+        # canonical recorded request cannot match these legacy project fields.
+        return binding
+    return WorkerRunBinding(**binding)
+
+
+def _execution_transition_authorizer(conn: sqlite3.Connection, run: sqlite3.Row,
+                                     task: sqlite3.Row):
+    """Renew the validated caller's authority inside its existing transaction."""
+    expected_binding = _ledger_worker_binding(run, task)
+    run_id, state, lease_token = run["run_id"], run["state"], run["lease_token"]
+
+    def authorize():
+        current = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if (not current or current["state"] != state
+                or not secrets.compare_digest(current["lease_token"], lease_token)):
+            raise ValueError("patch_execution_authority_changed")
+        current_task = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                    (current["task_id"],)).fetchone()
+        if current_task is None or _ledger_worker_binding(current, current_task) != expected_binding:
+            raise ValueError("patch_execution_authority_changed")
+
+    return authorize
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -1192,6 +1228,421 @@ class Orchestrator:
             "plan_bytes": plan_bytes,
         }
 
+    def _readmission_event(self, conn: sqlite3.Connection, run: sqlite3.Row,
+                           kind: str) -> Tuple[sqlite3.Row, Dict[str, Any]]:
+        event = conn.execute("SELECT * FROM events WHERE run_id=? AND kind=? ORDER BY seq DESC LIMIT 1",
+                             (run["run_id"], kind)).fetchone()
+        if not event or event["task_id"] != run["task_id"]:
+            raise ValueError("readmission_evidence_event_missing:" + kind)
+        value = json.loads(event["payload_json"])
+        if not isinstance(value, dict):
+            raise ValueError("readmission_evidence_event_invalid:" + kind)
+        return event, value
+
+    def _readmission_snapshot(self, conn: sqlite3.Connection, run: sqlite3.Row,
+                              payload: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot_id = run["snapshot_id"]
+        snapshot = conn.execute("SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()
+        if not snapshot or snapshot["run_id"] != run["run_id"]:
+            raise ValueError("readmission_snapshot_run_mismatch")
+        manifest = json.loads(snapshot["manifest_json"])
+        if (not isinstance(manifest, dict)
+            or set(manifest) != {"schema_version", "workspace", "files", "protected", "git_head",
+                                 "created_at", "verification_evidence"}
+            or type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1
+            or not isinstance(manifest.get("created_at"), str)
+            or snapshot["manifest_json"] != canonical_json(manifest)
+            or snapshot_id != "sha256:" + sha256_bytes(canonical_json(manifest).encode("utf-8"))
+            or manifest["workspace"] != str(Path(payload["workspace"]).resolve())
+            or manifest["git_head"] != run["claim_git_head"]
+            or not isinstance(manifest["files"], dict) or not manifest["files"]):
+            raise ValueError("readmission_snapshot_binding_invalid")
+        for relative, recorded in manifest["files"].items():
+            if (normalize_relative_path(relative) != relative
+                or not path_allowed(relative, payload["allowed_paths"])
+                or relative in payload.get("protected_paths", {})
+                or not isinstance(recorded, dict)
+                or set(recorded) != {"deleted", "sha256", "bytes", "mode"}
+                or type(recorded["deleted"]) is not bool
+                or type(recorded["bytes"]) is not int or recorded["bytes"] < 0):
+                raise ValueError("readmission_snapshot_files_invalid")
+            if recorded["deleted"]:
+                if recorded != {"deleted": True, "sha256": None, "bytes": 0, "mode": None}:
+                    raise ValueError("readmission_snapshot_files_invalid")
+            elif (not isinstance(recorded["sha256"], str)
+                  or re.fullmatch(r"[0-9a-f]{64}", recorded["sha256"]) is None
+                  or not isinstance(recorded["mode"], str)
+                  or re.fullmatch(r"0o[0-7]{1,3}", recorded["mode"]) is None):
+                raise ValueError("readmission_snapshot_files_invalid")
+        expected = payload.get("protected_paths", {})
+        if (manifest["protected"] != {relative: {"expected": digest, "actual": digest, "matches": True}
+                                     for relative, digest in expected.items()}):
+            raise ValueError("readmission_snapshot_protected_mismatch")
+        return manifest
+
+    def _readmission_retained_evidence(self, conn: sqlite3.Connection, run: sqlite3.Row,
+                                      payload: Dict[str, Any], manifest: Dict[str, Any],
+                                      *, verdict: str) -> Dict[str, Any]:
+        run_id = run["run_id"]
+        receipt, receipt_hash, receipt_bytes = self._load_worker_receipt(run_id, self._receipt_path(run_id))
+        _, submitted = self._readmission_event(conn, run, "RESULT_SUBMITTED")
+        if (receipt != json.loads(run["receipt_json"] or "null")
+            or receipt.get("run_id") != run_id or receipt.get("task_id") != run["task_id"]
+            or sorted(receipt["changed_paths"]) != sorted(manifest["files"])
+            or submitted.get("receipt_sha256") != receipt_hash
+            or submitted.get("receipt_bytes") != receipt_bytes):
+            raise ValueError("readmission_receipt_evidence_changed")
+        evidence = self._verification_evidence_manifest(run_id, payload.get("checks", []))
+        if evidence != manifest["verification_evidence"]:
+            raise ValueError("readmission_verification_evidence_changed")
+        _, verified = self._readmission_event(conn, run, "VERIFY_PASS")
+        if verified.get("snapshot_id") != run["snapshot_id"]:
+            raise ValueError("readmission_verification_snapshot_mismatch")
+        report, report_hash, report_bytes = self._load_review_report(run_id, self._review_report_path(run_id))
+        _, imported = self._readmission_event(conn, run, "REVIEW_IMPORTED")
+        if (report.get("run_id") != run_id or report.get("snapshot_id") != run["snapshot_id"]
+            or report.get("verdict") != verdict or run["review_status"] != verdict
+            or imported.get("snapshot_id") != run["snapshot_id"] or imported.get("verdict") != verdict
+            or imported.get("report_sha256") != report_hash or imported.get("report_bytes") != report_bytes):
+            raise ValueError("readmission_review_evidence_changed")
+        if verdict == "NEEDS_FIX" and json.loads(run["feedback_json"] or "null") != {
+                "kind": "review", "verdict": verdict, "findings": report["findings"],
+                "snapshot_id": run["snapshot_id"]}:
+            raise ValueError("readmission_feedback_evidence_changed")
+        quiescence, _ = self._readmission_event(conn, run, "COOPERATIVE_QUIESCENCE_CONFIRMED")
+        checkpoint = conn.execute("SELECT seq FROM events WHERE run_id=? AND kind='WORKER_CHECKPOINT_RECORDED' ORDER BY seq DESC LIMIT 1",
+                                  (run_id,)).fetchone()
+        if checkpoint and checkpoint["seq"] > quiescence["seq"]:
+            raise ValueError("readmission_process_state_unresolved")
+        return {"receipt_sha256": receipt_hash, "receipt_bytes": receipt_bytes,
+                "review_sha256": report_hash, "review_bytes": report_bytes,
+                "verification_evidence": evidence, "quiescence_event_seq": quiescence["seq"]}
+
+    @staticmethod
+    def _readmission_review_contract(old: Dict[str, Any], new: Dict[str, Any]) -> None:
+        before, after = normalize_review_policy(old), normalize_review_policy(new)
+        levels = {"off": 0, "risk_based": 1, "required": 2}
+        if (levels[after["mode"]] < levels[before["mode"]]
+            or (before["mode"] != "off" and (after["reviewer"] != before["reviewer"]
+                                                   or after["placement"] != before["placement"]))
+            or any(not set(before[field]).issubset(after[field])
+                   for field in ("risk_tags", "trigger_tags", "sensitive_patterns"))
+            or after["large_diff_files"] > before["large_diff_files"]
+            or after["large_diff_bytes"] > before["large_diff_bytes"]
+            or (before["review_on_retry"] and not after["review_on_retry"])):
+            raise ValueError("readmission_review_contract_widened")
+
+    def _readmission_project(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        from .project import ProjectRegistry, inspect_project
+        project_id = payload.get("project_id")
+        if not project_id:
+            raise ValueError("readmission_registered_project_required")
+        project = ProjectRegistry.open_readonly(self.root).get(project_id)
+        workspace = Path(payload["workspace"]).resolve()
+        current = inspect_project(workspace)
+        if (Path(project["root"]).resolve() != workspace or current["root"] != str(workspace)
+            or project.get("writer_key") != payload["writer_key"]
+            or current["writer_key"] != payload["writer_key"]
+            or current["branch"] != (project.get("git") or {}).get("branch")):
+            raise ValueError("readmission_project_identity_changed")
+        policy = project.get("git") or {}
+        recorded_origin = policy.get("remote_url") or (project.get("inventory_at_registration") or {}).get("origin_url")
+        transport = inspect_transport_url(current.get("origin_url"), workspace)
+        registered_transport = inspect_transport_url(recorded_origin, workspace)
+        if (transport.get("status") != "READY" or registered_transport.get("status") != "READY"
+            or transport["canonical_url"] != registered_transport["canonical_url"]):
+            raise ValueError("readmission_project_origin_changed")
+        for relative, expected in (project.get("protected_paths") or {}).items():
+            self._repair_source_current(workspace, relative, expected)
+        return project, current
+
+    def _readmission_contract(self, old: Dict[str, Any], new: Dict[str, Any],
+                              old_project: Dict[str, Any], new_project: Dict[str, Any],
+                              dependency_task_id: str, remaining: int) -> None:
+        if remaining < 1 or new["max_attempts"] > remaining:
+            raise ValueError("readmission_remaining_attempts_exceeded")
+        for entry in new["allowed_paths"]:
+            relative = normalize_relative_path(entry.rstrip("/"))
+            if not path_allowed(relative, old["allowed_paths"]) or (entry.endswith("/") and not any(
+                    allowed.endswith("/") and path_allowed(relative, [allowed]) for allowed in old["allowed_paths"])):
+                raise ValueError("readmission_allowed_paths_widened")
+        for baseline in (old, old_project, new_project):
+            if any(new.get("protected_paths", {}).get(path) != digest
+                   for path, digest in baseline.get("protected_paths", {}).items()):
+                raise ValueError("readmission_protected_paths_widened")
+        old_dependencies = set(old.get("dependencies", []))
+        new_dependencies = set(new.get("dependencies", []))
+        if (not old_dependencies.issubset(new_dependencies)
+            or dependency_task_id not in new_dependencies or old["id"] in new_dependencies):
+            raise ValueError("readmission_dependencies_widened")
+        if (not set(old.get("acceptance", [])).issubset(new.get("acceptance", []))
+            or not set(old.get("non_goals", [])).issubset(new.get("non_goals", []))
+            or (old.get("execution_budget") is not None and new.get("execution_budget") != old["execution_budget"])):
+            raise ValueError("readmission_task_requirements_widened")
+        self._readmission_review_contract(old, new)
+        # The first attempt in a new task must not erase a risk-based retry gate.
+        if normalize_review_policy(old)["mode"] == "risk_based" and normalize_review_policy(new)["mode"] != "required":
+            raise ValueError("readmission_retry_review_required")
+        self._readmission_review_contract(old_project, new_project)
+        if old.get("owner_acceptance") and not new.get("owner_acceptance"):
+            raise ValueError("readmission_owner_gate_widened")
+        old_approval = (old_project.get("approval") or {}).get("default")
+        new_approval = (new_project.get("approval") or {}).get("default")
+        if new_approval != old_approval and new_approval != "required":
+            raise ValueError("readmission_project_owner_gate_widened")
+        old_policy, new_policy = old_project.get("git") or {}, new_project.get("git") or {}
+        for field in ("allow_commit", "allow_push", "allow_force_push", "allow_reset", "allow_clean", "allow_stash"):
+            if new_policy.get(field) and not old_policy.get(field):
+                raise ValueError("readmission_project_git_permission_widened:" + field)
+        if any(new_policy.get(field) for field in ("allow_force_push", "allow_reset", "allow_clean", "allow_stash")):
+            raise ValueError("readmission_unsafe_project_git_permission")
+        before, after = old.get("publication") or {}, new.get("publication") or {}
+        levels = {"none": 0, "git_local": 1, "git": 2}
+        if levels[after.get("kind", "none")] > levels[before.get("kind", "none")]:
+            raise ValueError("readmission_publication_permission_widened")
+        if after.get("kind") in {"git_local", "git"} and not new_policy.get("allow_commit"):
+            raise ValueError("readmission_project_commit_not_allowed")
+        if after.get("kind") == "git" and not new_policy.get("allow_push"):
+            raise ValueError("readmission_project_push_not_allowed")
+        if after.get("kind") in {"git_local", "git"} and (
+            after.get("branch") != new_policy.get("branch")
+            or (after.get("ref") or after.get("branch"))
+               != (new_policy.get("ref") or new_policy.get("branch"))
+        ):
+            raise ValueError("readmission_publication_destination_mismatch")
+        for field in ("remote", "remote_url", "transport_kind"):
+            if after.get(field) != before.get(field):
+                raise ValueError("readmission_publication_transport_changed")
+        old_checks, new_checks = old.get("checks", []), new.get("checks", [])
+        if len(old_checks) != len(new_checks):
+            raise ValueError("readmission_check_contract_changed")
+        for prior, fresh in zip(old_checks, new_checks):
+            for field, default in (("id", "unnamed"), ("argv", None), ("cwd", "."),
+                                   ("timeout_sec", 30), ("output_tail_chars", 8000),
+                                   ("timeout_action", "needs_fix")):
+                if prior.get(field, default) != fresh.get(field, default):
+                    raise ValueError("readmission_check_contract_changed:" + field)
+            if ({(item["path"], item["expected"]) for item in prior["authority_files"]}
+                != {(item["path"], item["expected"]) for item in fresh["authority_files"]}):
+                raise ValueError("readmission_authority_paths_changed")
+            if prior["executable_sha256"] != fresh["executable_sha256"]:
+                raise ValueError("readmission_executable_identity_changed")
+            old_executable, new_executable = Path(prior["executable_path"]), Path(fresh["executable_path"])
+            old_workspace, new_workspace = Path(old["workspace"]).resolve(), Path(new["workspace"]).resolve()
+            if _inside(old_workspace, old_executable):
+                if not _inside(new_workspace, new_executable) or old_executable.relative_to(old_workspace) != new_executable.relative_to(new_workspace):
+                    raise ValueError("readmission_executable_identity_changed")
+            elif old_executable != new_executable:
+                raise ValueError("readmission_executable_identity_changed")
+
+    def _readmission_tracked_file(self, workspace: Path, commit: str, relative: str,
+                                  expected_hash: Optional[str]) -> None:
+        git = self._publication_git(workspace, binary=True)
+        entry = git("ls-tree", "-z", commit, "--", relative)
+        if entry.returncode:
+            raise ValueError("readmission_dependency_tree_unavailable")
+        if expected_hash is None:
+            if entry.stdout or os.path.lexists(workspace / relative):
+                raise ValueError("readmission_authority_expected_absent:" + relative)
+            return
+        mode = self._git_entry_mode(entry, relative)
+        if mode not in {b"100644", b"100755"}:
+            raise ValueError("readmission_authority_not_tracked:" + relative)
+        blob = git("show", f"{commit}:{relative}")
+        if blob.returncode or sha256_bytes(blob.stdout) != expected_hash:
+            raise ValueError("readmission_dependency_authority_mismatch:" + relative)
+        self._repair_source_current(workspace, relative, expected_hash, recorded={
+            "deleted": False, "bytes": len(blob.stdout), "mode": "0o755" if mode == b"100755" else "0o644"})
+
+    def _readmission_guard(self, conn: sqlite3.Connection, previous_run_id: str,
+                           dependency_run_id: str, new: Dict[str, Any]) -> Dict[str, Any]:
+        prior = conn.execute("SELECT * FROM runs WHERE run_id=?", (previous_run_id,)).fetchone()
+        dependency = conn.execute("SELECT * FROM runs WHERE run_id=?", (dependency_run_id,)).fetchone()
+        if not prior or not dependency or previous_run_id == dependency_run_id:
+            raise ValueError("readmission_run_missing_or_same")
+        task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (prior["task_id"],)).fetchone()
+        dep_task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (dependency["task_id"],)).fetchone()
+        old, dep_payload = self._task_payload(task), self._task_payload(dep_task)
+        if new["id"] in {old["id"], dep_payload["id"]} or new["workspace"] == old["workspace"]:
+            raise ValueError("readmission_new_task_and_workspace_required")
+        if conn.execute("SELECT 1 FROM settings WHERE key='paused'").fetchone():
+            raise ValueError("readmission_paused")
+        pauses = self._project_pauses(conn)
+        if any(payload.get("project_id") in pauses for payload in (old, dep_payload, new)):
+            raise ValueError("readmission_project_paused")
+        projects = [self._readmission_project(payload) for payload in (old, dep_payload, new)]
+        old_project, old_current = projects[0]
+        dep_project, dep_current = projects[1]
+        new_project, new_current = projects[2]
+        origins = [inspect_transport_url(current["origin_url"], Path(payload["workspace"]))["canonical_url"]
+                   for payload, (_, current) in zip((old, dep_payload, new), projects)]
+        if len(set(origins)) != 1 or new_current["git_common_dir"] != dep_current["git_common_dir"]:
+            raise ValueError("readmission_repository_mismatch")
+        writer_keys = {old["writer_key"], dep_payload["writer_key"], new["writer_key"]}
+        if any(key in self._active_writer_locks(conn) for key in writer_keys):
+            raise ValueError("readmission_active_writer")
+        for key in writer_keys:
+            runs = conn.execute("SELECT r.run_id FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE t.writer_key=?", (key,)).fetchall()
+            if any(os.path.lexists(self._capability_path(row["run_id"])) for row in runs):
+                raise ValueError("readmission_capability_present")
+            if conn.execute("SELECT 1 FROM publications p JOIN runs r ON r.run_id=p.run_id JOIN tasks t ON t.task_id=r.task_id WHERE t.writer_key=? AND p.status NOT IN ('COMPLETE','ABANDONED') LIMIT 1", (key,)).fetchone():
+                raise ValueError("readmission_publication_pending")
+        old_head, old_branch = self._claim_git_state(old)
+        self._repair_claim_guard(conn, task, old, previous_run_id, old_head, old_branch)
+        old_manifest = self._readmission_snapshot(conn, prior, old)
+        source_evidence = self._readmission_retained_evidence(conn, prior, old, old_manifest, verdict="NEEDS_FIX")
+        latest_dep = conn.execute("SELECT run_id FROM runs WHERE task_id=? ORDER BY attempt DESC LIMIT 1", (dep_task["task_id"],)).fetchone()
+        publication = conn.execute("SELECT * FROM publications WHERE run_id=?", (dependency_run_id,)).fetchone()
+        if (dependency["state"] != "COMPLETE" or dependency["verify_status"] != "PASS"
+            or dep_task["status"] != "DONE" or not latest_dep or latest_dep["run_id"] != dependency_run_id
+            or not publication or publication["status"] != "COMPLETE"
+            or publication["kind"] not in {"git", "git_local"}
+            or publication["kind"] != dep_payload.get("publication", {}).get("kind")
+            or not isinstance(publication["commit_id"], str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", publication["commit_id"]) is None):
+            raise ValueError("readmission_dependency_not_published")
+        dep_manifest = self._readmission_snapshot(conn, dependency, dep_payload)
+        dep_evidence = self._readmission_retained_evidence(conn, dependency, dep_payload, dep_manifest, verdict="PASS")
+        commit = publication["commit_id"]
+        base = old_manifest["git_head"]
+        if (dep_manifest["git_head"] != base or publication["expected_base"] != base
+            or dep_payload.get("publication", {}).get("expected_base", base) != base):
+            raise ValueError("readmission_dependency_base_mismatch")
+        git = self._publication_git(Path(dep_payload["workspace"]))
+        parents = git("rev-list", "--parents", "-n", "1", commit)
+        if parents.returncode or parents.stdout.strip().split() != [commit, base]:
+            raise ValueError("readmission_dependency_parent_mismatch")
+        if not self._commit_matches_snapshot(Path(dep_payload["workspace"]), commit, base, dep_manifest):
+            raise ValueError("readmission_dependency_commit_mismatch")
+        _, published = self._readmission_event(conn, dependency, "PUBLISHED")
+        if (published.get("commit") != commit or published.get("kind") != publication["kind"]
+            or (publication["kind"] == "git" and (publication["remote_commit"] != commit or published.get("remote_commit") != commit))):
+            raise ValueError("readmission_dependency_publication_evidence_changed")
+        if dep_payload.get("owner_acceptance"):
+            approval = conn.execute("SELECT snapshot_id FROM approvals WHERE run_id=?", (dependency_run_id,)).fetchone()
+            if not approval or approval["snapshot_id"] != dependency["snapshot_id"]:
+                raise ValueError("readmission_dependency_owner_gate_missing")
+        attempts = conn.execute("SELECT COUNT(*) FROM runs WHERE task_id=?", (task["task_id"],)).fetchone()[0]
+        remaining = old["max_attempts"] - attempts
+        self._readmission_contract(old, new, old_project, new_project, dep_task["task_id"], remaining)
+        for dep in new.get("dependencies", []):
+            row = conn.execute("SELECT status FROM tasks WHERE task_id=?", (dep,)).fetchone()
+            if not row or row["status"] != "DONE":
+                raise ValueError("readmission_dependencies_not_done")
+        workspace = Path(new["workspace"]).resolve()
+        if (workspace == Path(old["workspace"]).resolve()
+            or new_current["head"] != commit or new_current["branch"] != (new_project.get("git") or {}).get("branch")
+            or (new.get("publication", {}).get("kind") in {"git", "git_local"}
+                and new.get("publication", {}).get("expected_base") != commit)):
+            raise ValueError("readmission_destination_identity_mismatch")
+        staged = self._publication_git(workspace, binary=True)("diff", "--no-ext-diff", "--no-textconv", "--cached", "--ita-visible-in-index", "--name-only", "-z")
+        scope = self._workspace_scope_evidence(new, [])
+        if (staged.returncode or staged.stdout or scope.get("status") != "PASS" or scope.get("git_head") != commit
+            or scope.get("protected_preexisting_paths") or new_current["staged_paths"]
+            or new_current["dirty_tracked_paths"] or new_current["untracked_paths"]):
+            raise ValueError("readmission_destination_not_clean")
+        for check in new.get("checks", []):
+            for binding in check["authority_files"]:
+                self._readmission_tracked_file(workspace, commit, binding["path"], binding["sha256"])
+        for relative, digest in new.get("protected_paths", {}).items():
+            self._readmission_tracked_file(workspace, commit, relative, digest)
+        if self._check_authority_evidence(workspace, new.get("checks", []))["status"] != "PASS":
+            raise ValueError("readmission_check_authority_changed")
+        return {"previous_task_id": task["task_id"], "previous_run_id": previous_run_id,
+                "previous_snapshot_id": prior["snapshot_id"], "previous_base": base,
+                "dependency_task_id": dep_task["task_id"], "dependency_run_id": dependency_run_id,
+                "dependency_snapshot_id": dependency["snapshot_id"], "dependency_commit": commit,
+                "remaining_attempts": remaining, "admitted_max_attempts": new["max_attempts"],
+                "source_evidence": source_evidence, "dependency_evidence": dep_evidence,
+                "source_payload_sha256": sha256_bytes(task["payload_json"].encode("utf-8")),
+                "dependency_payload_sha256": sha256_bytes(dep_task["payload_json"].encode("utf-8")),
+                "project_policy_sha256": [sha256_bytes(canonical_json(project).encode("utf-8")) for project, _ in projects],
+                "operator_authorization": "operator_asserted", "process_inactivity_confirmation": "operator_asserted_not_os_fenced"}
+
+    def readmit(self, previous_run_id: str, dependency_run_id: str, plan_path: Path, *,
+                operator_authorization_confirmed: bool = False,
+                process_inactivity_confirmed: bool = False) -> Dict[str, Any]:
+        if operator_authorization_confirmed is not True:
+            raise ValueError("readmission_operator_authorization_required")
+        if process_inactivity_confirmed is not True:
+            raise ValueError("readmission_process_inactivity_confirmation_required")
+        for run_id in (previous_run_id, dependency_run_id):
+            if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is None:
+                raise ValueError("invalid_run_id")
+        data, digest, _ = read_plan_document(plan_path)
+        with self.connect() as conn:
+            _begin_immediate(conn)
+            try:
+                # Replay precedes workspace/terminal predicates: the admitted worker may
+                # already be active and dirty. Only the exact immutable request replays.
+                events = conn.execute("SELECT * FROM events WHERE kind='TASK_READMITTED' AND run_id=? ORDER BY seq", (previous_run_id,)).fetchall()
+                if events:
+                    proof = json.loads(events[0]["payload_json"])
+                    publication = conn.execute("SELECT commit_id FROM publications WHERE run_id=?", (dependency_run_id,)).fetchone()
+                    existing = conn.execute("SELECT * FROM tasks WHERE task_id=?", (proof["new_task_id"],)).fetchone()
+                    plan = conn.execute("SELECT source_digest FROM plans WHERE plan_revision=?", (proof["plan_revision"],)).fetchone()
+                    if (len(events) != 1 or proof.get("plan_digest") != digest
+                        or proof.get("dependency_run_id") != dependency_run_id
+                        or not publication or publication["commit_id"] != proof["dependency_commit"]
+                        or not existing or sha256_bytes(existing["payload_json"].encode("utf-8")) != proof["new_payload_sha256"]
+                        or not plan or plan["source_digest"] != digest):
+                        raise ValueError("readmission_replay_conflict")
+                    conn.execute("COMMIT")
+                    return proof["result"]
+                if set(data) - {"schema_version", "plan_revision", "tasks", "adapter"}:
+                    raise ValueError("unknown_plan_field")
+                revision = data.get("plan_revision")
+                if (data.get("schema_version") != 1 or not isinstance(revision, str)
+                    or re.fullmatch(r"[A-Za-z0-9._-]{1,200}", revision) is None
+                    or (data.get("adapter") is not None and not isinstance(data["adapter"], dict))
+                    or not isinstance(data.get("tasks"), list) or len(data["tasks"]) != 1):
+                    raise ValueError("readmission_single_task_plan_required")
+                validate_task_definition(data["tasks"][0])
+                validate_dependency_graph(data["tasks"])
+                new = prepare_task_payload(data["tasks"][0])
+                if conn.execute("SELECT 1 FROM plans WHERE plan_revision=?", (revision,)).fetchone() or conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (new["id"],)).fetchone():
+                    raise ValueError("readmission_plan_or_task_already_exists")
+                proof = self._readmission_guard(conn, previous_run_id, dependency_run_id, new)
+                new_payload_json = canonical_json(new)
+                proof.update(new_task_id=new["id"], plan_revision=revision, plan_digest=digest,
+                             new_payload_sha256=sha256_bytes(new_payload_json.encode("utf-8")))
+                queue_seq = conn.execute("SELECT COALESCE(MAX(queue_seq),0)+1 FROM tasks").fetchone()[0]
+                prospective = {"task_id": new["id"], "project_id": new.get("project_id"),
+                               "writer_key": new["writer_key"], "queue_seq": queue_seq, "plan_revision": revision}
+                context = self._build_context_pack(conn, prospective, new, run_id="readmission-preflight",
+                                                   attempt=1, claim_git_head=proof["dependency_commit"], run_persisted=False)
+                prior = conn.execute("SELECT feedback_json FROM runs WHERE run_id=?", (previous_run_id,)).fetchone()
+                context.update(previous_run_id=previous_run_id, previous_snapshot_id=proof["previous_snapshot_id"],
+                               feedback=json.loads(prior["feedback_json"]), readmission=proof)
+                if len(canonical_json(context).encode("utf-8")) > 32768:
+                    raise ValueError("readmission_context_pack_too_large")
+                _, current_digest, _ = read_plan_document(plan_path)
+                if current_digest != digest or prepare_task_payload(data["tasks"][0]) != new:
+                    raise ValueError("readmission_plan_or_authority_changed")
+                repeated = self._readmission_guard(conn, previous_run_id, dependency_run_id, new)
+                if any(proof[key] != value for key, value in repeated.items()):
+                    raise ValueError("readmission_proof_changed")
+                result = {"status": "READMITTED", "task_id": new["id"], "plan_revision": revision,
+                          "plan_digest": digest, "previous_run_id": previous_run_id,
+                          "previous_snapshot_id": proof["previous_snapshot_id"],
+                          "dependency_run_id": dependency_run_id, "dependency_commit": proof["dependency_commit"],
+                          "remaining_attempts": proof["remaining_attempts"], "max_attempts": new["max_attempts"]}
+                proof["result"] = result
+                now = utc_now()
+                conn.execute("INSERT INTO plans VALUES(?,?,?)", (revision, digest, now))
+                conn.execute("INSERT INTO tasks(task_id,plan_revision,ordinal,project_id,writer_key,queue_seq,status,payload_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                             (new["id"], revision, 0, new.get("project_id"), new["writer_key"], queue_seq, "PLANNED", new_payload_json, now))
+                conn.execute("UPDATE tasks SET status='CANCELLED',updated_at=? WHERE task_id=?", (now, proof["previous_task_id"]))
+                self._event(conn, "TASK_CANCELLED", task_id=proof["previous_task_id"],
+                            payload={"reason": "superseded_by_readmission", "new_task_id": new["id"], "previous_run_id": previous_run_id})
+                self._event(conn, "TASK_READMITTED", task_id=new["id"], run_id=previous_run_id, payload=proof)
+                conn.execute("COMMIT")
+                return result
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
     def _task_payload(self, row: sqlite3.Row) -> Dict[str, Any]:
         return json.loads(row["payload_json"])
 
@@ -1226,11 +1677,14 @@ class Orchestrator:
         return result
 
     def _claim_git_state(
-        self, payload: Dict[str, Any]
+        self, payload: Dict[str, Any], *,
+        git_scope: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         publication = payload.get("publication") or {}
-        if publication.get("kind") not in {"git", "git_local"}:
-            return None, None
+        requires_git = publication.get("kind") in {"git", "git_local"}
+        if not requires_git and git_scope is not None:
+            if git_scope.get("status") == "NON_GIT_UNAVAILABLE" or git_scope.get("git_head") is None:
+                return None, None
         workspace = Path(payload["workspace"]).resolve()
         git_binary = Path("/usr/bin/git")
         if not git_binary.is_file() or not os.access(str(git_binary), os.X_OK):
@@ -1257,24 +1711,31 @@ class Orchestrator:
             "-c", "core.hooksPath=/dev/null",
             "-C", str(workspace),
         ]
+        if not requires_git and git_scope is None:
+            probe = subprocess.run(
+                prefix + ["rev-parse", "--is-inside-work-tree"],
+                env=env, capture_output=True, text=True, timeout=15, check=False,
+            )
+            if probe.returncode or probe.stdout.strip() != "true":
+                return None, None
         head = subprocess.run(
-            prefix + ["rev-parse", "HEAD"],
+            prefix + ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"],
             env=env, capture_output=True, text=True, timeout=15, check=False,
         )
         if head.returncode or not head.stdout.strip():
             raise ValueError("claim_git_head_unavailable")
-        claim_head = head.stdout.strip()
+        identity = head.stdout.splitlines()
+        claim_head = identity[0].strip()
         if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", claim_head) is None:
             raise ValueError("claim_git_head_invalid")
-        branch = subprocess.run(
-            prefix + ["branch", "--show-current"],
-            env=env, capture_output=True, text=True, timeout=15, check=False,
-        )
-        branch_name = branch.stdout.strip() if branch.returncode == 0 else ""
-        expected_branch = publication.get("branch")
+        branch_ref = identity[1].strip() if len(identity) == 2 else ""
+        branch_name = branch_ref[len("refs/heads/"):] if branch_ref.startswith("refs/heads/") else ""
+        if git_scope is not None and git_scope.get("git_head") != claim_head:
+            raise ValueError("claim_git_head_changed_during_preflight")
+        expected_branch = publication.get("branch") if requires_git else None
         if expected_branch and branch_name != expected_branch:
             raise ValueError("claim_branch_mismatch")
-        expected_base = publication.get("expected_base")
+        expected_base = publication.get("expected_base") if requires_git else None
         if expected_base and claim_head != expected_base:
             raise ValueError("claim_expected_base_changed")
         return claim_head, branch_name or None
@@ -1356,9 +1817,190 @@ class Orchestrator:
             "check_authority": authority,
         }
 
-    def claim(self, worker_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+    def _repair_source_current(self, workspace: Path, relative: str,
+                               expected_hash: str, *, recorded=None) -> None:
+        path = safe_workspace_path(workspace, relative, must_exist=False)
+        if workspace_path_has_symlink_component(workspace, path):
+            raise ValueError("repair_source_unsafe:" + relative)
+        if recorded is not None and recorded["deleted"]:
+            if os.path.lexists(path):
+                raise ValueError("repair_snapshot_stale:" + relative)
+            return
+        try:
+            fd = os.open(str(path), regular_file_read_flags())
+        except OSError as exc:
+            raise ValueError("repair_source_unsafe:" + relative) from exc
+        try:
+            before = os.fstat(fd)
+            if not statmod.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ValueError("repair_source_unsafe:" + relative)
+            if recorded is not None and (
+                before.st_size != recorded["bytes"]
+                or oct(before.st_mode & 0o777) != recorded["mode"]
+            ):
+                raise ValueError("repair_snapshot_stale:" + relative)
+            digest = hashlib.sha256()
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                after = os.fstat(handle.fileno())
+            current = path.lstat()
+            if (digest.hexdigest() != expected_hash
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mode,
+                    before.st_nlink, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mode,
+                    after.st_nlink, after.st_mtime_ns, after.st_ctime_ns)
+                or (current.st_dev, current.st_ino, current.st_size, current.st_mode,
+                    current.st_nlink, current.st_mtime_ns, current.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mode,
+                    after.st_nlink, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError("repair_snapshot_stale:" + relative)
+        except OSError as exc:
+            raise ValueError("repair_source_unsafe:" + relative) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _repair_claim_guard(self, conn: sqlite3.Connection, task: sqlite3.Row,
+                            payload: Dict[str, Any], prior_run_id: str,
+                            claim_git_head: Optional[str],
+                            claim_branch: Optional[str]) -> Dict[str, Any]:
+        # This is admission to a new attempt, never a mutation of the old attempt.
+        current_task = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                    (task["task_id"],)).fetchone()
+        if not current_task or dict(current_task) != dict(task):
+            raise ValueError("repair_task_changed")
+        prior = conn.execute("SELECT * FROM runs WHERE run_id=?", (prior_run_id,)).fetchone()
+        latest = conn.execute("SELECT run_id FROM runs WHERE task_id=? ORDER BY attempt DESC LIMIT 1",
+                              (task["task_id"],)).fetchone()
+        if not prior or prior["task_id"] != task["task_id"] or not latest or latest["run_id"] != prior_run_id:
+            raise ValueError("repair_run_not_latest")
+        if prior["state"] != "NEEDS_FIX" or prior["verify_status"] != "PASS":
+            raise ValueError("repair_run_not_verified_needs_fix")
+        snapshot_id = prior["snapshot_id"]
+        if not isinstance(snapshot_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot_id) is None:
+            raise ValueError("repair_snapshot_missing")
+        snap = conn.execute("SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,)).fetchone()
+        if not snap or snap["run_id"] != prior_run_id:
+            raise ValueError("repair_snapshot_run_mismatch")
+        manifest = json.loads(snap["manifest_json"])
+        if (not isinstance(manifest, dict)
+            or set(manifest) != {"schema_version", "workspace", "files", "protected", "git_head",
+                                 "created_at", "verification_evidence"}
+            or type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 1
+            or not isinstance(manifest.get("created_at"), str)
+            or snapshot_id != "sha256:" + sha256_bytes(canonical_json(manifest).encode("utf-8"))):
+            raise ValueError("repair_snapshot_binding_invalid")
+        workspace = Path(payload["workspace"]).resolve()
+        if manifest["workspace"] != str(workspace):
+            raise ValueError("repair_snapshot_workspace_mismatch")
+        if prior["claim_git_head"] is None or claim_git_head is None or claim_branch is None:
+            raise ValueError("repair_claim_git_identity_missing")
+        if (prior["claim_git_head"] != claim_git_head
+            or manifest["git_head"] != claim_git_head):
+            raise ValueError("repair_snapshot_base_mismatch")
+        claimed = conn.execute("SELECT task_id,payload_json FROM events WHERE run_id=? AND kind='RUN_CLAIMED' ORDER BY seq DESC LIMIT 1",
+                               (prior_run_id,)).fetchone()
+        claimed_payload = json.loads(claimed["payload_json"]) if claimed else None
+        if isinstance(claimed_payload, dict) and claimed_payload.get("claim_branch") is None:
+            raise ValueError("repair_claim_git_identity_missing")
+        if (not claimed or claimed["task_id"] != task["task_id"]
+            or not isinstance(claimed_payload, dict)
+            or claimed_payload.get("claim_branch") != claim_branch):
+            raise ValueError("repair_snapshot_branch_mismatch")
+        files = manifest["files"]
+        if not isinstance(files, dict) or not files:
+            raise ValueError("repair_snapshot_files_invalid")
+        for relative, recorded in files.items():
+            if (not isinstance(relative, str) or normalize_relative_path(relative) != relative
+                or not path_allowed(relative, payload.get("allowed_paths", []))
+                or relative in payload.get("protected_paths", {})
+                or not isinstance(recorded, dict)
+                or set(recorded) != {"deleted", "sha256", "bytes", "mode"}
+                or type(recorded["deleted"]) is not bool
+                or type(recorded["bytes"]) is not int or recorded["bytes"] < 0):
+                raise ValueError("repair_snapshot_files_invalid")
+            if recorded["deleted"]:
+                if recorded != {"deleted": True, "sha256": None, "bytes": 0, "mode": None}:
+                    raise ValueError("repair_snapshot_files_invalid")
+            elif (not isinstance(recorded["sha256"], str)
+                  or re.fullmatch(r"[0-9a-f]{64}", recorded["sha256"]) is None
+                  or not isinstance(recorded["mode"], str)
+                  or re.fullmatch(r"0o[0-7]{1,3}", recorded["mode"]) is None):
+                raise ValueError("repair_snapshot_files_invalid")
+            self._repair_source_current(workspace, relative, recorded["sha256"], recorded=recorded)
+        receipt = json.loads(prior["receipt_json"] or "null")
+        if (not isinstance(receipt, dict) or receipt.get("run_id") != prior_run_id
+            or receipt.get("task_id") != task["task_id"]
+            or not isinstance(receipt.get("changed_paths"), list)
+            or any(not isinstance(path, str) for path in receipt["changed_paths"])
+            or sorted(receipt.get("changed_paths") or []) != sorted(files)):
+            raise ValueError("repair_snapshot_receipt_mismatch")
+        protected = manifest["protected"]
+        expected_protected = payload.get("protected_paths", {})
+        if not isinstance(protected, dict) or set(protected) != set(expected_protected):
+            raise ValueError("repair_snapshot_protected_mismatch")
+        for relative, expected in expected_protected.items():
+            if protected[relative] != {"expected": expected, "actual": expected, "matches": True}:
+                raise ValueError("repair_snapshot_protected_mismatch")
+            self._repair_source_current(workspace, relative, expected)
+        # Staging is an independent boundary; scope evidence includes staged paths.
+        staged = self._publication_git(workspace, binary=True)(
+            "diff", "--no-ext-diff", "--no-textconv", "--cached", "--ita-visible-in-index", "--name-only", "-z")
+        if staged.returncode or staged.stdout:
+            raise ValueError("repair_index_not_empty")
+        scope = self._workspace_scope_evidence(payload, sorted(files))
+        if scope.get("status") != "PASS" or scope.get("git_head") != claim_git_head:
+            raise ValueError("repair_workspace_scope_changed")
+        evidence = self._verification_evidence_manifest(prior_run_id, payload.get("checks", []))
+        if evidence != manifest["verification_evidence"]:
+            raise ValueError("repair_verification_evidence_changed")
+        authority = self._check_authority_evidence(workspace, payload.get("checks", []))
+        if authority.get("status") != "PASS":
+            raise ValueError(authority.get("reason") or "repair_check_authority_changed")
+        for check in payload.get("checks", []):
+            for binding in check.get("authority_files", []):
+                if binding.get("expected") == "file":
+                    self._repair_source_current(workspace, binding["path"], binding["sha256"])
+        previous_runs = conn.execute("SELECT r.run_id FROM runs r JOIN tasks t ON t.task_id=r.task_id "
+                                     "WHERE t.writer_key=?", (task["writer_key"],)).fetchall()
+        if any(os.path.lexists(self._capability_path(item["run_id"])) for item in previous_runs):
+            raise ValueError("repair_previous_capability_present")
+        pending = conn.execute("SELECT p.run_id FROM publications p JOIN runs r ON r.run_id=p.run_id "
+                               "JOIN tasks t ON t.task_id=r.task_id WHERE t.writer_key=? "
+                               "AND p.status NOT IN ('COMPLETE','ABANDONED') LIMIT 1",
+                               (task["writer_key"],)).fetchone()
+        if pending:
+            raise ValueError("repair_publication_pending")
+        event = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+                             (task["task_id"],)).fetchone()
+        if task["status"] == "BLOCKED":
+            before_block = conn.execute("SELECT * FROM events WHERE task_id=? AND seq<? ORDER BY seq DESC LIMIT 1",
+                                        (task["task_id"], event["seq"] if event else 0)).fetchone()
+            blocked_payload = json.loads(event["payload_json"]) if event else None
+            before_payload = json.loads(before_block["payload_json"]) if before_block else None
+            if (not event or event["kind"] != "TASK_BLOCKED_AT_CLAIM"
+                or not isinstance(blocked_payload, dict)
+                or blocked_payload.get("reason") != "claim_workspace_dirty:" + sorted(files)[0]
+                or not before_block or before_block["kind"] != "REVIEW_IMPORTED"
+                or before_block["run_id"] != prior_run_id
+                or not isinstance(before_payload, dict)
+                or before_payload.get("verdict") != "NEEDS_FIX"
+                or before_payload.get("snapshot_id") != snapshot_id):
+                raise ValueError("repair_task_not_dirty_claim_blocked")
+        elif task["status"] != "NEEDS_FIX":
+            raise ValueError("repair_task_not_needs_fix")
+        return {"status": "PASS", "repair_from_run_id": prior_run_id,
+                "repair_snapshot_id": snapshot_id, "scope": scope}
+
+    def claim(self, worker_id: str, project_id: Optional[str] = None, *,
+              repair_from_run_id: Optional[str] = None) -> Dict[str, Any]:
         if project_id is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,160}", project_id) is None:
             raise ValueError("invalid_project_id")
+        if repair_from_run_id is not None and (not isinstance(repair_from_run_id, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]+", repair_from_run_id) is None):
+            raise ValueError("invalid_run_id")
         now = utc_now()
         with self.connect() as conn:
             _begin_immediate(conn)
@@ -1378,7 +2020,39 @@ class Orchestrator:
             blocked_locks: List[Dict[str, Any]] = []
             paused_projects: Dict[str, Dict[str, Any]] = {}
             selected = None
-            for row in conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall():
+            if repair_from_run_id is not None:
+                prior = conn.execute("SELECT task_id FROM runs WHERE run_id=?", (repair_from_run_id,)).fetchone()
+                if not prior:
+                    conn.execute("COMMIT")
+                    return {"status": "BLOCKED", "reason": "repair_run_missing"}
+                rows = conn.execute("SELECT * FROM tasks WHERE task_id=?", (prior["task_id"],)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM tasks ORDER BY queue_seq,task_id").fetchall()
+            for row in rows:
+                if repair_from_run_id is not None:
+                    def refuse(reason):
+                        conn.execute("COMMIT")
+                        return {"status": "BLOCKED", "task_id": row["task_id"],
+                                "project_id": row["project_id"], "reason": reason}
+                    if project_id is not None and row["project_id"] != project_id:
+                        return refuse("repair_project_mismatch")
+                    if row["project_id"] in project_pauses:
+                        conn.execute("COMMIT")
+                        return {"status": "PROJECT_PAUSED", "project_id": row["project_id"],
+                                "details": project_pauses[row["project_id"]]}
+                    payload = self._task_payload(row)
+                    if not self._dependencies_done(conn, payload):
+                        return refuse("repair_dependencies_not_done")
+                    attempts = conn.execute("SELECT COUNT(*) AS n FROM runs WHERE task_id=?",
+                                            (row["task_id"],)).fetchone()["n"]
+                    if attempts >= int(payload.get("max_attempts", 2)):
+                        return refuse("repair_max_attempts")
+                    lock = locks.get(row["writer_key"])
+                    if lock:
+                        conn.execute("COMMIT")
+                        return {"status": "BUSY", "active": lock, "locks": [lock]}
+                    selected = (row, payload, attempts + 1)
+                    break
                 if row["status"] not in READY_TASK_STATES:
                     continue
                 if project_id is not None and row["project_id"] != project_id:
@@ -1424,15 +2098,30 @@ class Orchestrator:
             row, payload, attempt = selected
             claim_guard = None
             try:
-                claim_git_head, claim_branch = self._claim_git_state(payload)
-                claim_guard = self._claim_workspace_guard(
-                    payload, claim_git_head
-                )
+                if repair_from_run_id is not None:
+                    claim_git_head, claim_branch = self._claim_git_state(payload)
+                    claim_guard = self._repair_claim_guard(conn, row, payload, repair_from_run_id,
+                                                          claim_git_head, claim_branch)
+                elif (payload.get("publication") or {}).get("kind") in {"git", "git_local"}:
+                    claim_git_head, claim_branch = self._claim_git_state(payload)
+                    claim_guard = self._claim_workspace_guard(payload, claim_git_head)
+                else:
+                    # Reuse this preflight's census only to distinguish Git from
+                    # ordinary non-Git workspaces. Git identity is read afresh.
+                    claim_guard = self._claim_workspace_guard(payload, None)
+                    claim_git_head, claim_branch = (None, None)
+                    if claim_guard["status"] == "PASS":
+                        claim_git_head, claim_branch = self._claim_git_state(
+                            payload, git_scope=claim_guard["scope"])
                 if claim_guard["status"] != "PASS":
                     raise ValueError(claim_guard["reason"])
             except ValueError as exc:
                 reason = str(exc)
                 details = claim_guard
+                if repair_from_run_id is not None:
+                    conn.execute("COMMIT")
+                    return {"status": "BLOCKED", "task_id": row["task_id"],
+                            "project_id": row["project_id"], "reason": reason}
                 conn.execute(
                     "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
                     (now, row["task_id"]),
@@ -1465,8 +2154,33 @@ class Orchestrator:
                     claim_git_head=claim_git_head,
                     run_persisted=False,
                 )
+                if repair_from_run_id is not None:
+                    claim_git_head, claim_branch = self._claim_git_state(payload)
+                    claim_guard = self._repair_claim_guard(conn, row, payload, repair_from_run_id,
+                                                           claim_git_head, claim_branch)
+                else:
+                    # Context preparation must not leave a stale preflight
+                    # identity or workspace guard authorizing the new writer.
+                    claim_guard = self._claim_workspace_guard(payload, claim_git_head)
+                    if claim_guard["status"] != "PASS":
+                        raise ValueError(claim_guard["reason"])
+                    try:
+                        current_head, current_branch = self._claim_git_state(
+                            payload, git_scope=claim_guard["scope"])
+                    except ValueError as exc:
+                        if str(exc) == "claim_branch_mismatch":
+                            raise ValueError("claim_branch_changed_during_preflight") from exc
+                        raise
+                    if current_head != claim_git_head:
+                        raise ValueError("claim_git_head_changed_during_preflight")
+                    if current_branch != claim_branch:
+                        raise ValueError("claim_branch_changed_during_preflight")
             except ValueError as exc:
                 reason = str(exc)
+                if repair_from_run_id is not None:
+                    conn.execute("COMMIT")
+                    return {"status": "BLOCKED", "task_id": row["task_id"],
+                            "project_id": row["project_id"], "reason": reason}
                 conn.execute(
                     "UPDATE tasks SET status='BLOCKED',updated_at=? WHERE task_id=?",
                     (now, row["task_id"]),
@@ -1511,6 +2225,9 @@ class Orchestrator:
                     "queue_seq": row["queue_seq"],
                     "claim_git_head": claim_git_head,
                     "claim_branch": claim_branch,
+                    **({"repair_from_run_id": repair_from_run_id,
+                        "repair_snapshot_id": claim_guard["repair_snapshot_id"]}
+                       if repair_from_run_id is not None else {}),
                 },
             )
             conn.execute("COMMIT")
@@ -1584,18 +2301,30 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         if run_persisted:
             previous = conn.execute(
-                "SELECT feedback_json,snapshot_id,attempt FROM runs "
+                "SELECT run_id,feedback_json,snapshot_id,attempt FROM runs "
                 "WHERE task_id=? AND run_id<>? AND feedback_json IS NOT NULL "
                 "ORDER BY attempt DESC LIMIT 1",
                 (task["task_id"], run_id),
             ).fetchone()
         else:
             previous = conn.execute(
-                "SELECT feedback_json,snapshot_id,attempt FROM runs "
+                "SELECT run_id,feedback_json,snapshot_id,attempt FROM runs "
                 "WHERE task_id=? AND feedback_json IS NOT NULL "
                 "ORDER BY attempt DESC LIMIT 1",
                 (task["task_id"],),
             ).fetchone()
+        readmission = conn.execute("SELECT payload_json FROM events WHERE kind='TASK_READMITTED' AND task_id=? ORDER BY seq DESC LIMIT 1",
+                                    (task["task_id"],)).fetchone()
+        readmission_proof = json.loads(readmission["payload_json"]) if readmission else None
+        # Readmission authorizes one dependency base regardless of publication
+        # mode. Retrieval uses the run's stored claim identity, not live HEAD.
+        if readmission and (not isinstance(readmission_proof, dict)
+                            or not isinstance(readmission_proof.get("dependency_commit"), str)
+                            or readmission_proof["dependency_commit"] != claim_git_head):
+            raise ValueError("readmission_claim_base_mismatch")
+        if not previous and readmission_proof:
+            previous = conn.execute("SELECT run_id,feedback_json,snapshot_id,attempt FROM runs WHERE run_id=?",
+                                    (readmission_proof["previous_run_id"],)).fetchone()
         feedback = (
             json.loads(previous["feedback_json"])
             if previous and previous["feedback_json"]
@@ -1623,10 +2352,13 @@ class Orchestrator:
             "owner_acceptance": bool(payload.get("owner_acceptance")),
             "publication": payload.get("publication", {"kind": "none"}),
             "feedback": feedback,
+            "previous_run_id": previous["run_id"] if previous else None,
             "previous_snapshot_id": (
                 previous["snapshot_id"] if previous else None
             ),
         }
+        if readmission_proof:
+            pack["readmission"] = {key: value for key, value in readmission_proof.items() if key != "result"}
         size = len(canonical_json(pack).encode("utf-8"))
         if size > 32768:
             raise ValueError(f"context_pack_too_large:{size}")
@@ -1758,44 +2490,47 @@ class Orchestrator:
         }
 
     def submit(self, run_id: str, lease_token: str, receipt_path: Path) -> Dict[str, Any]:
-        receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
-            run_id, receipt_path
-        )
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            if not run or not secrets.compare_digest(run["lease_token"], lease_token):
-                conn.execute("ROLLBACK")
-                raise ValueError("invalid_lease")
-            if run["state"] != "RUNNING":
-                conn.execute("ROLLBACK")
-                raise ValueError("run_not_running")
-            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
-            payload = self._task_payload(task)
-            if receipt.get("run_id") != run_id or receipt.get("task_id") != run["task_id"]:
-                conn.execute("ROLLBACK")
-                raise ValueError("receipt_identity_mismatch")
-            changed = receipt.get("changed_paths")
-            if not isinstance(changed, list) or not changed:
-                conn.execute("ROLLBACK")
-                raise ValueError("receipt_changed_paths_required")
-            for relative in changed:
-                if not isinstance(relative, str) or not path_allowed(relative, payload.get("allowed_paths", [])):
-                    conn.execute("ROLLBACK")
-                    raise ValueError(f"path_not_allowed:{relative}")
-            now = utc_now()
-            conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
-                         (canonical_json(receipt), now, now, run_id))
-            self._event(
-                conn, "RESULT_SUBMITTED",
-                task_id=run["task_id"], run_id=run_id,
-                payload={
-                    "changed_paths": changed,
-                    "receipt_sha256": receipt_sha256,
-                    "receipt_bytes": receipt_bytes,
-                },
+        with runtime_operation_lock(self.root):
+            receipt, receipt_sha256, receipt_bytes = self._load_worker_receipt(
+                run_id, receipt_path
             )
-            conn.execute("COMMIT")
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if not run or not secrets.compare_digest(run["lease_token"], lease_token):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("invalid_lease")
+                if run["state"] != "RUNNING":
+                    conn.execute("ROLLBACK")
+                    raise ValueError("run_not_running")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+                payload = self._task_payload(task)
+                if receipt.get("run_id") != run_id or receipt.get("task_id") != run["task_id"]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("receipt_identity_mismatch")
+                changed = receipt.get("changed_paths")
+                if not isinstance(changed, list) or not changed:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("receipt_changed_paths_required")
+                for relative in changed:
+                    if not isinstance(relative, str) or not path_allowed(relative, payload.get("allowed_paths", [])):
+                        conn.execute("ROLLBACK")
+                        raise ValueError(f"path_not_allowed:{relative}")
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
+                                           authorize=_execution_transition_authorizer(conn, run, task))
+                now = utc_now()
+                conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
+                             (canonical_json(receipt), now, now, run_id))
+                self._event(
+                    conn, "RESULT_SUBMITTED",
+                    task_id=run["task_id"], run_id=run_id,
+                    payload={
+                        "changed_paths": changed,
+                        "receipt_sha256": receipt_sha256,
+                        "receipt_bytes": receipt_bytes,
+                    },
+                )
+                conn.execute("COMMIT")
         return {
             "status": "RESULT_SUBMITTED",
             "run_id": run_id,
@@ -1804,20 +2539,24 @@ class Orchestrator:
         }
 
     def quiesce(self, run_id: str, lease_token: str) -> Dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT task_id,state,lease_token FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            if not row or not secrets.compare_digest(row["lease_token"], lease_token):
-                conn.execute("ROLLBACK")
-                raise ValueError("invalid_lease")
-            if row["state"] != "RESULT_SUBMITTED":
-                conn.execute("ROLLBACK")
-                raise ValueError("result_not_submitted")
-            conn.execute("UPDATE runs SET state='VERIFYING',heartbeat_at=? WHERE run_id=?", (utc_now(), run_id))
-            self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
-                        payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
-            conn.execute("COMMIT")
-        revoked = self._revoke_capability(run_id)
+        with runtime_operation_lock(self.root):
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if not row or not secrets.compare_digest(row["lease_token"], lease_token):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("invalid_lease")
+                if row["state"] != "RESULT_SUBMITTED":
+                    conn.execute("ROLLBACK")
+                    raise ValueError("result_not_submitted")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (row["task_id"],)).fetchone()
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(row, task),
+                                           authorize=_execution_transition_authorizer(conn, row, task))
+                conn.execute("UPDATE runs SET state='VERIFYING',heartbeat_at=? WHERE run_id=?", (utc_now(), run_id))
+                self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
+                            payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
+                conn.execute("COMMIT")
+            revoked = self._revoke_capability(run_id)
         return {"status": "VERIFYING", "residual_risk": "cooperative_direct_rdc_not_os_fenced",
                 "capability_revoked": revoked}
 
@@ -2155,13 +2894,18 @@ class Orchestrator:
                       "output_tail_chars": output_tail_chars,
                       "timeout_action": timeout_action}
         except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.stdout, exc.stderr
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
             result = {"id": check.get("id", "unnamed"), "argv": argv,
                       "executed_argv": executed_argv, "exit_code": None,
                       "duration_ms": int((time.monotonic() - started) * 1000),
-                      "stdout": ((exc.stdout or "")[-output_tail_chars:]
-                                 if isinstance(exc.stdout, str) else ""),
-                      "stderr": ((exc.stderr or "")[-output_tail_chars:]
-                                 if isinstance(exc.stderr, str) else ""),
+                      "stdout": (stdout[-output_tail_chars:]
+                                 if isinstance(stdout, str) else ""),
+                      "stderr": (stderr[-output_tail_chars:]
+                                 if isinstance(stderr, str) else ""),
                       "timed_out": True,
                       "output_tail_chars": output_tail_chars,
                       "timeout_action": timeout_action}
@@ -3393,52 +4137,56 @@ class Orchestrator:
         self, run_id: str, reason: str, retry: bool = False,
         process_inactivity_confirmed: bool = False,
     ) -> Dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id=?", (run_id,)
-            ).fetchone()
-            if not run or run["state"] not in ACTIVE_RUN_STATES:
-                conn.execute("ROLLBACK")
-                raise ValueError("run_not_active")
-            checkpoint = conn.execute(
-                "SELECT value_json FROM settings WHERE key=?",
-                (f"run_checkpoint:{run_id}",),
-            ).fetchone()
-            if (
-                run["state"] == "RUNNING"
-                and checkpoint is not None
-                and not process_inactivity_confirmed
-            ):
-                conn.execute("ROLLBACK")
-                raise ValueError("process_inactivity_confirmation_required")
-            now = utc_now()
-            state = "NEEDS_FIX" if retry else "BLOCKED"
-            conn.execute(
-                "UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?",
-                (reason[:1000], now, run_id),
-            )
-            conn.execute(
-                "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
-                (state, now, run["task_id"]),
-            )
-            payload = {
-                "reason": reason[:500],
-                "retry": retry,
-                "checkpoint_present": checkpoint is not None,
-                "process_inactivity_confirmation": (
-                    "operator_asserted"
-                    if checkpoint is not None and process_inactivity_confirmed
-                    else None
-                ),
-                "process_fencing": False,
-            }
-            self._event(
-                conn, "RUN_ABORTED", task_id=run["task_id"],
-                run_id=run_id, payload=payload,
-            )
-            conn.execute("COMMIT")
-        self._revoke_capability(run_id)
+        with runtime_operation_lock(self.root):
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                run = conn.execute(
+                    "SELECT * FROM runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+                if not run or run["state"] not in ACTIVE_RUN_STATES:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("run_not_active")
+                checkpoint = conn.execute(
+                    "SELECT value_json FROM settings WHERE key=?",
+                    (f"run_checkpoint:{run_id}",),
+                ).fetchone()
+                if (
+                    run["state"] == "RUNNING"
+                    and checkpoint is not None
+                    and not process_inactivity_confirmed
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("process_inactivity_confirmation_required")
+                task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
+                require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
+                                           authorize=_execution_transition_authorizer(conn, run, task))
+                now = utc_now()
+                state = "NEEDS_FIX" if retry else "BLOCKED"
+                conn.execute(
+                    "UPDATE runs SET state='ABORTED',error=?,completed_at=? WHERE run_id=?",
+                    (reason[:1000], now, run_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status=?,updated_at=? WHERE task_id=?",
+                    (state, now, run["task_id"]),
+                )
+                payload = {
+                    "reason": reason[:500],
+                    "retry": retry,
+                    "checkpoint_present": checkpoint is not None,
+                    "process_inactivity_confirmation": (
+                        "operator_asserted"
+                        if checkpoint is not None and process_inactivity_confirmed
+                        else None
+                    ),
+                    "process_fencing": False,
+                }
+                self._event(
+                    conn, "RUN_ABORTED", task_id=run["task_id"],
+                    run_id=run_id, payload=payload,
+                )
+                conn.execute("COMMIT")
+            self._revoke_capability(run_id)
         return {
             "status": "ABORTED",
             "run_id": run_id,

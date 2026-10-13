@@ -1,8 +1,8 @@
-"""Descriptor-anchored, read-only file-scope foundation for a local Bridge.
+"""Descriptor-anchored file-scope foundation for a trusted local Bridge.
 
-Only existing regular-file file.read targets can acquire a descriptor.
-No contents are transferred, no worker adapter executes, and no permission
-survives outside the returned context. Not an OS sandbox or same-user fence.
+Read/list contexts and the trusted local patcher acquire only existing target
+descriptors. No contents are transferred and this module performs no leaf
+mutation. Scope observations are volatile, not an OS sandbox or same-user fence.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Iterator
 
 from .bridge_authorization import LocalRunSessionAuthority
+from .bridge_patch_metadata import (
+    file_signature, read_file_metadata, require_no_acl,
+)
 from .config import read_bounded_json_object
 from .core import path_allowed
 from .project import (
@@ -38,6 +41,17 @@ def _require_primitives() -> None:
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
+
+
+def _require_patch_primitives() -> None:
+    _require_primitives()
+    # On macOS os.replace accepts both dir_fd arguments, but only its
+    # equivalent os.rename is listed in supports_dir_fd. The actual replace
+    # descriptor behavior is exercised by the native scope fixture.
+    if (os.rename not in os.supports_dir_fd
+            or os.unlink not in os.supports_dir_fd
+            or not callable(getattr(os, "replace", None))):
+        raise ValueError("bridge_file_scope_unsupported")
 
 
 def _directory_flags() -> int:
@@ -77,12 +91,71 @@ def _open_registered_root(root: Path) -> int:
         raise
 
 
+class _PatchTargetHandle:
+    """Owned descriptor observation; does not itself grant a publication."""
+
+    def __init__(self, scope: "LocalFileScope", request: WorkerOperationRequest,
+                 root_fd: int, parent_fd: int, leaf: str, fd: int,
+                 ancestors: list):
+        self.parent_fd, self.leaf, self.fd = parent_fd, leaf, fd
+        self._scope, self._request = scope, request
+        self._root_fd, self._ancestors = root_fd, ancestors
+        self._parent_identity = _identity(os.fstat(parent_fd))
+        self._ancestor_identities = [_identity(os.fstat(child))
+                                     for _, _, child in ancestors]
+        self._original_signature = file_signature(os.fstat(fd))
+        self._original_metadata = read_file_metadata(fd)
+        self._closed = False
+
+    @property
+    def anchors(self) -> dict:
+        return {"root": list(self._scope._root_identity),
+                "parents": [list(self._scope._root_identity)] +
+                           [list(identity) for identity in self._ancestor_identities],
+                "parent": list(self._parent_identity)}
+
+    def recheck(self, *, original_required: bool = True) -> None:
+        """Renew authority/allowlist and every pinned path observation.
+
+        After a rename only parents can be compared to the pre-rename scope;
+        the patcher independently reopens and verifies the new named target.
+        """
+        if self._closed or self._scope._root_fd < 0:
+            raise ValueError("bridge_file_scope_closed")
+        if type(original_required) is not bool:
+            raise ValueError("bridge_file_scope_invalid_recheck")
+        _require_patch_primitives()
+        root, allowed = self._scope._live_scope()
+        if (root != self._scope._root_path
+                or not path_allowed(self._request.target, allowed)):
+            raise ValueError("bridge_file_scope_scope_changed")
+        self._scope._check_root_identity()
+        try:
+            if (_identity(os.fstat(self._root_fd)) != self._scope._root_identity
+                    or _identity(os.fstat(self.parent_fd)) != self._parent_identity):
+                raise ValueError("bridge_file_scope_path_changed")
+            require_no_acl(self._root_fd)
+            for (parent, name, child), pinned in zip(self._ancestors, self._ancestor_identities):
+                if (_identity(_entry(parent, name, directory=True)) != pinned
+                        or _identity(os.fstat(child)) != pinned):
+                    raise ValueError("bridge_file_scope_path_changed")
+                require_no_acl(child)
+            if original_required:
+                if (file_signature(_entry(self.parent_fd, self.leaf, directory=False))
+                        != self._original_signature
+                        or file_signature(os.fstat(self.fd)) != self._original_signature
+                        or read_file_metadata(self.fd) != self._original_metadata):
+                    raise ValueError("bridge_file_scope_path_changed")
+        except (OSError, TypeError):
+            raise ValueError("bridge_file_scope_path_denied") from None
+
+
 class LocalFileScope:
     """Own a pinned root descriptor for one volatile run/session.
 
     Construct only within trusted local OrchKit code. The root fd belongs to
     this object and must be closed. Each yielded target fd belongs to its
-    open_readonly context and is closed even if caller code raises.
+    target context and is closed even if caller code raises.
     Do not share instances across threads or fork boundaries.
     """
 
@@ -176,7 +249,7 @@ class LocalFileScope:
 
         The leaf and all parents must already exist. Missing components,
         symlinks and nonregular targets are refused; no mkdir, O_CREAT or
-        write occurs. file.list and file.patch are not implemented.
+        write occurs. Other operation kinds use their dedicated contexts.
         """
         if self._root_fd < 0:
             raise ValueError("bridge_file_scope_closed")
@@ -225,6 +298,59 @@ class LocalFileScope:
                 except (OSError, TypeError) as exc:
                     raise ValueError("bridge_file_scope_path_denied") from exc
                 yield fd
+        finally:
+            self._active_handles -= 1
+
+    @contextmanager
+    def open_patch_target(self, request: WorkerOperationRequest) -> Iterator[_PatchTargetHandle]:
+        """Yield pinned existing-target descriptors to the local patcher only.
+
+        No leaf write, creation, deletion or rename happens here. The context
+        owns its root duplicate, ancestor descriptors and read-only original.
+        Raw paths never survive as reusable scope approvals.
+        """
+        if self._root_fd < 0:
+            raise ValueError("bridge_file_scope_closed")
+        require_matching_worker_run(self._binding, request)
+        if request.kind != "file.patch":
+            raise ValueError("bridge_file_scope_kind_unsupported")
+        _require_patch_primitives()
+        root, allowed = self._live_scope()
+        if root != self._root_path or not path_allowed(request.target, allowed):
+            raise ValueError("bridge_file_scope_path_denied")
+        self._check_root_identity()
+        self._active_handles += 1
+        try:
+            with ExitStack() as owned:
+                try:
+                    root_fd = os.dup(self._root_fd)
+                    owned.callback(os.close, root_fd)
+                    os.set_inheritable(root_fd, False)
+                    parent_fd = root_fd
+                    ancestors = []
+                    parts = request.target.split("/")
+                    for part in parts[:-1]:
+                        _entry(parent_fd, part, directory=True)
+                        child = os.open(part, _directory_flags(), dir_fd=parent_fd)
+                        owned.callback(os.close, child)
+                        if not stat.S_ISDIR(os.fstat(child).st_mode):
+                            raise ValueError("bridge_file_scope_unsafe_type")
+                        ancestors.append((parent_fd, part, child))
+                        parent_fd = child
+                    leaf = parts[-1]
+                    _entry(parent_fd, leaf, directory=False)
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+                    fd = os.open(leaf, flags, dir_fd=parent_fd)
+                    owned.callback(os.close, fd)
+                    handle = _PatchTargetHandle(self, request, root_fd, parent_fd,
+                                                leaf, fd, ancestors)
+                    handle.recheck()
+                except (OSError, TypeError):
+                    raise ValueError("bridge_file_scope_path_denied") from None
+                try:
+                    yield handle
+                finally:
+                    handle._closed = True
         finally:
             self._active_handles -= 1
 
