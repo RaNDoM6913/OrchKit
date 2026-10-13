@@ -51,8 +51,14 @@ and linked intent under that lock. Failed renewal preserves evidence and blocks
 closure. Returned receipts remain historical after later workspace edits. These
 source capabilities do not alter frozen 0.11.0 artifacts, prove power-loss or
 same-user isolation, or accept independent ordinary-Chat Bridge workers. General
-write/create/delete operations, owned processes, a product Bridge service/broker
-and the remote route remain unimplemented.
+write/create/delete operations, a product Bridge service/broker and the remote
+route remain unimplemented. The separate P1-C3 source API adds trusted operator
+process profiles, bounded output/cursors, background deadlines and direct-child
+exit evidence. Durable dispatches never replay after restart; active or uncertain
+children block native authority release. This is cooperative local ownership,
+with no descendant containment or ordinary-Chat Bridge acceptance.
+Lifecycle capacity is reserved within the bounded operation cache, so ordinary
+polling cannot starve termination or proven terminal readback for admitted children.
 
 The first target is one operator, one Mac, and up to three independent project workers. Preserve one active writer per existing `writer_key`; linked worktrees that share a Git common directory remain serialized.
 

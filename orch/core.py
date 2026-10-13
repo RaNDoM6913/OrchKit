@@ -20,6 +20,7 @@ from .config import (atomic_write_json, ensure_private_dir,
                      read_bounded_regular_file, regular_file_read_flags)
 from .git_transport import inspect_transport_url, run_sandboxed_transport
 from .bridge_patch_execution import runtime_operation_lock, require_execution_resolved
+from .bridge_process_store import configure_process_durability, require_processes_resolved
 from .review_policy import decide_review, normalize_review_policy
 from .worker_operations import WorkerRunBinding
 
@@ -2495,6 +2496,7 @@ class Orchestrator:
                 run_id, receipt_path
             )
             with self.connect() as conn:
+                configure_process_durability(conn)
                 conn.execute("BEGIN IMMEDIATE")
                 run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if not run or not secrets.compare_digest(run["lease_token"], lease_token):
@@ -2518,6 +2520,7 @@ class Orchestrator:
                         raise ValueError(f"path_not_allowed:{relative}")
                 require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
                                            authorize=_execution_transition_authorizer(conn, run, task))
+                require_processes_resolved(conn, run_id, _ledger_worker_binding(run, task))
                 now = utc_now()
                 conn.execute("UPDATE runs SET state='RESULT_SUBMITTED',receipt_json=?,submitted_at=?,heartbeat_at=? WHERE run_id=?",
                              (canonical_json(receipt), now, now, run_id))
@@ -2541,6 +2544,7 @@ class Orchestrator:
     def quiesce(self, run_id: str, lease_token: str) -> Dict[str, Any]:
         with runtime_operation_lock(self.root):
             with self.connect() as conn:
+                configure_process_durability(conn)
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if not row or not secrets.compare_digest(row["lease_token"], lease_token):
@@ -2552,6 +2556,7 @@ class Orchestrator:
                 task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (row["task_id"],)).fetchone()
                 require_execution_resolved(self.root, run_id, _ledger_worker_binding(row, task),
                                            authorize=_execution_transition_authorizer(conn, row, task))
+                require_processes_resolved(conn, run_id, _ledger_worker_binding(row, task))
                 conn.execute("UPDATE runs SET state='VERIFYING',heartbeat_at=? WHERE run_id=?", (utc_now(), run_id))
                 self._event(conn, "COOPERATIVE_QUIESCENCE_CONFIRMED", task_id=row["task_id"], run_id=run_id,
                             payload={"boundary": "helper_lease_only", "direct_rdc_shell_residual_risk": True})
@@ -4139,6 +4144,7 @@ class Orchestrator:
     ) -> Dict[str, Any]:
         with runtime_operation_lock(self.root):
             with self.connect() as conn:
+                configure_process_durability(conn)
                 conn.execute("BEGIN IMMEDIATE")
                 run = conn.execute(
                     "SELECT * FROM runs WHERE run_id=?", (run_id,)
@@ -4160,6 +4166,7 @@ class Orchestrator:
                 task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (run["task_id"],)).fetchone()
                 require_execution_resolved(self.root, run_id, _ledger_worker_binding(run, task),
                                            authorize=_execution_transition_authorizer(conn, run, task))
+                require_processes_resolved(conn, run_id, _ledger_worker_binding(run, task))
                 now = utc_now()
                 state = "NEEDS_FIX" if retry else "BLOCKED"
                 conn.execute(

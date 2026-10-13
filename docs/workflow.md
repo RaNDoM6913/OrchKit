@@ -246,6 +246,27 @@ The current CLI admits and displays a versioned bounded-execution contract, but 
 
 See the [roadmap](../ROADMAP.md) for the ordered P0 milestones.
 
+The trusted local owned-process source API is a separate bounded executor.
+Operator profiles freeze executable/arguments, project-root cwd, sanitized
+environment, output budget and deadline; worker requests use profile IDs and
+opaque run/session handles. Its supervisor drains bounded output and enforces
+deadlines without polling. A signal is not completion: only retained direct-child
+reaping and settled output produce linked exit evidence. Dispatch and exit
+metadata live in SQLite events; output and live handles are volatile.
+
+Ordinary polling cannot consume an admitted child's reserved terminate and
+proven-terminal readback slots. The 64-entry outcome cache counts these safety
+reservations when admitting new work. A capacity refusal or pending terminal
+poll is not exit proof; pending/invalid observations do not spend the final slot.
+
+Unresolved dispatches block submit, quiesce and abort. An operator inactivity
+assertion does not waive owned-process evidence. Restart never replays spawn or
+signals a saved PID. Native closure validates the exact exit chain and commits
+its acknowledgement with the authority transition using FULL synchronous
+durability. Backup preserves process metadata, not live ownership or output.
+Trusted profiles must avoid descendants and secrets; this is no OS sandbox or
+ordinary-Chat Bridge acceptance.
+
 ## Review and publication
 
 Review can be disabled, risk-based, or required by policy. Codex is an optional reviewer and must not be used as a prerequisite for the core workflow.
