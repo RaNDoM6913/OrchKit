@@ -299,7 +299,7 @@ process/fault fixtures do not establish actual power-loss recovery. Native
 verifier/publisher and current source/PR/merge acceptance gates remain separate.
 
 **Still not implemented:** general write/create/delete adapters, external content
-transport, owned processes, general operation replay, daemon, multi-session broker,
+transport, general operation replay, daemon, multi-session broker,
 relay/MCP or device trust. Finish those as separately scoped gates before any
 first ordinary-Chat route without RDC; do not relabel this foundation as a
 working Bridge or relax P1-C1/verifier/publisher authority.
@@ -311,6 +311,39 @@ Build in separate packages:
 - Path canonicalization, symlink/escape rejection, and allowed-path tests.
 - Owned-process start, output limits, deadlines, exit readback, and safe termination.
 - Durable operation IDs, idempotent retry, and restart/readback semantics before exposing remote mutations.
+
+### P1-C3: trusted local owned-process source API
+
+`LocalOwnedProcessOperations` implements v1 start/poll/terminate for a trusted
+local caller. Workers select a frozen operator profile ID and receive an opaque
+run/session handle. Executable identity/content, exact arguments, project-root
+cwd and sanitized environment are operator-owned; worker shell text, arbitrary
+argv and raw PIDs are refused. Profiles must avoid descendants and secrets.
+
+An immutable SQLite dispatch event, FULL commit and independent exact readback
+precede spawn under the same cooperative runtime lock as native closure. Existing
+IDs never authorize another spawn. Lost live `Popen` ownership after restart is
+`UNKNOWN`; saved PIDs, elapsed time and absence are not exit proof. Only a retained
+direct child's reaped exit plus settled merged output can create linked terminal
+evidence. Native submit/quiesce/abort validate complete chains and acknowledge
+them in the FULL state-transition transaction; uncertainty blocks release.
+
+The supervisor enforces profile deadlines without worker polling and drains
+output beyond the retained-byte limit. Poll responses bound the entire JSON and
+base64 envelope, expose explicit truncation and cursors, and bind cursor/request
+identity to a bounded in-memory operation cache. Ledger events contain metadata
+only; SQLite backup preserves them. Terminal metadata does not restore live
+handles or child output. Deadline and termination prove only this trusted direct
+child, without process-group, descendant or OS fencing. No daemon, remote route,
+general replay or ordinary-Chat mutation acceptance is supplied by this package.
+
+Within the 64 cached-outcome ceiling, every admitted child reserves one terminate
+and one proven-terminal poll outcome. Ordinary polling and new-start admission
+count outstanding reservations, so they cannot starve those lifecycle calls.
+A reserved terminal poll is consumed only by a successful durable `EXITED`
+readback; pending, invalid or undersized observations leave it available. Cached
+mutation identity is never evicted. Capacity may refuse ordinary work before all
+64 entries are occupied; it never establishes that the child stopped.
 
 **Acceptance:** a session cannot change its project/run authority; unsupported operations are refused; secrets/capability contents never enter model-facing responses; failures are durable and attributable. Restart is not evidence that an uncertain write failed or that a process stopped. Do not expose unrestricted machine shell as the normal interface.
 

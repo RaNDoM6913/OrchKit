@@ -725,7 +725,62 @@ receipts do not replace verification or authorize Git publication. Product
 Bridge endpoint, ordinary-Chat Bridge acceptance and source/PR/merge gates are
 separate from this local API.
 
-Only after further owned-process, durable-operation and transport gates should
+### P1-C3 — trusted local owned-process operations
+
+`orch/bridge_process.py` exposes `OwnedProcessProfile` and
+`LocalOwnedProcessOperations` to trusted local code. Existing v1 requests remain
+unchanged: start targets an operator profile ID, poll/terminate target an opaque
+handle. Profiles freeze exact executable/arguments, project-root cwd, sanitized
+environment, output budget and deadline; workers cannot register profiles or
+submit shell text, arbitrary argv or PIDs. Operators must use profiles that avoid
+descendants and sensitive output. This is direct-child cooperative ownership.
+
+Every normal operation rechecks full session/run/capability/project authority
+under the existing runtime lock. `ProcessOperationStore` records bounded safe
+dispatch and exit metadata in the existing SQLite events ledger. FULL synchronous
+commit and independent exact-row readback precede spawn. The intent records full
+request/binding and profile/session hashes, never PID, argv, environment, raw
+output or capability contents. Existing dispatch IDs never permit another spawn,
+including a visible record after ambiguous commit or a restart before spawn.
+
+Live ownership is the retained `Popen` object. No restart reconstructs it, signals
+a saved PID/PGID, or concludes inactivity from time or disappearance. The
+background supervisor continuously drains merged stdout/stderr, retains at most
+the profile byte bound, marks truncation, and enforces the deadline without a
+poll. Proven terminal exit requires reaping that direct child and settled output.
+Missing output EOF after bounded settling stays unresolved. Trusted local owner
+cleanup after worker authority loss can use only its still-held child object;
+normal worker calls remain denied.
+
+Start/poll/terminate return bounded v1 outcomes. Successful JSON observations
+separate API success from child exit code. Poll accepts a byte cursor and exposes
+the next cursor with base64 output; the complete envelope obeys the requested
+byte limit. In-memory operation caching binds complete request plus cursor;
+conflicting IDs refuse. Dispatch/capture/cache admission is bounded, and unresolved
+intents consume capacity. Output is volatile and never persisted in the ledger.
+
+The 64-entry outcome budget includes two safety reservations per admitted child:
+one terminate result and one proven-terminal poll. Ordinary poll/new-start
+admission accounts for outstanding reservations; an exhausted ordinary budget
+returns an explicit capacity refusal while preserving lifecycle admission.
+Pending terminal polls and invalid/undersized requests cannot consume the terminal
+reservation. Only durable `EXITED` readback spends that slot. An unused terminate
+reservation remains available after natural exit; terminating an already exited
+retained child safely reads its terminal state. These reservations can refuse new
+work before the global cache or ledger dispatch ceilings are reached. Cached
+request/kind/cursor conflicts remain refused and mutation IDs are never evicted.
+
+Submit, quiesce and abort validate complete linked process chains beside the
+existing file.patch guard. Active, orphaned, invalid or uncertain evidence blocks
+closure, including operator inactivity assertions. Accepted exit evidence is
+acknowledged with the native FULL state transition. Native SQLite backup preserves
+metadata; restoration cannot recreate live handles or prove uncertain exit.
+
+This source API is separate from required review, publication, CI and runtime
+acceptance. It adds no daemon, product endpoint, descendant containment, OS fence,
+general operation replay or ordinary-Chat mutating-production acceptance.
+
+Only after further durable-operation and transport gates should
 a real Bridge endpoint be considered. These local packages are **not** an RDC
 replacement, shell, relay, daemon or MCP.
 
