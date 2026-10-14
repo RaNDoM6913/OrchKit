@@ -267,6 +267,62 @@ durability. Backup preserves process metadata, not live ownership or output.
 Trusted profiles must avoid descendants and secrets; this is no OS sandbox or
 ordinary-Chat Bridge acceptance.
 
+## Calling the local read-only source service
+
+Source builds with P1-C4a provide one foreground service for one existing native
+run. Prepare an operator-owned `0700` directory, then use new socket and transport
+credential paths within it:
+
+```bash
+orch --root /absolute/existing/home bridge serve \
+  --run-id RUN_ID --cap /absolute/capability-file \
+  --socket /absolute/private-directory/bridge.sock \
+  --client-credential-file /absolute/private-directory/client.json
+```
+
+The root must already contain safe schema-v4 native state. Serving never creates
+or migrates a ledger or repairs its permissions. The CLI selects the run/task
+binding; unchanged native authority validates it and the capability before any
+worker call. The service creates its socket and separate credential as `0600`;
+keep the credential private. Its fresh token is read internally by the client,
+and native capability/lease contents never travel over the socket.
+
+Use a separate terminal for an explicit authenticated call:
+
+```bash
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation session.status
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation file.read --target relative/path --max-response-bytes 4096
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation file.list --target relative-directory --max-response-bytes 4096
+```
+
+Only these three operations are available. Read/list targets remain subject to
+the existing relative-path grants, descriptor checks and live native authority.
+Status is a bounded view of the configured run/session and admitted service
+limits. File output is base64 in a compact JSON reply. `--max-response-bytes`
+defaults to 4,096 and bounds the complete JSON envelope; the maximum is 65,536.
+The CLI prints that envelope without a trailing newline and exits zero only for
+`SUCCEEDED`. Refusals/failures use fixed safe error codes, without raw exceptions,
+native paths, lease/token contents, environment or raw process identifiers.
+
+One connection is active at a time. Each CLI invocation performs a fresh hello;
+EOF or a five-second framing/send timeout closes its connection while retaining
+the service/session for the next explicit call. The service exits on stop,
+unrecoverable failure or thirty seconds without a new connection. Cleanup removes
+only still-matching owned socket/credential identities. Restart is explicit and
+creates fresh routing IDs and credential; there is no automatic retry. None of
+these transport actions releases or completes the native writer. Finish native
+work independently through its normal authorized lifecycle.
+
+This source endpoint still requires native review/publication, CI, immutable
+runtime, actual RDC wire execution and preservation acceptance. Existing frozen
+release/default runtime choices stay unchanged. Mutation RPC, broker/remote
+transport and ordinary-Chat Bridge acceptance remain deferred. Native durable
+state preservation and SQLite WAL/SHM effects are verified separately; file byte
+bounds do not promise cancellable storage-I/O deadlines or OS isolation.
+
 ## Review and publication
 
 Review can be disabled, risk-based, or required by policy. Codex is an optional reviewer and must not be used as a prerequisite for the core workflow.

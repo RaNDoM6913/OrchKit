@@ -10,15 +10,27 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 from pathlib import Path
+from typing import Protocol
 
 from .config import read_bounded_json_object
-from .core import Orchestrator, WRITER_LOCK_RUN_STATES
+from .core import WRITER_LOCK_RUN_STATES
 from .project import (
     PROJECT_CONFIG_MAX_BYTES, ProjectRegistry, inspect_project,
     project_root_identity_matches, validate_project_schema,
 )
 from .worker_operations import WorkerRunBinding
+
+
+class AuthorityLedger(Protocol):
+    """Structural ledger surface used by unchanged local authority decisions."""
+
+    root: Path
+
+    def connect(self) -> sqlite3.Connection: ...
+
+    def lease_from_capability(self, run_id: str, capability_file: Path) -> str: ...
 
 
 class LocalRunSessionAuthority:
@@ -29,7 +41,7 @@ class LocalRunSessionAuthority:
     No worker operation is executed or approved by this object.
     """
 
-    def __init__(self, orchestrator: Orchestrator):
+    def __init__(self, orchestrator: AuthorityLedger):
         self._orch = orchestrator
         self._sessions: dict[str, WorkerRunBinding] = {}
 
