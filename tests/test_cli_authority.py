@@ -1,21 +1,29 @@
 import contextlib
+import base64
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
-from orch.cli import main as cli_main
+from orch.cli import build_parser, main as cli_main
 from orch.core import Orchestrator
+from orch.plan import build_single_task_plan, write_plan
 from orch.project import ProjectRegistry
 
 
 class CliLedgerAuthorityTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,6 +87,328 @@ class CliLedgerAuthorityTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(result["error"], "state_ledger_missing_or_unsafe")
         self.assertFalse(home.exists())
+
+    def test_bridge_parser_exposes_only_readonly_calls_and_operator_binding(self):
+        parser = build_parser()
+        serve = parser.parse_args([
+            "bridge", "serve", "--run-id", "fixture-run",
+            "--cap", "/private/native-capability.json",
+            "--socket", "/private/bridge.sock",
+            "--client-credential-file", "/private/client.json",
+        ])
+        self.assertEqual(serve.run_id, "fixture-run")
+        self.assertEqual(serve.cap, "/private/native-capability.json")
+        self.assertEqual(serve.socket, "/private/bridge.sock")
+        for operation in ("session.status", "file.read", "file.list"):
+            with self.subTest(operation=operation):
+                call = parser.parse_args([
+                    "bridge", "call", "--client-credential-file",
+                    "/private/client.json", "--operation", operation,
+                ])
+                self.assertEqual(call.operation, operation)
+                self.assertEqual(call.max_response_bytes, 4096)
+                self.assertIsNone(call.target)
+        for arguments in (
+            ["--operation", "file.patch"],
+            ["--operation", "process.start"],
+            ["--operation", "session.status", "--run-id", "other-run"],
+            ["--operation", "session.status", "--cap", "/private/native.json"],
+            ["--operation", "session.status", "--root", "/other-home"],
+        ):
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as rejected:
+                        parser.parse_args([
+                            "bridge", "call", "--client-credential-file",
+                            "/private/client.json", *arguments,
+                        ])
+                self.assertEqual(rejected.exception.code, 2)
+
+    def test_bridge_serve_missing_home_is_sanitized_and_never_initializes(self):
+        home = self.base / "missing-bridge-home"
+        rc, result = self.invoke(
+            "--root", str(home), "bridge", "serve",
+            "--run-id", "fixture-run", "--cap", str(self.base / "cap.json"),
+            "--socket", str(self.base / "bridge.sock"),
+            "--client-credential-file", str(self.base / "client.json"),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result, {
+            "status": "ERROR", "error_code": "bridge_serve_failed",
+        })
+        self.assertFalse(home.exists())
+        self.assertFalse((self.base / "bridge.sock").exists())
+        self.assertFalse((self.base / "client.json").exists())
+
+    def test_bridge_serve_unsafe_home_is_not_repaired(self):
+        home = self.base / "unsafe-bridge-home"
+        Orchestrator(home)
+        db = home / ".runtime" / "orch.sqlite3"
+        original = db.read_bytes()
+        home.chmod(0o755)
+        rc, result = self.invoke(
+            "--root", str(home), "bridge", "serve",
+            "--run-id", "fixture-run", "--cap", str(self.base / "cap.json"),
+            "--socket", str(self.base / "bridge.sock"),
+            "--client-credential-file", str(self.base / "client.json"),
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result["error_code"], "bridge_serve_failed")
+        self.assertEqual(home.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(db.read_bytes(), original)
+
+    def test_bridge_call_missing_credentials_is_sanitized_without_ledger(self):
+        home = self.base / "unused-bridge-home"
+        credential = self.base / "missing-private-transport.json"
+        rc, result = self.invoke(
+            "--root", str(home), "bridge", "call",
+            "--client-credential-file", str(credential),
+            "--operation", "session.status",
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(result, {
+            "status": "ERROR", "error_code": "bridge_call_failed",
+        })
+        self.assertFalse(home.exists())
+
+    def make_bridge_run(self, home, name):
+        if not home.exists():
+            home.mkdir(mode=0o700)
+        repo = self.make_repo(name)
+        (repo / "data").mkdir()
+        (repo / "data" / "sample.bin").write_bytes(b"\x00\xfffixture\n")
+        subprocess.run(["git", "-C", str(repo), "add", "data"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "binary fixture"],
+            check=True, capture_output=True,
+        )
+        project = self.register_via_cli(home, repo)
+        task_id = name.upper()
+        plan = build_single_task_plan(
+            project, task_id=task_id, goal="Test local read-only CLI",
+            allowed_paths=["README.md", "data/"], plan_revision=name,
+        )
+        plan_file = self.base / (name + "-plan.json")
+        self.assertEqual(write_plan(plan_file, plan)["status"], "CREATED")
+        orch = Orchestrator(home)
+        self.assertEqual(orch.load_plan(plan_file)["queued_count"], 1)
+        claim = orch.claim("cli-fixture", project_id=project["project_id"])
+        self.assertEqual(claim["status"], "CLAIMED")
+        return orch, project, claim
+
+    def bridge_serve_args(self, home, claim, transport):
+        return [
+            "--root", str(home), "bridge", "serve",
+            "--run-id", claim["run_id"], "--cap", claim["capability_file"],
+            "--socket", str(transport / "bridge.sock"),
+            "--client-credential-file", str(transport / "client.json"),
+        ]
+
+    def test_bridge_serve_uses_selected_rows_with_independent_native_authority(self):
+        from orch.bridge_authorization import LocalRunSessionAuthority
+        from orch.bridge_readonly_authority import ReadOnlyAuthorityLedger
+        from orch.worker_operations import WorkerRunBinding
+
+        home = self.base / "binding-home"
+        orch, project, claim = self.make_bridge_run(home, "cli-binding-a")
+        self.make_bridge_run(home, "cli-binding-b")
+        expected = WorkerRunBinding(
+            project_id=project["project_id"], writer_key=project["writer_key"],
+            task_id="CLI-BINDING-A", run_id=claim["run_id"], attempt=1,
+        )
+        transport = self.base / "binding-transport"
+        transport.mkdir(mode=0o700)
+        with orch.connect() as conn:
+            before = hashlib.sha256(json.dumps([
+                tuple(row) for row in conn.execute("SELECT * FROM runs")
+            ]).encode("utf-8")).hexdigest()
+
+        # A real foreground listener is unbounded here; retain actual native
+        # authority in the probe and substitute only that blocking endpoint.
+        def serve_probe(ledger, binding, capability_file, socket_path,
+                        credential_file, limits):
+            self.assertIsInstance(ledger, ReadOnlyAuthorityLedger)
+            self.assertEqual(binding, expected)
+            self.assertEqual(socket_path, transport / "bridge.sock")
+            self.assertEqual(credential_file, transport / "client.json")
+            authority = LocalRunSessionAuthority(ledger)
+            session_id = authority.open_session(binding, capability_file)
+            try:
+                authority.require_session(session_id, binding, capability_file)
+            finally:
+                authority.close_session(session_id)
+            return 0
+
+        with mock.patch("orch.bridge_local_service.serve_local_bridge", serve_probe):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = cli_main(self.bridge_serve_args(home, claim, transport))
+        self.assertEqual(rc, 0)
+        self.assertEqual(output.getvalue(), "")
+        with orch.connect() as conn:
+            after = hashlib.sha256(json.dumps([
+                tuple(row) for row in conn.execute("SELECT * FROM runs")
+            ]).encode("utf-8")).hexdigest()
+        self.assertEqual(after, before)
+
+    def test_bridge_serve_explicit_and_default_symlink_home_are_refused(self):
+        home = self.base / "symlink-bridge-home"
+        _, _, claim = self.make_bridge_run(home, "cli-symlink")
+        link = self.base / "linked-home"
+        link.symlink_to(home, target_is_directory=True)
+        transport = self.base / "symlink-transport"
+        transport.mkdir(mode=0o700)
+        for explicit_root in (True, False):
+            with self.subTest(explicit_root=explicit_root):
+                arguments = self.bridge_serve_args(link, claim, transport)
+                if not explicit_root:
+                    arguments = arguments[2:]
+                # Returning success makes a bypass of the no-follow root
+                # check observable without starting a long-running listener.
+                with mock.patch("orch.bridge_local_service.serve_local_bridge", return_value=0):
+                    with mock.patch.dict(os.environ, {"ORCH_HOME": str(link)}):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output):
+                            rc = cli_main(arguments)
+                self.assertEqual(rc, 1)
+                self.assertEqual(json.loads(output.getvalue()), {
+                    "status": "ERROR", "error_code": "bridge_serve_failed",
+                })
+
+    def test_bridge_serve_existing_endpoint_refusal_is_sanitized_and_preserved(self):
+        home = self.base / "occupied-endpoint-home"
+        _, _, claim = self.make_bridge_run(home, "cli-occupied")
+        transport = self.base / "occupied-transport"
+        transport.mkdir(mode=0o700)
+        endpoint = transport / "bridge.sock"
+        endpoint.write_bytes(b"existing-owner-file")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = cli_main(self.bridge_serve_args(home, claim, transport))
+        self.assertEqual(rc, 1)
+        self.assertTrue(output.getvalue(), "service refusal needs a safe CLI code")
+        result = json.loads(output.getvalue())
+        self.assertEqual(result, {
+            "status": "ERROR", "error_code": "bridge_serve_failed",
+        })
+        self.assertEqual(endpoint.read_bytes(), b"existing-owner-file")
+        self.assertFalse((transport / "client.json").exists())
+
+    def test_bridge_cli_real_status_binary_read_list_and_refusal_preserve_native_rows(self):
+        home = self.base / "wire-home"
+        orch, project, claim = self.make_bridge_run(home, "cli-wire-a")
+        _, unrelated, _ = self.make_bridge_run(home, "cli-wire-b")
+        unrelated_file = Path(unrelated["root"]) / "data" / "sample.bin"
+        unrelated_bytes = unrelated_file.read_bytes()
+        capability = Path(claim["capability_file"])
+        capability_digest = hashlib.sha256(capability.read_bytes()).hexdigest()
+        transport = self.base / "wire"
+        transport.mkdir(mode=0o700)
+        credential = transport / "client.json"
+        unused_home = self.base / "client-unused-home"
+        with orch.connect() as conn:
+            before = hashlib.sha256(json.dumps({
+                table: [tuple(row) for row in conn.execute("SELECT * FROM " + table)]
+                for table in ("runs", "tasks", "events")
+            }, sort_keys=True).encode("utf-8")).hexdigest()
+        process = subprocess.Popen(
+            [sys.executable, "-m", "orch", *self.bridge_serve_args(home, claim, transport)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 8
+            ready_wait = threading.Event()
+            # Publication is the real readiness condition, not elapsed sleep.
+            while not credential.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    self.fail("local bridge did not publish its credential")
+                ready_wait.wait(0.01)
+            self.assertIsNone(process.poll(), "local bridge exited before readiness")
+            transport_credential = json.loads(credential.read_text(encoding="utf-8"))
+            for operation, target, expected in (
+                ("session.status", None, None),
+                ("file.read", "data/sample.bin", b"\x00\xfffixture\n"),
+                ("file.list", "data", b'{"entries":["sample.bin"]}'),
+                ("file.read", "outside.txt", None),
+            ):
+                with self.subTest(operation=operation, target=target):
+                    arguments = [
+                        "--root", str(unused_home), "bridge", "call",
+                        "--client-credential-file", str(credential),
+                        "--operation", operation,
+                    ]
+                    if target is not None:
+                        arguments.extend(["--target", target])
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        rc = cli_main(arguments)
+                    encoded = output.getvalue()
+                    result = json.loads(encoded)
+                    self.assertLessEqual(len(encoded.encode("ascii")), 4096)
+                    self.assertEqual(encoded, json.dumps(
+                        result, sort_keys=True, ensure_ascii=True,
+                        separators=(",", ":"), allow_nan=False,
+                    ))
+                    if target == "outside.txt":
+                        self.assertEqual(rc, 1)
+                        self.assertEqual(result["state"], "REFUSED")
+                        self.assertEqual(result["output_base64"], "")
+                    else:
+                        self.assertEqual(rc, 0)
+                        self.assertEqual(result["state"], "SUCCEEDED")
+                        if expected is not None:
+                            self.assertEqual(base64.b64decode(result["output_base64"]), expected)
+                        else:
+                            self.assertEqual(result["status"]["binding"]["project_id"], project["project_id"])
+                            self.assertEqual(result["status"]["binding"]["run_id"], claim["run_id"])
+                    for private in (str(home), claim["capability_file"], str(transport)):
+                        self.assertNotIn(private, encoded)
+                    self.assertFalse(transport_credential["transport_token"] in encoded)
+            wrong_credential = transport / "wrong-client.json"
+            altered = dict(transport_credential)
+            altered["transport_token"] = "wrong-private-token-must-never-appear"
+            wrong_credential.write_text(json.dumps(altered), encoding="utf-8")
+            wrong_credential.chmod(0o600)
+            rc, result = self.invoke(
+                "--root", str(unused_home), "bridge", "call",
+                "--client-credential-file", str(wrong_credential),
+                "--operation", "session.status",
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(result, {
+                "status": "ERROR", "error_code": "bridge_call_failed",
+            })
+            self.assertTrue(wrong_credential.exists())
+            rc, result = self.invoke(
+                "bridge", "call", "--client-credential-file", str(credential),
+                "--operation", "session.status",
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(result["state"], "SUCCEEDED")
+            self.assertFalse(unused_home.exists())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                server_output, server_error = process.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=8)
+                self.fail("owned local bridge did not stop")
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(server_output, b"")
+        self.assertEqual(server_error, b"")
+        self.assertFalse(credential.exists())
+        self.assertFalse((transport / "bridge.sock").exists())
+        self.assertEqual(unrelated_file.read_bytes(), unrelated_bytes)
+        self.assertEqual(hashlib.sha256(capability.read_bytes()).hexdigest(), capability_digest)
+        with orch.connect() as conn:
+            after = hashlib.sha256(json.dumps({
+                table: [tuple(row) for row in conn.execute("SELECT * FROM " + table)]
+                for table in ("runs", "tasks", "events")
+            }, sort_keys=True).encode("utf-8")).hexdigest()
+        self.assertEqual(after, before)
 
     def test_state_check_missing_ledger_fails_without_initializing(self):
         home = self.base / "missing-state-home"
