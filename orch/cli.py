@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -59,8 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     overview.add_argument("--project")
 
-    bridge = sub.add_parser("bridge", help="inspect or reconcile local worker-operation records")
+    bridge = sub.add_parser("bridge", help="serve local read-only operations or inspect worker records")
     bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
+    serve = bridge_sub.add_parser("serve", help="serve one foreground local read-only session")
+    serve.add_argument("--run-id", required=True)
+    serve.add_argument("--cap", required=True, help="path to the current run capability file")
+    serve.add_argument("--socket", required=True, help="new socket path in a private operator directory")
+    serve.add_argument("--client-credential-file", required=True, help="new private transport credential path")
+    call = bridge_sub.add_parser("call", help="call the configured local read-only service")
+    call.add_argument("--client-credential-file", required=True)
+    call.add_argument("--operation", required=True, choices=["session.status", "file.read", "file.list"])
+    call.add_argument("--target")
+    call.add_argument("--max-response-bytes", type=int, default=4096)
     operation = bridge_sub.add_parser("operation")
     operation_sub = operation.add_subparsers(dest="operation_command", required=True)
     operation_inspect = operation_sub.add_parser("inspect")
@@ -370,6 +382,54 @@ def _reconcile_patch_execution(
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "bridge" and args.bridge_command == "call":
+        try:
+            from .bridge_local_client import LocalBridgeClient
+            from .bridge_local_protocol import encode_payload
+
+            client = LocalBridgeClient(Path(args.client_credential_file).expanduser())
+            try:
+                result = client.call(args.operation, args.target, args.max_response_bytes)
+            finally:
+                client.close()
+            sys.stdout.write(encode_payload(result).decode("ascii"))
+            return 0 if result["state"] == "SUCCEEDED" else 1
+        except Exception:
+            emit({"status": "ERROR", "error_code": "bridge_call_failed"})
+            return 1
+    if args.command == "bridge" and args.bridge_command == "serve":
+        try:
+            from .bridge_local_protocol import LocalServiceLimits
+            from .bridge_local_service import serve_local_bridge
+            from .bridge_readonly_authority import ReadOnlyAuthorityLedger
+            from .worker_operations import WorkerRunBinding
+
+            # Preserve the supplied identity for the view's no-follow checks.
+            root = Path(args.root or os.environ.get("ORCH_HOME") or Path.home() / ".orch").expanduser()
+            ledger = ReadOnlyAuthorityLedger(root)
+            with contextlib.closing(ledger.connect()) as conn:
+                row = conn.execute(
+                    "SELECT r.run_id, r.task_id, r.attempt, t.project_id, t.writer_key "
+                    "FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE r.run_id=?",
+                    (args.run_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("bridge_run_unknown")
+                binding = WorkerRunBinding(
+                    project_id=row["project_id"], writer_key=row["writer_key"],
+                    task_id=row["task_id"], run_id=row["run_id"], attempt=row["attempt"],
+                )
+            rc = serve_local_bridge(
+                ledger, binding, Path(args.cap).expanduser(),
+                Path(args.socket).expanduser(),
+                Path(args.client_credential_file).expanduser(), LocalServiceLimits(),
+            )
+            if rc != 0:
+                emit({"status": "ERROR", "error_code": "bridge_serve_failed"})
+            return rc
+        except Exception:
+            emit({"status": "ERROR", "error_code": "bridge_serve_failed"})
+            return 1
     root = root_from_args(args)
     orch = None
     try:

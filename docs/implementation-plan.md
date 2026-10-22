@@ -298,13 +298,12 @@ Cooperative provenance is not OS compare-and-swap or same-user fencing;
 process/fault fixtures do not establish actual power-loss recovery. Native
 verifier/publisher and current source/PR/merge acceptance gates remain separate.
 
-**Still not implemented:** general write/create/delete adapters, external content
-transport, general operation replay, daemon, multi-session broker,
-relay/MCP or device trust. Finish those as separately scoped gates before any
-first ordinary-Chat route without RDC; do not relabel this foundation as a
-working Bridge or relax P1-C1/verifier/publisher authority.
-
-Define a versioned local protocol and a bounded, explicitly authorized daemon lifecycle before adding remote connectivity. The CLI and future UI must consume the same protocol.
+**Deferred:** general write/create/delete adapters, remote content transport,
+general operation replay, background daemon, multi-session broker, relay/MCP and
+device trust. P1-C4a adds the separately scoped foreground local read-only
+transport described below; it does not accept an ordinary-Chat route without RDC
+or relax P1-C1/verifier/publisher authority. The CLI and future UI must consume
+the same protocol.
 
 Build in separate packages:
 - Run/session binding, local authorization, and bounded file operations.
@@ -345,7 +344,46 @@ readback; pending, invalid or undersized observations leave it available. Cached
 mutation identity is never evicted. Capacity may refuse ordinary work before all
 64 entries are occupied; it never establishes that the child stopped.
 
-**Acceptance:** a session cannot change its project/run authority; unsupported operations are refused; secrets/capability contents never enter model-facing responses; failures are durable and attributable. Restart is not evidence that an uncertain write failed or that a process stopped. Do not expose unrestricted machine shell as the normal interface.
+### P1-C4a: single-session local read-only IPC
+
+The source package exposes `orch bridge serve` and `orch bridge call` over a
+private AF_UNIX socket. The operator selects one existing native run and a
+capability-file path; the CLI derives its exact `WorkerRunBinding` from that
+run/task row. A minimal `ReadOnlyAuthorityLedger` supplies the unchanged native
+session and file-scope authority through existing schema-v4 read-only state,
+without constructing `Orchestrator`, initializing/migrating state or repairing
+permissions. Client calls cannot select a binding or invoke native lifecycle.
+
+The only wire operations are `session.status`, `file.read` and `file.list`.
+Separate fresh transport credentials authenticate explicit hello frames; native
+capability/lease contents stay local. Strict version-1 length-prefixed JSON has
+65,536-byte frame and complete response maxima, a 4,096-byte minimum response,
+five-second framing/send timeout and thirty-second idle accept timeout. Budgets
+cover correlation fields and base64 as well as file data. Status exposes only the
+configured binding, bounded native/service state and actual limits. File storage
+I/O is still governed by existing byte bounds, not a cancellable deadline.
+
+Serial calls revalidate native authority before dispatch and release of buffered
+output. EOF/timeouts close the client connection; the foreground service and its
+one volatile session remain for the next explicit hello. Stop/idle/failure ends
+the service without claiming, checkpointing, quiescing, releasing or completing
+the native writer. Cleanup removes only matching owned endpoint/credential
+identities, and explicit restart creates fresh IDs and credential. There is no
+automatic retry, saved-PID recovery, mutation RPC or background installation.
+
+**Source gate:** strict codec and real socket tests, CLI no-initialization and
+safe-output checks, revocation/drift/scope denials, envelope bounds, lifecycle and
+unrelated-project preservation, plus frozen authority/function checks and the
+full registered suite on the stable integrated candidate.
+
+**Pending parent gates:** native verification/review/publication, exact-head and
+exact-merge CI, immutable archived runtime, actual RDC wire execution, and the
+final preservation audit. Source tests alone do not close these gates. Measure
+SQLite WAL/SHM effects separately from durable authority/schema/permissions.
+Frozen release artifacts and default runtime selection stay unchanged. Mutation,
+broker, remote and ordinary-Chat Bridge acceptance are separately scoped work.
+
+**Acceptance:** a session cannot change its project/run authority; unsupported operations are refused; secrets/capability contents never enter model-facing responses; failures are attributable. Restart is not evidence that an uncertain write failed or that a process stopped. Do not expose unrestricted machine shell as the normal interface.
 
 The existing core is not an OS sandbox. Any stronger isolation claim requires an independently verified OS boundary, not just a new endpoint.
 
