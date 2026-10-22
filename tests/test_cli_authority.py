@@ -14,6 +14,8 @@ import time
 import unittest
 from unittest import mock
 
+from bridge_cli_diagnostics import child_environment, failure_snapshot
+
 from orch.cli import build_parser, main as cli_main
 from orch.core import Orchestrator
 from orch.plan import build_single_task_plan, write_plan
@@ -317,10 +319,12 @@ class CliLedgerAuthorityTests(unittest.TestCase):
                 table: [tuple(row) for row in conn.execute("SELECT * FROM " + table)]
                 for table in ("runs", "tasks", "events")
             }, sort_keys=True).encode("utf-8")).hexdigest()
+        diagnostics = self.base / "shutdown-diagnostics"
         process = subprocess.Popen(
             [sys.executable, "-m", "orch", *self.bridge_serve_args(home, claim, transport)],
             cwd=str(Path(__file__).resolve().parents[1]),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=child_environment(diagnostics),
         )
         try:
             deadline = time.monotonic() + 8
@@ -398,10 +402,23 @@ class CliLedgerAuthorityTests(unittest.TestCase):
                 process.terminate()
             try:
                 server_output, server_error = process.communicate(timeout=8)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate(timeout=8)
-                self.fail("owned local bridge did not stop")
+            except subprocess.TimeoutExpired as timeout:
+                try:
+                    observed = failure_snapshot(
+                        process, timeout, diagnostics, credential, transport / "bridge.sock",
+                    )
+                except Exception as error:
+                    observed = {"diagnostic_error": type(error).__name__}
+                finally:
+                    process.kill()
+                    try:
+                        process.communicate(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        observed["pipe_drain_timed_out"] = True
+                        for stream in (process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+                self.fail("owned local bridge did not stop: " + json.dumps(observed, sort_keys=True))
         self.assertEqual(process.returncode, 0)
         self.assertEqual(server_output, b"")
         self.assertEqual(server_error, b"")
@@ -415,6 +432,48 @@ class CliLedgerAuthorityTests(unittest.TestCase):
                 for table in ("runs", "tasks", "events")
             }, sort_keys=True).encode("utf-8")).hexdigest()
         self.assertEqual(after, before)
+
+    def test_bridge_cli_shutdown_reports_snapshot_when_pipe_drain_times_out(self):
+        original, children = subprocess.Popen, []
+
+        def spawn(command, *args, **kwargs):
+            process = original(command, *args, **kwargs)
+            if (isinstance(command, list) and command[1:3] == ["-m", "orch"]
+                    and "serve" in command):
+                children.append(process)
+
+                def communicate(*args, **kwargs):
+                    # The real CLI has handled all requests and its SIGTERM.
+                    # Model only an inherited pipe that never reaches EOF.
+                    process.wait(timeout=8)
+                    raise subprocess.TimeoutExpired("fixture-pipe-eof", kwargs.get("timeout", 8))
+
+                process.communicate = communicate
+            return process
+
+        caught = None
+        try:
+            with mock.patch.object(subprocess, "Popen", side_effect=spawn):
+                try:
+                    self.test_bridge_cli_real_status_binary_read_list_and_refusal_preserve_native_rows()
+                except BaseException as error:
+                    caught = error
+            self.assertIsInstance(caught, self.failureException)
+            self.assertIn('"child_returncode_at_deadline": 0', str(caught))
+            self.assertIn('"pipe_drain_timed_out": true', str(caught))
+            self.assertEqual(len(children), 1)
+            self.assertEqual(children[0].poll(), 0)
+            self.assertTrue(children[0].stdout.closed)
+            self.assertTrue(children[0].stderr.closed)
+            self.assertFalse((self.base / "wire" / "client.json").exists())
+            self.assertFalse((self.base / "wire" / "bridge.sock").exists())
+        finally:
+            for process in children:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=8)
+                process.stdout.close()
+                process.stderr.close()
 
     def test_state_check_missing_ledger_fails_without_initializing(self):
         home = self.base / "missing-state-home"

@@ -12,6 +12,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -85,6 +86,7 @@ class LocalServiceTests(unittest.TestCase):
     def _start(self, **kwargs):
         ready = threading.Event()
         results = []
+        completed = kwargs.get("completed")
         original = service._publish_credential
 
         def publish(*args, **kw):
@@ -100,6 +102,8 @@ class LocalServiceTests(unittest.TestCase):
                 ))
             finally:
                 ready.set()
+                if completed is not None:
+                    completed.set()
 
         with mock.patch.object(service, "_publish_credential", side_effect=publish):
             thread = threading.Thread(target=run)
@@ -243,38 +247,145 @@ class LocalServiceTests(unittest.TestCase):
         self.assertEqual((reply["state"], reply["output_base64"], reply["error_code"]),
                          ("REFUSED", "", "local_bridge_response_too_large"))
 
-    def test_competing_connection_times_out_while_active_read_remains_serial(self):
-        entered, release = threading.Event(), threading.Event()
+    def _native_rows(self):
+        with self.orch.connect() as conn:
+            return {table: [tuple(row) for row in conn.execute(
+                "SELECT * FROM " + table + " ORDER BY rowid")]
+                for table in ("runs", "tasks")}
+
+    def _wait_for_active_read(self, active, entered, completed, results):
+        # Preparation is distinct from the competitor's transport timeout.
+        deadline = time.monotonic() + self.limits.io_timeout_sec
+        while not entered.is_set():
+            if select.select([active], [], [], 0)[0]:
+                try:
+                    reply = receive_frame(active, self.limits)
+                except (EOFError, OSError, TimeoutError, ValueError) as exc:
+                    self.fail("active read ended before readiness: " + type(exc).__name__)
+                self.fail("active read ended before readiness: %s/%s" %
+                          (reply.get("state"), reply.get("error_code")))
+            if completed.is_set():
+                self.fail("service exited before active read: %r" % results)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.fail("active read readiness deadline expired while service was preparing")
+            entered.wait(min(remaining, 0.05))
+
+    def _exercise_competing_read(self, *, before_request=None, expected_result=0):
         from orch import bridge_file_read
-        original = bridge_file_read._read_chunk
+        entered, release = threading.Event(), threading.Event()
+        stopped, completed = threading.Event(), threading.Event()
+        original_read, socket_type = bridge_file_read._read_chunk, socket.socket
+        before = self._native_rows()
+        thread, results, active, competitor = None, [], None, None
+        thread_count = len(self.threads)
+
+        class StoppableListener(socket_type):
+            # Stop only at the fixture's accept boundary, after active I/O ends.
+            def accept(listener):
+                if stopped.is_set():
+                    raise service._ServiceStopped()
+                connection, address = super().accept()
+                if stopped.is_set():
+                    connection.close()
+                    raise service._ServiceStopped()
+                return connection, address
 
         def gated_read(fd, size):
             entered.set()
-            if not release.wait(2):
-                raise RuntimeError("fixture did not release read")
-            return original(fd, size)
+            release.wait()  # The owner releases this in every exit path below.
+            return original_read(fd, size)
 
-        with mock.patch.object(bridge_file_read, "_read_chunk", gated_read):
-            self._start()
-            active = self._connect()
-            hello = self._hello(active)
-            send_frame(active, {"schema_version": 1, "request_id": "active", "session_id": hello["session_id"],
-                               "operation": "file.read", "target": "binary.bin", "max_response_bytes": 4096}, self.limits)
-            self.assertTrue(entered.wait(1))
-            competitor = self._connect()
-            competitor.settimeout(0.05)
-            credential = json.loads(self.credential.read_text())
-            send_frame(competitor, {"schema_version": 1, "request_id": "competing", "type": "hello",
-                                   "transport_token": credential["transport_token"]}, self.limits)
-            competitor.settimeout(0.05)
+        # Serialism does not require the separate short-deadline frame fixture.
+        with mock.patch.object(self, "limits", LocalServiceLimits()), \
+                mock.patch.object(service.socket, "socket", StoppableListener), \
+                mock.patch.object(bridge_file_read, "_read_chunk", gated_read):
             try:
+                thread, results = self._start(completed=completed)
+                active = self._connect()
+                hello = self._hello(active)
+                if before_request is not None:
+                    before_request()
+                send_frame(active, {"schema_version": 1, "request_id": "active", "session_id": hello["session_id"],
+                                   "operation": "file.read", "target": "binary.bin", "max_response_bytes": 4096}, self.limits)
+                self._wait_for_active_read(active, entered, completed, results)
+                competitor = self._connect()
+                credential = json.loads(self.credential.read_text())
+                send_frame(competitor, {"schema_version": 1, "request_id": "competing", "type": "hello",
+                                       "transport_token": credential["transport_token"]}, self.limits)
+                competitor.settimeout(0.05)
                 with self.assertRaises(socket.timeout):
                     competitor.recv(1)
-            finally:
                 competitor.close()
                 release.set()
-            self.assertEqual(base64.b64decode(receive_frame(active, LocalServiceLimits())["output_base64"]), b"\x00\xff\x80\n")
-            active.close()
+                reply = receive_frame(active, self.limits)
+                self.assertEqual((reply["state"], reply["error_code"]), ("SUCCEEDED", None))
+                self.assertEqual(base64.b64decode(reply["output_base64"]), b"\x00\xff\x80\n")
+            finally:
+                release.set()
+                for client in (competitor, active):
+                    if client is not None:
+                        client.close()
+                stopped.set()
+                if thread is None and len(self.threads) > thread_count:
+                    thread = self.threads[-1]
+                if thread is not None:
+                    if thread.is_alive():
+                        # Wake an idle accept; the fixture boundary owns closure.
+                        try:
+                            with socket_type(socket.AF_UNIX, socket.SOCK_STREAM) as wakeup:
+                                wakeup.settimeout(self.limits.io_timeout_sec)
+                                wakeup.connect(str(self.endpoint))
+                        except OSError:
+                            pass  # The listener may already have closed.
+                    thread.join(self.limits.io_timeout_sec)
+                    self.assertFalse(thread.is_alive(), "foreground service did not exit")
+                if results:
+                    self.assertEqual(results, [expected_result])
+                self.assertFalse(self.endpoint.exists())
+                self.assertFalse(self.credential.exists())
+                self.assertEqual(self._native_rows(), before)
+
+    def test_competing_connection_times_out_while_active_read_remains_serial(self):
+        self._exercise_competing_read()
+
+    def test_competing_read_readiness_tolerates_delayed_authority(self):
+        armed, delayed, checked = threading.Event(), threading.Event(), threading.Event()
+        original = service.LocalRunSessionAuthority.require_session
+
+        def delayed_authority(authority, *args, **kwargs):
+            pause = armed.is_set() and not delayed.is_set()
+            if pause:
+                delayed.set()
+                time.sleep(1.1)  # Fault injection beyond the former one-second wait.
+            outcome = original(authority, *args, **kwargs)
+            if pause:
+                checked.set()
+            return outcome
+
+        with mock.patch.object(service.LocalRunSessionAuthority, "require_session", delayed_authority):
+            self._exercise_competing_read(before_request=armed.set)
+        self.assertTrue(checked.is_set(), "the delayed authentic authority check did not finish")
+
+    def test_competing_read_refusal_fails_readiness_and_releases_fixture(self):
+        with mock.patch.object(service, "_dispatch", side_effect=RuntimeError("fixture dispatch failure")):
+            with self.assertRaisesRegex(self.failureException,
+                                        "active read ended before readiness: REFUSED/local_bridge_authority_denied"):
+                self._exercise_competing_read(expected_result=1)
+
+    def test_competing_read_competitor_setup_failure_releases_active_read(self):
+        original, connections = self._connect, 0
+
+        def connect():
+            nonlocal connections
+            connections += 1
+            if connections == 2:
+                raise OSError("fixture competitor setup failed")
+            return original()
+
+        with mock.patch.object(self, "_connect", side_effect=connect):
+            with self.assertRaisesRegex(OSError, "fixture competitor setup failed"):
+                self._exercise_competing_read()
 
     def test_branch_and_head_drift_are_live_wire_refusals(self):
         before = self._native_state()
