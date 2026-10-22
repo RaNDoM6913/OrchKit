@@ -780,13 +780,71 @@ This source API is separate from required review, publication, CI and runtime
 acceptance. It adds no daemon, product endpoint, descendant containment, OS fence,
 general operation replay or ordinary-Chat mutating-production acceptance.
 
-Only after further durable-operation and transport gates should
-a real Bridge endpoint be considered. These local packages are **not** an RDC
-replacement, shell, relay, daemon or MCP.
+### P1-C4a — single-session local read-only IPC (source package)
 
-Add a local daemon controlled by the CLI.
+The source package adds one foreground AF_UNIX service for one operator-selected
+native run. `ReadOnlyAuthorityLedger` opens only existing private schema-v4 state,
+with SQLite read-only/query-only connections and restricted SQL authorization.
+It does not construct the mutating orchestrator, initialize or migrate state,
+repair permissions, or make a second permission decision. The unchanged
+`LocalRunSessionAuthority` and file-scope/read/list adapters remain authoritative.
+The CLI derives the exact run/task binding from the selected rows; client frames
+cannot choose a root, run, capability or binding.
 
-Proposed operator surface:
+```text
+orch --root /absolute/existing/home bridge serve \
+  --run-id RUN_ID --cap /absolute/capability-file \
+  --socket /absolute/private-directory/bridge.sock \
+  --client-credential-file /absolute/private-directory/client.json
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation session.status
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation file.read --target relative/path --max-response-bytes 4096
+orch bridge call --client-credential-file /absolute/private-directory/client.json \
+  --operation file.list --target relative-directory --max-response-bytes 4096
+```
+
+The operator supplies an existing `0700` transport directory and new endpoint
+and credential paths. The service creates a `0600` socket and a separate fresh
+`0600` transport credential. The client reads that credential privately; native
+capability and lease contents never go on the wire. Authentication grants only
+connection to this configured service. Every hello and operation revalidates
+native authority, including a final check before releasing buffered content.
+Status projects the configured binding, native run/task states, volatile service
+identity/state, supported operations and limits; it does not forward broad native
+status, recent events, capability paths, environment or raw process identifiers.
+
+Version-1 frames contain one strict UTF-8 JSON object after a four-byte big-endian
+length. Default frame and complete response bounds are 65,536 bytes, the minimum
+requested response is 4,096 bytes, framing/send timeout is five seconds and idle
+accept timeout is thirty seconds. The complete response budget includes all
+correlation fields and base64 content; `bridge call` prints the same compact JSON
+without an extra newline. Native file bounds do not establish cancellable storage
+I/O deadlines. Only `session.status`, `file.read` and `file.list` are dispatched.
+Mutation/process operations and malformed, foreign or over-budget requests are
+refused with fixed safe codes or a bounded connection close.
+
+Connections are explicit and serial, with one active connection and a backlog
+of one. EOF or a framing/send timeout closes that connection while retaining the
+service and its one volatile authority session for the next explicit hello.
+There is no automatic retry or connection resume. Stop, idle timeout or server
+failure ends the invocation, unwinds scope/session ownership, and removes only
+still-matching socket/credential identities. Restart creates fresh credential,
+session and incarnation values. Disconnect, stop and restart never release or
+complete the native writer; normal native lifecycle work remains independent.
+
+Source tests are not runtime acceptance. Required native review/publication, CI,
+immutable runtime, actual RDC wire execution and preservation gates remain
+pending until their separate evidence passes. Preservation covers durable native
+authority, schema, existing permissions and capability contents; SQLite WAL/SHM
+identity/existence effects are measured separately. This package does not change
+frozen releases or default runtime selection. Mutation RPC, a multi-session
+broker, remote MCP/relay and ordinary-Chat Bridge acceptance remain deferred.
+The endpoint is a cooperative same-user local boundary, not OS containment.
+
+### Later local service lifecycle and mutation surface
+
+A background daemon and broader operator lifecycle remain proposed:
 
 ```text
 orch bridge install
