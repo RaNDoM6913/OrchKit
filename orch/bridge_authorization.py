@@ -12,6 +12,7 @@ import json
 import secrets
 import sqlite3
 from pathlib import Path
+from threading import Lock
 from typing import Protocol
 
 from .config import read_bounded_json_object
@@ -41,19 +42,30 @@ class LocalRunSessionAuthority:
     No worker operation is executed or approved by this object.
     """
 
-    def __init__(self, orchestrator: AuthorityLedger):
+    def __init__(
+        self, orchestrator: AuthorityLedger, *, max_worker_sessions: int = 3
+    ):
+        if (isinstance(max_worker_sessions, bool)
+                or not isinstance(max_worker_sessions, int)
+                or max_worker_sessions <= 0):
+            raise ValueError("bridge_invalid_worker_session_limit")
         self._orch = orchestrator
+        self._max_worker_sessions = max_worker_sessions
+        self._session_lock = Lock()
         self._sessions: dict[str, WorkerRunBinding] = {}
 
     def open_session(self, binding: WorkerRunBinding, capability_file: Path) -> str:
         self._require_live_run(binding, capability_file)
-        if binding in self._sessions.values():
-            raise ValueError("bridge_run_already_bound_locally")
-        session_id = secrets.token_urlsafe(24)
-        if session_id in self._sessions:
-            raise ValueError("bridge_session_id_collision")
-        self._sessions[session_id] = binding
-        return session_id
+        with self._session_lock:
+            if binding in self._sessions.values():
+                raise ValueError("bridge_run_already_bound_locally")
+            if len(self._sessions) >= self._max_worker_sessions:
+                raise ValueError("bridge_session_capacity_exhausted")
+            session_id = secrets.token_urlsafe(24)
+            if session_id in self._sessions:
+                raise ValueError("bridge_session_id_collision")
+            self._sessions[session_id] = binding
+            return session_id
 
     def require_session(
         self, session_id: str, binding: WorkerRunBinding, capability_file: Path
@@ -66,9 +78,10 @@ class LocalRunSessionAuthority:
         self._require_live_run(binding, capability_file)
 
     def close_session(self, session_id: str) -> None:
-        if not isinstance(session_id, str) or session_id not in self._sessions:
-            raise ValueError("bridge_session_unknown")
-        del self._sessions[session_id]
+        with self._session_lock:
+            if not isinstance(session_id, str) or session_id not in self._sessions:
+                raise ValueError("bridge_session_unknown")
+            del self._sessions[session_id]
 
     def _require_live_run(
         self, binding: WorkerRunBinding, capability_file: Path
