@@ -16,6 +16,7 @@ import signal
 import socket
 import stat
 import threading
+import time
 from typing import Callable
 
 from .bridge_authorization import LocalRunSessionAuthority
@@ -296,7 +297,10 @@ def serve_local_bridge(ledger: ReadOnlyAuthorityLedger, binding: WorkerRunBindin
         if _identity(os.stat(socket_path.name, dir_fd=parent_fd, follow_symlinks=False)) != socket_identity:
             raise ValueError("local_bridge_endpoint_denied")
         listener.listen(1)
-        listener.settimeout(limits.idle_timeout_sec)
+        # A signal delivered to another OS thread can leave its Python
+        # callback pending while the main thread waits in accept(). Return
+        # to the interpreter periodically without shortening the idle limit.
+        listener.settimeout(min(limits.idle_timeout_sec, 0.25))
 
         def credential_owned(identity: tuple) -> None:
             nonlocal credential_identity
@@ -307,16 +311,22 @@ def serve_local_bridge(ledger: ReadOnlyAuthorityLedger, binding: WorkerRunBindin
             "service_incarnation": incarnation, "transport_token": token,
         }, stop=stop, on_owned=credential_owned)
         result = 0
+        idle_deadline = time.monotonic() + limits.idle_timeout_sec
         while True:
             try:
+                remaining = idle_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                listener.settimeout(min(remaining, 0.25))
                 connection, _ = listener.accept()
             except socket.timeout:
-                break
+                continue
             with connection:
                 if not _serve_connection(connection, ledger, binding, capability_file,
                                          authority, session_id, incarnation, token, limits, reader, lister):
                     result = 1
                     break
+            idle_deadline = time.monotonic() + limits.idle_timeout_sec
     except _ServiceStopped:
         result = 0
     except Exception:

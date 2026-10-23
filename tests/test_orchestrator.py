@@ -1,3 +1,4 @@
+import gc
 import hashlib
 from contextlib import closing
 import dataclasses
@@ -1013,19 +1014,56 @@ class OrchestratorTests(unittest.TestCase):
 
     def _readmission_cases(self, cases, name):
         fixture = self._readmission_fixture(name)
-        with closing(self.orch.connect()) as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         archive = Path(self.tmp.name) / (name + "-archive")
         archive.mkdir()
         paths = [self.orch.root, fixture["repo"], fixture["dep_repo"], fixture["new_repo"]]
-        for index, path in enumerate(paths):
-            shutil.copytree(path, archive / str(index), symlinks=True)
+        # Keep fixture WAL sidecars alive while copytree uses its enumerated paths.
+        with closing(self.orch.connect()) as conn:
+            self.assertEqual(tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()),
+                             (0, 0, 0))
+            for index, path in enumerate(paths):
+                shutil.copytree(path, archive / str(index), symlinks=True)
         for index, case in enumerate(cases):
             if index:
                 for offset, path in enumerate(paths):
                     shutil.rmtree(path)
                     shutil.copytree(archive / str(offset), path, symlinks=True)
             yield case, fixture
+
+    def test_readmission_archive_survives_connection_collection(self):
+        original_copytree = shutil.copytree
+        observed = []
+
+        def collect_after_enumeration(source, names):
+            if Path(source) == self.orch.runtime:
+                observed.append(set(names))
+                gc.collect()
+            return ()
+
+        def copy_with_collection(*args, **kwargs):
+            if len(args) > 3:
+                args = (*args[:3], collect_after_enumeration, *args[4:])
+            else:
+                kwargs["ignore"] = collect_after_enumeration
+            return original_copytree(*args, **kwargs)
+
+        enabled = gc.isenabled()
+        gc.disable()
+        states = []
+        try:
+            with mock.patch.object(shutil, "copytree", side_effect=copy_with_collection):
+                for _, fixture in self._readmission_cases(("first", "restored"),
+                                                          "readmission-archive-gc"):
+                    states.append(self._readmission_state())
+                    self.assertEqual(self._readmit_fixture(fixture)["status"], "READMITTED")
+            self.assertEqual(len(observed), 1)
+            self.assertTrue({"orch.sqlite3-wal", "orch.sqlite3-shm"} <= observed[0])
+            self.assertEqual(len(states), 2)
+            self.assertEqual(states[0], states[1])
+        finally:
+            gc.collect()
+            if enabled:
+                gc.enable()
 
     def test_readmission_real_published_dependency_preserves_history_and_remaining_budget(self):
         f = self._readmission_fixture()
