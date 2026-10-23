@@ -27,7 +27,9 @@ from typing import Mapping
 
 from .bridge_authorization import LocalRunSessionAuthority
 from .bridge_patch_execution import runtime_operation_lock
-from .bridge_process_store import ProcessOperationStore
+from .bridge_process_store import (
+    DEFAULT_MAX_PROCESSES_PER_RUN, DEFAULT_MAX_PROCESSES_TOTAL, ProcessOperationStore,
+)
 from .config import read_bounded_json_object
 from .project import PROJECT_CONFIG_MAX_BYTES, ProjectRegistry
 from .worker_operations import (
@@ -210,13 +212,18 @@ class LocalOwnedProcessOperations:
     """
 
     def __init__(self, authority: LocalRunSessionAuthority, session_id: str,
-                 binding: WorkerRunBinding, capability_file: Path, profiles):
+                 binding: WorkerRunBinding, capability_file: Path, profiles, *,
+                 max_processes_total: int = DEFAULT_MAX_PROCESSES_TOTAL,
+                 max_processes_per_run: int = DEFAULT_MAX_PROCESSES_PER_RUN):
         if not isinstance(authority, LocalRunSessionAuthority):
             raise ValueError("process_invalid_authority")
         self._authority, self._session, self._binding = authority, session_id, binding
         self._capability = capability_file
         self._orch = authority._orch
-        self._store = ProcessOperationStore(self._orch)
+        self._store = ProcessOperationStore(
+            self._orch, max_processes_total=max_processes_total,
+            max_processes_per_run=max_processes_per_run,
+        )
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._children, self._outcomes = {}, {}

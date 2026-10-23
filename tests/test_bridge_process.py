@@ -84,11 +84,11 @@ class LocalOwnedProcessTests(unittest.TestCase):
             env or {"LANG": "C", "PYTHONUNBUFFERED": "1"}, deadline, limit,
         )
 
-    def _executor(self, *profiles, authority=None, session=None):
+    def _executor(self, *profiles, authority=None, session=None, **limits):
         self.assertIsNotNone(module, "owned process adapter is not implemented")
         executor = module.LocalOwnedProcessOperations(
             authority or self.authority, session or self.session,
-            self.binding, self.cap, profiles or (self._profile(),),
+            self.binding, self.cap, profiles or (self._profile(),), **limits,
         )
         self.addCleanup(executor.close)
         return executor
@@ -99,6 +99,97 @@ class LocalOwnedProcessTests(unittest.TestCase):
         return WorkerOperationRequest(binding or self.binding,
                                       op or "op-" + str(self.sequence),
                                       kind, target, limit)
+
+    def _b01_executor(self, label, *, code="import time; time.sleep(600)", **limits):
+        root = self.base / ("repo-" + label)
+        self._git("clone", "--quiet", "--no-hardlinks", str(self.root), str(root))
+        project = ProjectRegistry(self.orch.root).add(
+            root, name="Disposable B01 " + label, profile="safe", review_mode="off",
+            allow_commit=True, allow_push=False,
+        )["project"]
+        plan = build_single_task_plan(project, task_id="B01-" + label,
+                                      goal="Test one-home process capacity", allowed_paths=["README.md"],
+                                      plan_revision="b01-" + label)
+        plan_file = self.base / (label + "-plan.json")
+        write_plan(plan_file, plan)
+        self.orch.load_plan(plan_file)
+        claim = self.orch.claim("b01-" + label, project_id=project["project_id"])
+        self.assertEqual(claim["status"], "CLAIMED", claim)
+        binding = WorkerRunBinding(project_id=project["project_id"], writer_key=project["writer_key"],
+                                   task_id=claim["task_id"], run_id=claim["run_id"], attempt=claim["attempt"])
+        cap = Path(claim["capability_file"])
+        authority = LocalRunSessionAuthority(self.orch)
+        session = authority.open_session(binding, cap)
+        profile = module.OwnedProcessProfile("python", Path(sys.executable).resolve(), ("-c", code),
+                                             root, {"LANG": "C", "PYTHONUNBUFFERED": "1"}, 600,
+                                             WORKER_MAX_OUTPUT_BYTES)
+        executor = module.LocalOwnedProcessOperations(authority, session, binding, cap, (profile,), **limits)
+        self.addCleanup(executor.close)
+        return executor, binding
+
+    def test_b01_three_real_runs_admit_two_children_and_refuse_before_spawn(self):
+        first = self._executor(self._profile("import time; time.sleep(600)", deadline=600))
+        executors = [(first, self.binding), self._b01_executor("second"), self._b01_executor("third")]
+        fourth, fourth_binding = self._b01_executor("fourth")
+        with mock.patch.object(module, "_spawn_process", wraps=module._spawn_process) as spawn:
+            for executor, binding in executors:
+                for _ in range(2):
+                    self._start(executor, binding=binding)
+                if executor is first:
+                    request = self._request("process.start", "python")
+                    outcome = executor.start(request)
+                    self.assertEqual((outcome.state, outcome.error_code), ("REFUSED", "process_dispatch_capacity"))
+                    self.assertEqual(spawn.call_count, 2)
+            self.assertEqual(spawn.call_count, 6)
+            request = self._request("process.start", "python", binding=fourth_binding)
+            outcome = fourth.start(request)
+            self.assertEqual((outcome.state, outcome.error_code), ("REFUSED", "process_dispatch_capacity"))
+            self.assertEqual(spawn.call_count, 6)
+        self.assertEqual(sum(len(executor._children) for executor, _ in executors), 6)
+        with self.orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 6)
+
+    def test_b01_invalid_adapter_limits_refuse_without_spawn_or_intent(self):
+        with mock.patch.object(module, "_spawn_process") as spawn:
+            for option in ("max_processes_total", "max_processes_per_run"):
+                for invalid in (True, 0, -1, 1.5, "2", None):
+                    with self.subTest(option=option, invalid=invalid), self.assertRaisesRegex(ValueError, "^process_invalid_limits$"):
+                        self._executor(**{option: invalid})
+            spawn.assert_not_called()
+        with self.orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 0)
+
+    def test_b01_confirmed_real_child_exit_releases_global_capacity(self):
+        first = self._executor(self._profile("pass"), max_processes_total=1)
+        second, binding = self._b01_executor("exit-reuse", max_processes_total=1)
+        _, _, started = self._start(first)
+        self.assertEqual(self._exit(first, started["handle"])["exit_code"], 0)
+        first._children[started["handle"]].thread.join(timeout=3)
+        self.assertFalse(first._children[started["handle"]].thread.is_alive())
+        self._start(second, binding=binding)
+        with self.orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_EXIT_OBSERVED'").fetchone()[0], 1)
+
+    def test_b01_spawn_uncertainty_survives_route_close_owner_replacement_and_restart(self):
+        first = self._executor(max_processes_total=1)
+        request = self._request("process.start", "python")
+        with mock.patch.object(module, "_spawn_process", side_effect=OSError("ambiguous spawn")) as spawn:
+            self.assertEqual(first.start(request).state, "UNKNOWN")
+            self.assertEqual(spawn.call_count, 1)
+        self.authority.close_session(self.session)
+        first.close()
+        replacement_session = self.authority.open_session(self.binding, self.cap)
+        replacement = self._executor(session=replacement_session, max_processes_total=1)
+        other, other_binding = self._b01_executor("retained", max_processes_total=1)
+        with mock.patch.object(module, "_spawn_process") as spawn:
+            for executor, binding in ((replacement, self.binding), (other, other_binding)):
+                denied = self._request("process.start", "python", binding=binding)
+                outcome = executor.start(denied)
+                self.assertEqual((outcome.state, outcome.error_code), ("REFUSED", "process_dispatch_capacity"))
+            spawn.assert_not_called()
+        with self.orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_EXIT_OBSERVED'").fetchone()[0], 0)
 
     def _decode(self, request, outcome):
         self.assertEqual(outcome.state, "SUCCEEDED", outcome)
