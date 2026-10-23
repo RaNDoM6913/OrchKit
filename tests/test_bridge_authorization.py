@@ -1,12 +1,15 @@
 """Disposable local-only P1-C1 run/session authorization acceptance tests."""
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -30,6 +33,11 @@ class LocalRunSessionAuthorityTests(unittest.TestCase):
         self.claims = {}
         self.bindings = {}
         for label in ("a", "b"):
+            self._add_project(label)
+        self.auth = LocalRunSessionAuthority(self.orch)
+
+    def _add_project(self, label, *, repo=None, claim=True):
+        if repo is None:
             repo = self.base / ("project-" + label)
             self._git("init", "-q", "-b", "main", str(repo))
             self._git("-C", str(repo), "config", "user.email", "fixture@example.invalid")
@@ -37,32 +45,33 @@ class LocalRunSessionAuthorityTests(unittest.TestCase):
             (repo / "README.md").write_text("fixture\n", encoding="utf-8")
             self._git("-C", str(repo), "add", "README.md")
             self._git("-C", str(repo), "commit", "-qm", "root")
-            project = self.registry.add(
-                repo, name="Disposable " + label, profile="safe",
-                review_mode="off", allow_commit=True, allow_push=False,
-            )["project"]
-            self.projects[label] = project
-            plan = build_single_task_plan(
-                project, task_id="BRIDGE-TEST-" + label.upper(),
-                goal="Test local session authority", allowed_paths=["result.txt"],
-                plan_revision="bridge-test-" + label,
-            )
-            path = self.base / (label + "-plan.json")
-            self.assertEqual(write_plan(path, plan)["status"], "CREATED")
-            self.assertEqual(self.orch.load_plan(path)["queued_count"], 1)
-            claim = self.orch.claim(
-                "disposable-" + label, project_id=project["project_id"]
-            )
-            self.assertEqual(claim["status"], "CLAIMED", claim)
-            self.claims[label] = claim
-            self.bindings[label] = WorkerRunBinding(
-                project_id=project["project_id"],
-                writer_key=project["writer_key"],
-                task_id=claim["task_id"],
-                run_id=claim["run_id"],
-                attempt=claim["attempt"],
-            )
-        self.auth = LocalRunSessionAuthority(self.orch)
+        project = self.registry.add(
+            repo, name="Disposable " + label, profile="safe",
+            review_mode="off", allow_commit=True, allow_push=False,
+        )["project"]
+        self.projects[label] = project
+        plan = build_single_task_plan(
+            project, task_id="BRIDGE-TEST-" + label.upper(),
+            goal="Test local session authority", allowed_paths=["result.txt"],
+            plan_revision="bridge-test-" + label,
+        )
+        path = self.base / (label + "-plan.json")
+        self.assertEqual(write_plan(path, plan)["status"], "CREATED")
+        self.assertEqual(self.orch.load_plan(path)["queued_count"], 1)
+        if not claim:
+            return
+        admitted = self.orch.claim(
+            "disposable-" + label, project_id=project["project_id"]
+        )
+        self.assertEqual(admitted["status"], "CLAIMED", admitted)
+        self.claims[label] = admitted
+        self.bindings[label] = WorkerRunBinding(
+            project_id=project["project_id"],
+            writer_key=project["writer_key"],
+            task_id=admitted["task_id"],
+            run_id=admitted["run_id"],
+            attempt=admitted["attempt"],
+        )
 
     def _git(self, *args):
         env = dict(os.environ)
@@ -87,6 +96,282 @@ class LocalRunSessionAuthorityTests(unittest.TestCase):
             session_id, self.bindings[label],
             self._cap(cap_label or label),
         )
+
+    def _native_authority_snapshot(self):
+        # Compare all logical ledger state without exposing capability contents.
+        with self.orch.connect() as conn:
+            ledger_digest = hashlib.sha256(
+                "\n".join(conn.iterdump()).encode("utf-8")
+            ).hexdigest()
+        capabilities = {}
+        for label in self.claims:
+            cap = self._cap(label)
+            info = cap.stat()
+            capabilities[label] = (
+                str(cap), info.st_dev, info.st_ino, info.st_mode,
+                info.st_size, info.st_mtime_ns,
+                hashlib.sha256(cap.read_bytes()).hexdigest(),
+            )
+        return ledger_digest, capabilities
+
+    def _race_open(self, labels):
+        # Force unlocked contenders past duplicate/capacity checks together.
+        # A serialized generator cannot meet its peer: its bounded barrier
+        # expires, then the waiting admission must observe the first insertion.
+        from orch import bridge_authorization as module
+        start = threading.Barrier(len(labels) + 1)
+        generation = threading.Barrier(len(labels))
+        original_token = module.secrets.token_urlsafe
+
+        def synchronized_token(size):
+            try:
+                generation.wait(timeout=3)
+            except threading.BrokenBarrierError:
+                pass
+            return original_token(size)
+
+        def open_one(label):
+            start.wait(timeout=10)
+            try:
+                return "admitted", self._open(label)
+            except ValueError as exc:
+                return "refused", str(exc)
+
+        with mock.patch.object(
+            module.secrets, "token_urlsafe", side_effect=synchronized_token,
+        ):
+            with ThreadPoolExecutor(max_workers=len(labels)) as pool:
+                futures = [pool.submit(open_one, label) for label in labels]
+                start.wait(timeout=10)
+                return [future.result(timeout=15) for future in futures]
+
+    def test_p1d1_default_limit_close_isolation_and_native_identity(self):
+        self._add_project("c")
+        self._add_project("d")
+        before = self._native_authority_snapshot()
+        sessions = {label: self._open(label) for label in ("a", "b", "c")}
+        self.assertEqual(len(set(sessions.values())), 3)
+        with self.assertRaisesRegex(ValueError, "^bridge_session_capacity_exhausted$"):
+            self._open("d")
+        self.assertEqual(self._native_authority_snapshot(), before)
+        for label, sid in sessions.items():
+            self._require(sid, label)
+
+        self.auth.close_session(sessions["b"])
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require(sessions["b"], "b")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_unknown$"):
+            self.auth.close_session(sessions["b"])
+        for label in ("a", "c"):
+            self._require(sessions[label], label)
+        replacement = self._open("d")
+        self.assertNotIn(replacement, sessions.values())
+        self._require(replacement, "d")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_capacity_exhausted$"):
+            self._open("b")
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_configurable_limit_and_closed_slot_reuse(self):
+        self.auth = LocalRunSessionAuthority(self.orch, max_worker_sessions=1)
+        before = self._native_authority_snapshot()
+        first = self._open("a")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_capacity_exhausted$"):
+            self._open("b")
+        self.auth.close_session(first)
+        second = self._open("b")
+        self.assertNotEqual(first, second)
+        self._require(second, "b")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require(first, "a")
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+        self._add_project("c")
+        self._add_project("d")
+        larger = LocalRunSessionAuthority(self.orch, max_worker_sessions=4)
+        sessions = {
+            label: larger.open_session(self.bindings[label], self._cap(label))
+            for label in ("a", "b", "c", "d")
+        }
+        self.assertEqual(len(set(sessions.values())), 4)
+        for label, sid in sessions.items():
+            larger.require_session(sid, self.bindings[label], self._cap(label))
+
+    def test_p1d1_invalid_worker_session_limits(self):
+        before = self._native_authority_snapshot()
+        for invalid in (None, True, False, 0, -1, 1.0, "3", [], {}):
+            with self.subTest(limit=invalid):
+                with self.assertRaisesRegex(
+                    ValueError, "^bridge_invalid_worker_session_limit$",
+                ):
+                    LocalRunSessionAuthority(self.orch, max_worker_sessions=invalid)
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_concurrent_final_slot_admission_is_bounded(self):
+        self._add_project("c")
+        self._add_project("d")
+        sessions = {label: self._open(label) for label in ("a", "b")}
+        before = self._native_authority_snapshot()
+        results = self._race_open(("c", "d"))
+        admitted = [i for i, result in enumerate(results) if result[0] == "admitted"]
+        refused = [result[1] for result in results if result[0] == "refused"]
+        self.assertEqual(len(admitted), 1, results)
+        self.assertEqual(refused, ["bridge_session_capacity_exhausted"])
+        winner = ("c", "d")[admitted[0]]
+        loser = "d" if winner == "c" else "c"
+        sid = results[admitted[0]][1]
+        self._require(sid, winner)
+        for label, existing in sessions.items():
+            self._require(existing, label)
+        with self.assertRaisesRegex(ValueError, "^bridge_session_capacity_exhausted$"):
+            self._open(loser)
+        self.auth.close_session(sid)
+        replacement = self._open(loser)
+        self.assertNotEqual(replacement, sid)
+        self._require(replacement, loser)
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require(sid, winner)
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_concurrent_duplicate_admission_has_one_winner(self):
+        existing = self._open("a")
+        before = self._native_authority_snapshot()
+        results = self._race_open(("b", "b"))
+        admitted = [result[1] for result in results if result[0] == "admitted"]
+        refused = [result[1] for result in results if result[0] == "refused"]
+        self.assertEqual(len(admitted), 1, results)
+        self.assertEqual(refused, ["bridge_run_already_bound_locally"])
+        self._require(admitted[0], "b")
+        self._require(existing, "a")
+        self.auth.close_session(admitted[0])
+        replacement = self._open("b")
+        self.assertNotEqual(replacement, admitted[0])
+        self._require(replacement, "b")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require(admitted[0], "b")
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_rejected_admissions_do_not_consume_capacity(self):
+        self._add_project("c")
+        self._add_project("d")
+        before = self._native_authority_snapshot()
+        with self.assertRaisesRegex(ValueError, "^bridge_invalid_run_binding$"):
+            self.auth.open_session(None, self._cap("a"))
+        forged = dataclasses.replace(
+            self.bindings["a"], project_id=self.bindings["b"].project_id,
+        )
+        with self.assertRaisesRegex(ValueError, "^bridge_run_scope_mismatch$"):
+            self.auth.open_session(forged, self._cap("a"))
+        with self.assertRaisesRegex(ValueError, "^bridge_capability_denied$"):
+            self.auth.open_session(self.bindings["a"], self._cap("b"))
+        first = self._open("a")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require("forged-session", "a")
+        with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+            self._require(first, "b")
+        with self.assertRaisesRegex(ValueError, "^bridge_capability_denied$"):
+            self._require(first, "a", cap_label="b")
+        with self.assertRaisesRegex(ValueError, "^bridge_run_already_bound_locally$"):
+            self._open("a")
+        with mock.patch("orch.bridge_authorization.secrets.token_urlsafe", return_value=first):
+            with self.assertRaisesRegex(ValueError, "^bridge_session_id_collision$"):
+                self._open("b")
+        second, third = self._open("b"), self._open("c")
+        for label, sid in (("a", first), ("b", second), ("c", third)):
+            self._require(sid, label)
+        with self.assertRaisesRegex(ValueError, "^bridge_run_already_bound_locally$"):
+            self._open("a")
+        with self.assertRaisesRegex(ValueError, "^bridge_capability_denied$"):
+            self.auth.open_session(self.bindings["d"], self._cap("a"))
+        with self.assertRaisesRegex(ValueError, "^bridge_session_capacity_exhausted$"):
+            self._open("d")
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_revoked_and_drifted_admissions_do_not_take_slots(self):
+        self._add_project("c")
+        self._add_project("d")
+        claim = self.claims["a"]
+        receipt = Path(claim["receipt_file"])
+        atomic_write_json(receipt, {
+            "run_id": claim["run_id"], "task_id": claim["task_id"],
+            "changed_paths": ["result.txt"], "summary": "fixture",
+        }, mode=0o600)
+        lease = self.orch.lease_from_capability(claim["run_id"], self._cap("a"))
+        self.assertEqual(
+            self.orch.submit(claim["run_id"], lease, receipt)["status"],
+            "RESULT_SUBMITTED",
+        )
+        with self.assertRaisesRegex(ValueError, "^bridge_run_not_active$"):
+            self._open("a")
+        self.assertEqual(self.orch.quiesce(claim["run_id"], lease)["status"], "VERIFYING")
+        with self.assertRaisesRegex(ValueError, "^bridge_capability_denied$"):
+            self._open("a")
+        repo = self.projects["b"]["root"]
+        self._git("-C", repo, "switch", "-q", "-c", "drifted")
+        with self.assertRaisesRegex(ValueError, "^bridge_project_binding_denied$"):
+            self._open("b")
+        self._git("-C", repo, "switch", "-q", "main")
+        sessions = {label: self._open(label) for label in ("b", "c", "d")}
+        self.assertEqual(len(set(sessions.values())), 3)
+        for label, sid in sessions.items():
+            self._require(sid, label)
+
+    def test_p1d1_fresh_owner_rejects_every_old_session_id(self):
+        self._add_project("c")
+        sessions = {label: self._open(label) for label in ("a", "b", "c")}
+        before = self._native_authority_snapshot()
+        fresh = LocalRunSessionAuthority(Orchestrator(self.home))
+        fresh_ids = []
+        for label, sid in sessions.items():
+            with self.assertRaisesRegex(ValueError, "^bridge_session_mismatch$"):
+                fresh.require_session(sid, self.bindings[label], self._cap(label))
+            replacement = fresh.open_session(self.bindings[label], self._cap(label))
+            self.assertNotIn(replacement, sessions.values())
+            fresh_ids.append(replacement)
+            fresh.require_session(replacement, self.bindings[label], self._cap(label))
+            self._require(sid, label)
+        self.assertEqual(len(set(fresh_ids)), 3)
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_paused_project_retains_active_isolated_authority(self):
+        self._add_project("c")
+        sessions = {label: self._open(label) for label in ("a", "b", "c")}
+        project_b = self.projects["b"]["project_id"]
+        self.assertEqual(self.orch.pause_project(project_b, "fixture hold")["status"],
+                         "PROJECT_PAUSED")
+        self.assertEqual(self.orch.claim("blocked-b", project_id=project_b)["status"],
+                         "PROJECT_PAUSED")
+        before = self._native_authority_snapshot()
+        for label, sid in sessions.items():
+            self._require(sid, label)
+        self.auth.close_session(sessions["b"])
+        replacement = self._open("b")
+        self.assertNotEqual(replacement, sessions["b"])
+        self._require(replacement, "b")
+        for label in ("a", "c"):
+            self._require(sessions[label], label)
+        self.assertEqual(self._native_authority_snapshot(), before)
+
+    def test_p1d1_free_session_slot_does_not_release_shared_git_writer(self):
+        sid = self._open("a")
+        linked = self.base / "linked-a"
+        self._git("-C", self.projects["a"]["root"], "worktree", "add",
+                  "-q", "-b", "fixture-linked", str(linked))
+        self._add_project("linked", repo=linked, claim=False)
+        self.assertEqual(self.projects["linked"]["writer_key"], self.bindings["a"].writer_key)
+        before = self._native_authority_snapshot()
+        self.auth.close_session(sid)
+        blocked = self.orch.claim("linked-worker", project_id=self.projects["linked"]["project_id"])
+        self.assertEqual(blocked["status"], "BUSY")
+        self.assertEqual(blocked["active"]["run_id"], self.bindings["a"].run_id)
+        forged = dataclasses.replace(
+            self.bindings["a"], project_id=self.projects["linked"]["project_id"],
+        )
+        with self.assertRaisesRegex(ValueError, "^bridge_run_scope_mismatch$"):
+            self.auth.open_session(forged, self._cap("a"))
+        reopened = self._open("a")
+        self.assertNotEqual(reopened, sid)
+        self._require(reopened, "a")
+        self.assertEqual(self._native_authority_snapshot(), before)
 
     def test_two_distinct_project_sessions_and_repeat_readback(self):
         a, b = self._open("a"), self._open("b")

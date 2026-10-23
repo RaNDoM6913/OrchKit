@@ -393,6 +393,31 @@ Add independent session lifecycles and device capacity controls over the local B
 
 **Acceptance:** three independent projects make progress; one disconnect does not cancel the others; project pause is isolated; session impersonation and shared-Git concurrent writers are denied; capacity exhaustion is explicit; restart requires honest recovery readback. Overview must distinguish active, checkpointed, unknown, and complete states.
 
+### P1-D1: bounded local session admission and isolated close
+
+The source API `LocalRunSessionAuthority` accepts a keyword-only
+`max_worker_sessions` positive integer, default 3; booleans and invalid limits
+raise `bridge_invalid_worker_session_limit`. One shared local owner admits up to
+that limit, then refuses a new binding with `bridge_session_capacity_exhausted`.
+Fresh native authority remains mandatory before admission. Duplicate bindings,
+ID collisions and other failed admissions leave the session table unchanged.
+
+One private lock serializes admission and explicit close, preventing concurrent
+over-admission or duplicate binding. Closing B releases only that owner's routing
+slot while A/C retain their bindings. It does not release a native writer or
+prove process inactivity. The unchanged `require_session` continues fresh native
+checks; its existing in-flight behavior relative to close is unchanged. There is
+no TTL, automatic eviction or disconnect-driven session close, and a fresh owner
+requires explicit re-admission with current native authority.
+
+This is a per-owner source contract, not device-wide capacity enforcement or
+three connected ChatGPT workers. The foreground IPC service still creates a
+separate owner for its single run. Product defaults remain 3 worker sessions,
+6 owned processes total and 2 per worker; process quotas need separately admitted
+dispatch integration. The at-most-2 Codex helpers limit concerns engineering
+coordination and is separate from these product defaults. Full P1-D broker,
+reconnect, overview and real-worker acceptance remain pending.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
