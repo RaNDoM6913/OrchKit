@@ -448,6 +448,39 @@ physical-device singleton. It adds no broker, transport operation, recovered-PID
 authority or default-runtime switch. Three actual ChatGPT workers and RDC
 fallback remain separate acceptance milestones.
 
+### B02: trusted local broker read contexts
+
+`LocalRunBroker(ledger, *, max_worker_sessions=3)` owns one shared
+`LocalRunSessionAuthority`. Explicit `open_context(binding, capability_file)`
+admission returns a context with a read-only binding and routing ID, plus bounded
+`read`, `list`, `status` and `close` operations. Existing file scopes, readers and
+listers retain their authority, path, descriptor and output rules. Native
+authority is renewed around buffered output; a routing ID is not a capability.
+
+Three independent contexts coexist in this owner. A fourth, duplicate or foreign
+binding is refused without consuming a slot. Construction failure rolls back
+the new routing session and attempts cleanup of acquired resources. Closing B
+invalidates only B and releases its routing slot while A/C remain usable. Native
+writer, capability and process authority are unchanged. Existing native pause
+semantics remain authoritative; revocation prevents B output. A new broker may
+explicitly re-admit a currently authorized binding with a new context, but never
+adopts old session IDs or retargets another owner's contexts.
+
+The broker retains known-busy scope cleanup for explicit retry after handles
+unwind. An ambiguous descriptor-close failure remains unresolved and is not
+retried against a possibly reused descriptor number. `broker.close()` attempts
+all eligible owned cleanup and surfaces bounded failure rather than silently
+claiming complete resource closure. Existing file-scope lifetime rules remain
+unchanged; constructor failures do not establish universal descriptor recovery.
+
+This is a trusted synchronous source API, not multi-client transport or a
+physical-device singleton. It adds no process owners, daemon, wire methods,
+credentials, relay or default-runtime switch. Actual ordinary ChatGPT workers
+and RDC fallback remain separate gates. The CI job budget is 30 minutes so the
+full six-version suite can include these cases after the accepted B01 Python
+3.14 main lane nearly exhausted the former 20-minute budget; all steps, action
+pins, permissions and test coverage are retained.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
