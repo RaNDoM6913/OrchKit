@@ -31,7 +31,8 @@ _ID = re.compile(r"[A-Za-z0-9._-]{1,200}", re.ASCII)
 _REASONS = {"exited", "terminated", "deadline", "owner_cleanup"}
 _WRITER_STATES = ("RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING", "VERIFIED")
 _MAX_DISPATCHES = 64
-_MAX_UNRESOLVED = 2
+DEFAULT_MAX_PROCESSES_TOTAL = 6
+DEFAULT_MAX_PROCESSES_PER_RUN = 2
 _MAX_RECORD_BYTES = 8192
 _MAX_ACK_BYTES = 32768  # Includes all 64 exact exit links and maximal binding IDs.
 _MAX_RUN_ROWS = 132  # 64 starts + 64 exits + submit/quiesce/abort acknowledgements.
@@ -204,6 +205,23 @@ def _link(intent, terminal):
             "exit_seq": terminal["seq"], "exit_hash": terminal["hash"]}
 
 
+def _unresolved_processes(conn):
+    """Count this home's durable chains, including inactive/unknown owners.
+
+    Run state, session closure and a missing local Popen are never exit proof.
+    Validate every process-bearing run so malformed, orphan or cross-binding
+    history cannot silently disappear from the shared admission count.
+    """
+    total = 0
+    runs = conn.execute("SELECT DISTINCT run_id FROM events WHERE kind IN (?,?,?)",
+                        (_DISPATCH, _EXIT, _ACK))
+    for row in runs:
+        _, binding = _ledger_binding(conn, row["run_id"])
+        intents, terminals = _chains(conn, row["run_id"], binding)
+        total += len(intents) - len(terminals)
+    return total
+
+
 def configure_process_durability(conn):
     """Configure before BEGIN, never silently retain NORMAL/OFF durability."""
     # SQLite itself rejects safety-level changes inside an existing transaction.
@@ -259,8 +277,18 @@ def _insert(conn, kind, payload):
 
 
 class ProcessOperationStore:
-    """Trusted local ledger companion; contains no process execution code."""
-    def __init__(self, orch):
+    """Trusted local ledger companion; contains no process execution code.
+
+    Callers sharing an authoritative home supply the same trusted limits.
+    Configuration is local constructor policy, never worker/wire authority.
+    """
+    def __init__(self, orch, *, max_processes_total=DEFAULT_MAX_PROCESSES_TOTAL,
+                 max_processes_per_run=DEFAULT_MAX_PROCESSES_PER_RUN):
+        if any(type(value) is not int or value <= 0
+               for value in (max_processes_total, max_processes_per_run)):
+            raise ValueError("process_invalid_limits")
+        self._max_processes_total = max_processes_total
+        self._max_processes_per_run = max_processes_per_run
         self._orch = orch
         self._home = orch.root
         self._home_identity = _identity(os.stat(self._home, follow_symlinks=False), boundary=True)
@@ -316,7 +344,9 @@ class ProcessOperationStore:
             intents, terminals = _chains(conn, expected["run_id"], expected)
             if any(intent["request"]["operation_id"] == request.operation_id or intent["handle"] == handle for intent in intents):
                 raise ValueError("process_duplicate_dispatch")
-            if len(intents) >= _MAX_DISPATCHES or len(intents) - len(terminals) >= _MAX_UNRESOLVED:
+            if (len(intents) >= _MAX_DISPATCHES
+                    or len(intents) - len(terminals) >= self._max_processes_per_run
+                    or _unresolved_processes(conn) >= self._max_processes_total):
                 raise ValueError("process_capacity")
             result = _insert(conn, _DISPATCH, payload)
             self._lock().check()

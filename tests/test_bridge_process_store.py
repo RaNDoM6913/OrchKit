@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -83,6 +85,187 @@ class ProcessStoreTests(unittest.TestCase):
                          ("fixture", kind, task_id or self.binding.task_id,
                           run_id or self.binding.run_id,
                           payload if isinstance(payload, str) else json.dumps(payload)))
+
+    def _b01_fixture(self, label, count=4, **limits):
+        orch = Orchestrator(self.base / ("b01-" + label))
+        tasks = []
+        for number in range(count):
+            workspace = self.base / ("b01-" + label + "-workspace-" + str(number))
+            workspace.mkdir()
+            tasks.append({"id": "B01-" + label + "-" + str(number),
+                          "project_id": "b01-" + label.lower() + "-" + str(number),
+                          "goal": "Bounded process capacity fixture", "workspace": str(workspace),
+                          "dependencies": [], "allowed_paths": ["result.json"], "protected_paths": {},
+                          "checks": [], "required_review": False, "owner_acceptance": False,
+                          "publication": {"kind": "none"}, "max_attempts": 1})
+        plan = orch.root / "fixture-plan.json"
+        plan.write_text(json.dumps({"schema_version": 1, "plan_revision": "b01-" + label,
+                                    "tasks": tasks}))
+        orch.load_plan(plan)
+        bindings = []
+        for task in tasks:
+            claim = orch.claim("b01-fixture", project_id=task["project_id"])
+            self.assertEqual(claim["status"], "CLAIMED", claim)
+            with orch.connect() as conn:
+                row = conn.execute("SELECT r.run_id,r.task_id,r.attempt,t.project_id,t.writer_key "
+                                   "FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE r.run_id=?",
+                                   (claim["run_id"],)).fetchone()
+            bindings.append(WorkerRunBinding(**dict(row)))
+        return orch, bindings, module.ProcessOperationStore(orch, **limits)
+
+    def _b01_dispatch(self, orch, store, binding, operation):
+        with runtime_operation_lock(orch.root):
+            return store.dispatch(WorkerOperationRequest(binding, operation, "process.start", "profile"),
+                                  "a" * 64, "b" * 64, "owned-" + operation)
+
+    def test_b01_default_global_and_per_run_capacity_share_one_home(self):
+        orch, bindings, store = self._b01_fixture("defaults")
+        self.assertEqual(len({binding.writer_key for binding in bindings}), 4)
+        for number, binding in enumerate(bindings[:3]):
+            for child in range(2):
+                self._b01_dispatch(orch, store, binding, "start-" + str(number) + "-" + str(child))
+            if number == 0:
+                with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                    self._b01_dispatch(orch, store, binding, "third-per-run")
+        with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+            self._b01_dispatch(orch, store, bindings[3], "seventh-total")
+        with orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 6)
+
+    def test_b01_limits_require_strict_positive_integer_configuration(self):
+        for option in ("max_processes_total", "max_processes_per_run"):
+            for invalid in (None, True, False, 0, -1, 1.0, "6", [], {}):
+                with self.subTest(option=option, invalid=invalid), self.assertRaisesRegex(ValueError, "^process_invalid_limits$"):
+                    module.ProcessOperationStore(self.orch, **{option: invalid})
+        self.assertEqual(self._rows(), [])
+
+    def test_b01_configured_limits_apply_before_inserting_intent(self):
+        orch, bindings, store = self._b01_fixture("configured", max_processes_total=3, max_processes_per_run=1)
+        for number, binding in enumerate(bindings[:3]):
+            self._b01_dispatch(orch, store, binding, "start-" + str(number))
+            if number == 0:
+                with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                    self._b01_dispatch(orch, store, binding, "second-per-run")
+        for binding in (bindings[0], bindings[3]):
+            with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                self._b01_dispatch(orch, store, binding, "denied")
+        with orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 3)
+
+    def test_b01_confirmed_exit_releases_global_slot_even_after_lost_reply(self):
+        for lost_reply in (False, True):
+            with self.subTest(lost_reply=lost_reply):
+                orch, bindings, store = self._b01_fixture("exit-" + str(lost_reply), 2, max_processes_total=1)
+                intent = self._b01_dispatch(orch, store, bindings[0], "first")
+                with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                    self._b01_dispatch(orch, store, bindings[1], "before-exit")
+                with runtime_operation_lock(orch.root):
+                    if lost_reply:
+                        with mock.patch.object(store, "_readback", side_effect=OSError("lost terminal reply")):
+                            with self.assertRaises(OSError):
+                                store.observe_exit(intent, 0, "exited", 0, False)
+                    else:
+                        store.observe_exit(intent, 0, "exited", 0, False)
+                replacement = module.ProcessOperationStore(orch, max_processes_total=1)
+                self._b01_dispatch(orch, replacement, bindings[1], "after-exit")
+
+    def test_b01_dispatch_commit_and_readback_uncertainty_retain_charge_on_restart(self):
+        for failure in ("commit", "readback"):
+            with self.subTest(failure=failure):
+                orch, bindings, store = self._b01_fixture("uncertain-" + failure, 2, max_processes_total=1)
+                connect = orch.connect
+                class CommitResponseLoss:
+                    def __init__(self): self.inner = connect()
+                    def __enter__(self): return self
+                    def __exit__(self, *args): return self.inner.__exit__(*args)
+                    def __getattr__(self, name): return getattr(self.inner, name)
+                    def execute(self, sql, *args):
+                        result = self.inner.execute(sql, *args)
+                        if sql == "COMMIT": raise sqlite3.OperationalError("lost commit reply")
+                        return result
+                patch = (mock.patch.object(orch, "connect", side_effect=CommitResponseLoss) if failure == "commit"
+                         else mock.patch.object(store, "_readback", side_effect=OSError("lost dispatch readback")))
+                with patch, self.assertRaises((OSError, sqlite3.Error)):
+                    self._b01_dispatch(orch, store, bindings[0], "uncertain")
+                restarted = Orchestrator(orch.root)
+                replacement = module.ProcessOperationStore(restarted, max_processes_total=1)
+                with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                    self._b01_dispatch(restarted, replacement, bindings[1], "blocked")
+                with orch.connect() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 1)
+
+    def test_b01_global_charge_is_independent_of_run_state(self):
+        for state in ("RESULT_SUBMITTED", "VERIFYING", "VERIFIED", "ABORTED"):
+            with self.subTest(state=state):
+                orch, bindings, store = self._b01_fixture("state-" + state, 2, max_processes_total=1)
+                self._b01_dispatch(orch, store, bindings[0], "retained")
+                # Even an externally changed state is not evidence of exit.
+                with orch.connect() as conn:
+                    conn.execute("UPDATE runs SET state=? WHERE run_id=?", (state, bindings[0].run_id))
+                with self.assertRaisesRegex(ValueError, "^process_capacity$"):
+                    self._b01_dispatch(orch, store, bindings[1], "blocked")
+
+    def test_b01_foreign_corrupt_or_orphan_history_cannot_free_global_capacity(self):
+        for corruption in ("malformed", "orphan-exit", "hidden-run", "cross-binding", "unknown-run"):
+            with self.subTest(corruption=corruption):
+                orch, bindings, store = self._b01_fixture("corrupt-" + corruption, 2)
+                intent = self._b01_dispatch(orch, store, bindings[0], "first")
+                payload = {key: value for key, value in intent.items() if key not in ("seq", "hash")}
+                kind, run_id = "PROCESS_DISPATCH_INTENT", bindings[0].run_id
+                if corruption == "malformed":
+                    raw = "{"
+                else:
+                    if corruption == "orphan-exit":
+                        kind = "PROCESS_EXIT_OBSERVED"
+                        payload.update(intent_seq=intent["seq"] + 500, intent_hash=intent["hash"],
+                                       exit_code=0, reason="exited", output_bytes=0, truncated=False)
+                    elif corruption == "hidden-run":
+                        run_id = bindings[1].run_id
+                    elif corruption == "cross-binding":
+                        payload["request"]["binding"]["attempt"] += 1
+                    elif corruption == "unknown-run":
+                        run_id = payload["request"]["binding"]["run_id"] = "unknown-run"
+                    raw = json.dumps(payload)
+                with orch.connect() as conn:
+                    conn.execute("INSERT INTO events(ts,kind,task_id,run_id,payload_json) VALUES(?,?,?,?,?)",
+                                 ("fixture", kind, bindings[0].task_id, run_id, raw))
+                with self.assertRaisesRegex(ValueError, "process_"):
+                    self._b01_dispatch(orch, store, bindings[1], "blocked")
+                with orch.connect() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT' AND run_id=?",
+                                                  (bindings[1].run_id,)).fetchone()[0], int(corruption == "hidden-run"))
+
+    def test_b01_synchronized_admissions_cannot_overbook_last_global_slot(self):
+        orch, bindings, store = self._b01_fixture("concurrent")
+        for number, binding in enumerate(bindings[:3]):
+            for child in range(1 if number == 2 else 2):
+                self._b01_dispatch(orch, store, binding, "initial-" + str(number) + "-" + str(child))
+        start = threading.Barrier(3)
+        outcomes = []
+        def compete(binding, operation):
+            start.wait(timeout=5)
+            expires = time.monotonic() + 5
+            while True:
+                try:
+                    self._b01_dispatch(orch, module.ProcessOperationStore(orch), binding, operation)
+                    outcomes.append("admitted")
+                    return
+                except ValueError as exc:
+                    if str(exc) == "patch_execution_busy" and time.monotonic() < expires:
+                        time.sleep(.005)
+                        continue
+                    outcomes.append(str(exc))
+                    return
+        threads = [threading.Thread(target=compete, args=(binding, "race-" + str(number)))
+                   for number, binding in enumerate(bindings[2:])]
+        for thread in threads: thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=6)
+            self.assertFalse(thread.is_alive())
+        self.assertCountEqual(outcomes, ["admitted", "process_capacity"])
+        with orch.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='PROCESS_DISPATCH_INTENT'").fetchone()[0], 6)
 
     def test_dispatch_is_safe_metadata_and_independently_visible_after_full_commit(self):
         intent = self._dispatch()

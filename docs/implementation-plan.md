@@ -413,10 +413,40 @@ requires explicit re-admission with current native authority.
 This is a per-owner source contract, not device-wide capacity enforcement or
 three connected ChatGPT workers. The foreground IPC service still creates a
 separate owner for its single run. Product defaults remain 3 worker sessions,
-6 owned processes total and 2 per worker; process quotas need separately admitted
-dispatch integration. The at-most-2 Codex helpers limit concerns engineering
+6 owned processes total and 2 per worker; process admission is scoped separately
+below. The at-most-2 Codex helpers limit concerns engineering
 coordination and is separate from these product defaults. Full P1-D broker,
 reconnect, overview and real-worker acceptance remain pending.
+
+### B01: atomic process capacity within one ORCH_HOME
+
+The trusted local process store and owner accept keyword-only
+`max_processes_total` and `max_processes_per_run`, with defaults 6 and 2.
+Limits must be positive integers; booleans and invalid values are refused.
+Callers sharing the home must use the same trusted operator limits; these are
+not worker or wire inputs. The existing
+64-dispatch lifetime bound and cached-outcome reservations remain separate.
+
+The existing FULL dispatch transaction and cooperative runtime lock enforce
+both capacity limits before spawn. Shared-home accounting validates process
+event chains for every process-bearing run, independently of current run state,
+session routing and retained owner. Six unresolved dispatches across three
+independent runs are admitted; a seventh total or third per run is refused
+before another dispatch intent or child is created. Concurrent admissions
+cannot exceed the limits.
+
+Dispatch/spawn uncertainty remains charged through route close, owner
+replacement and restart. Only an exact validated durable exit chain from the
+retained owner's reaped direct child and settled output releases capacity.
+A lost reply does not invalidate an already durable exact exit observation;
+native writer release still requires the existing independent closure checks.
+Malformed or inconsistent process history fails closed. Elapsed time, PID
+absence and native run-state changes are not exit evidence.
+
+This is capacity within one authoritative ORCH_HOME, not a cross-home or
+physical-device singleton. It adds no broker, transport operation, recovered-PID
+authority or default-runtime switch. Three actual ChatGPT workers and RDC
+fallback remain separate acceptance milestones.
 
 ## 5. P1-E: remote MCP route
 
