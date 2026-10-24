@@ -512,6 +512,45 @@ process operations, automatic recovery, PID adoption, descendant containment,
 physical-device singleton enforcement, actual ordinary ChatGPT/RDC acceptance
 and default-runtime switching remain separately scoped work.
 
+### B04: honest read-only overview and recovery projection
+
+The bridge overview reports recorded native run/task state, routing observed in
+one local broker, and validated durable process uncertainty separately. A local
+route observation does not establish current capability authorization or an
+external ChatGPT connection. Without this broker's live observation, routing
+remains unknown; restart never reconstructs connectivity or process ownership.
+The existing context `status()` contract remains unchanged.
+
+Use `LocalRunBroker.overview_projection(limit=32, home=None)` for the local
+routing observation and `operator_overview(..., broker=None, limit=32)` for the
+combined projection. Limits are integers from 1 through 128; truncation remains
+explicit and does not establish a complete or globally safe process count.
+
+Read native data through bounded read-only queries and the existing validated
+process chains. An unmatched dispatch remains unknown; malformed or incomplete
+coverage is blocked or explicitly truncated. Checkpoints, `RESULT_SUBMITTED`,
+routing close and missing local children never imply task completion or process
+exit. Recorded native states retain their own meaning. The projection grants no
+repair, process, capability, native transition or publisher authority.
+
+Before fetching native binding/state text or scanning process JSON, metadata-only
+byte gates reject oversized records, including foreign process rows. This bounded
+projection requires UTF-8 SQLite with `octet_length` (SQLite 3.43 or newer).
+Unsupported encoding or a missing function returns BLOCKED without a payload
+fallback or ledger changes. Functional acceptance must exercise each supported
+interpreter's actual linked SQLite capability.
+
+SQLite access is logically read-only and retains current WAL visibility. It
+does not use `immutable=1` to omit live WAL data. Actual fixture observations
+require unchanged main database, WAL and all other protected state; the exact
+ledger SHM bookkeeping file is observed separately because read-only SQLite may
+update it. This is not a universal filesystem-immutability claim. Unsafe or
+missing authority and unsupported schemas are not initialized or repaired.
+
+This bounded local projection does not add a daemon, wire methods, connector,
+automatic recovery or a default-runtime switch. Actual ordinary ChatGPT/RDC
+acceptance remains separately scoped.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
