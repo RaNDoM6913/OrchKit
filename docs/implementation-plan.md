@@ -481,6 +481,37 @@ full six-version suite can include these cases after the accepted B01 Python
 3.14 main lane nearly exhausted the former 20-minute budget; all steps, action
 pins, permissions and test coverage are retained.
 
+### B03: retained process owners per broker context
+
+Operator admission may supply immutable `OwnedProcessProfile` values through
+`open_context(binding, capability_file, profiles=...)`. Each enabled context
+retains one existing `LocalOwnedProcessOperations` owner for its entire lifetime.
+`process_start`, `process_poll` with a bounded cursor, and `process_terminate`
+delegate only to that owner, with exact context/request binding and fresh native
+authority around buffered results. Contexts admitted without profiles keep the
+existing read/list/status interface and refuse process operations. Profiles,
+executables, arguments, environment and capacity are not worker inputs.
+
+The existing same-ORCH_HOME capacity remains six unresolved processes globally
+and two per run. Registered profiles, opaque handles, exact operation identities,
+bounded output and the direct-child supervisor remain authoritative. Foreign
+handles cannot be polled or terminated through another context. Reopening a
+route or creating another broker neither adopts old children nor replays their
+dispatch operations; durable unresolved charge survives owner replacement.
+
+Closing B first invalidates B, then independently attempts its retained process
+owner, file scope and routing cleanup. A/C remain usable. A failed process
+cleanup retains its owner for an explicit bounded retry using only held child
+objects. Cleanup return or routing release does not prove exit: only existing
+validated durable direct-child exit evidence releases process capacity. File
+descriptor uncertainty retains B02's separate retry restrictions. Native writer
+authority is never released by broker cleanup.
+
+This remains a synchronous trusted local API. Multi-client transport, wire
+process operations, automatic recovery, PID adoption, descendant containment,
+physical-device singleton enforcement, actual ordinary ChatGPT/RDC acceptance
+and default-runtime switching remain separately scoped work.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
