@@ -215,8 +215,8 @@ class LocalOwnedProcessTests(unittest.TestCase):
             time.sleep(0.025)
         self.fail("owned direct child did not reach a proven exit")
 
-    def _outside_child(self):
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"],
+    def _outside_child(self, *, code="import time; time.sleep(10)"):
+        child = subprocess.Popen([sys.executable, "-c", code],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL, close_fds=True)
         def cleanup():
@@ -566,19 +566,53 @@ class LocalOwnedProcessTests(unittest.TestCase):
         self.assertIsNone(unrelated.poll())
 
     def test_restart_never_replays_start_or_reconstructs_signal_target(self):
-        unrelated = self._outside_child()
-        executor = self._executor(self._profile("import time; time.sleep(10)"))
-        request, _, started = self._start(executor)
-        restarted = self._executor(self._profile("import time; time.sleep(10)"))
-        self.assertEqual(restarted.start(request).state, "UNKNOWN")
-        request = self._request("process.poll", started["handle"])
-        self.assertEqual(restarted.poll(request).state, "UNKNOWN")
-        request = self._request("process.terminate", started["handle"])
-        self.assertEqual(restarted.terminate(request).state, "UNKNOWN")
-        restarted.close()
-        self.assertIsNone(unrelated.poll())
-        request = self._request("process.poll", started["handle"])
-        self.assertEqual(self._decode(request, executor.poll(request))["process_state"], "RUNNING")
+        release = self.base / "restart-release"
+        owned_ready = self.base / "restart-owned-ready"
+        unrelated_ready = self.base / "restart-unrelated-ready"
+
+        def child_code(ready):
+            return (
+                "from pathlib import Path\n"
+                "import time\n"
+                f"ready = Path({str(ready)!r})\n"
+                f"release = Path({str(release)!r})\n"
+                "expires = time.monotonic() + 60\n"
+                "ready.write_bytes(b'ready')\n"
+                "while not release.exists() and time.monotonic() < expires:\n"
+                "    time.sleep(.01)\n"
+            )
+
+        try:
+            unrelated = self._outside_child(code=child_code(unrelated_ready))
+            profile = self._profile(child_code(owned_ready), deadline=60)
+            executor = self._executor(profile)
+            began = time.monotonic()
+            request, _, started = self._start(executor)
+            child = executor._children[started["handle"]]
+            ready_deadline = time.monotonic() + 5
+            while True:
+                with child.lock:
+                    self.assertIsNone(child.process.poll(), "owned fixture exited before readiness")
+                self.assertIsNone(unrelated.poll(), "unrelated fixture exited before readiness")
+                if owned_ready.is_file() and unrelated_ready.is_file():
+                    break
+                remaining = ready_deadline - time.monotonic()
+                self.assertGreater(remaining, 0, "restart fixture children did not become ready within 5s")
+                time.sleep(min(.01, remaining))
+            restarted = self._executor(profile)
+            self.assertEqual(restarted.start(request).state, "UNKNOWN")
+            request = self._request("process.poll", started["handle"])
+            self.assertEqual(restarted.poll(request).state, "UNKNOWN")
+            request = self._request("process.terminate", started["handle"])
+            self.assertEqual(restarted.terminate(request).state, "UNKNOWN")
+            restarted.close()
+            self.assertIsNone(unrelated.poll())
+            request = self._request("process.poll", started["handle"])
+            final = self._decode(request, executor.poll(request))
+            self.assertEqual(final["process_state"], "RUNNING",
+                             {"elapsed_sec": time.monotonic() - began, "envelope": final})
+        finally:
+            release.touch()
 
     def test_ambiguous_spawn_keeps_intent_unknown_and_never_retries(self):
         executor = self._executor(self._profile("import time; time.sleep(10)"))

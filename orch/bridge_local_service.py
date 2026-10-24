@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 from dataclasses import asdict
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import secrets
@@ -23,6 +24,7 @@ from .bridge_authorization import LocalRunSessionAuthority
 from .bridge_file_list import LocalBoundedFileLister
 from .bridge_file_read import LocalBoundedFileReader
 from .bridge_file_scope import LocalFileScope
+from .bridge_local_broker import LocalRunBroker, LocalRunContext
 from .bridge_local_protocol import (
     LOCAL_OPERATIONS, LocalServiceLimits, encode_payload, native_payload_budget,
     open_private_directory, receive_frame, send_frame, validate_hello,
@@ -356,6 +358,230 @@ def serve_local_bridge(ledger: ReadOnlyAuthorityLedger, binding: WorkerRunBindin
         finally:
             if parent_fd >= 0:
                 os.close(parent_fd)
+        for signum, old_handler in old_handlers.items():
+            signal.signal(signum, old_handler)
+    return result
+
+
+@dataclass(frozen=True)
+class LocalBridgeAdmission:
+    """Trusted local admission paths; native capability bytes stay off the wire."""
+
+    binding: WorkerRunBinding
+    capability_file: Path
+    credential_file: Path
+
+
+def _dispatch_context(request: dict, context: LocalRunContext,
+                      incarnation: str, limits: LocalServiceLimits) -> dict:
+    response = _response(request, context.session_id, incarnation)
+    budget = request["max_response_bytes"]
+    if request["operation"] == "session.status":
+        status = context.status()
+        status.update(service_state="SERVING", service_incarnation=incarnation,
+                      supported_operations=list(LOCAL_OPERATIONS), limits=asdict(limits))
+        response["status"] = status
+    else:
+        raw_budget = native_payload_budget(response, budget)
+        if raw_budget < 1:
+            return _refusal("local_bridge_response_too_large", request=request,
+                            session_id=context.session_id, incarnation=incarnation)
+        operation = WorkerOperationRequest(
+            context.binding, request["request_id"], request["operation"],
+            request["target"], raw_budget,
+        )
+        outcome = context.read(operation) if operation.kind == "file.read" else context.list(operation)
+        if outcome.state != "SUCCEEDED":
+            code = ("local_bridge_response_too_large" if outcome.error_code in
+                    ("file_read_too_large", "file_list_too_large") else
+                    "local_bridge_io_failed" if outcome.state == "FAILED" else
+                    "local_bridge_operation_denied")
+            return _refusal(code, request=request, session_id=context.session_id,
+                            incarnation=incarnation)
+        response["output_base64"] = base64.b64encode(outcome.output).decode("ascii")
+    if len(encode_payload(response)) > budget:
+        return _refusal("local_bridge_response_too_large", request=request,
+                        session_id=context.session_id, incarnation=incarnation)
+    return response
+
+
+def _serve_context_connection(sock: socket.socket,
+                              routes: tuple[tuple[str, LocalRunContext], ...],
+                              incarnation: str, limits: LocalServiceLimits) -> bool:
+    try:
+        hello = validate_hello(receive_frame(sock, limits))
+    except (EOFError, OSError, TimeoutError):
+        return True
+    except (ValueError, TypeError):
+        _safe_send(sock, _refusal("local_bridge_invalid_request"), limits)
+        return True
+    # Only the authenticated token selects an object. Later session IDs cannot
+    # choose a different context, even when they name another admitted session.
+    context = next((owned for token, owned in routes
+                    if secrets.compare_digest(hello["transport_token"], token)), None)
+    if context is None:
+        _safe_send(sock, _refusal("local_bridge_auth_denied", request=hello), limits)
+        return True
+    session_id = context.session_id
+    hello_response = {"schema_version": 1, "request_id": hello["request_id"],
+                      "state": "SUCCEEDED", "session_id": session_id,
+                      "service_incarnation": incarnation}
+    try:
+        context.status()
+    except Exception:
+        _safe_send(sock, _refusal("local_bridge_authority_denied", request=hello), limits)
+        return False
+    try:
+        send_frame(sock, hello_response, limits)
+    except (OSError, ValueError, TimeoutError):
+        return True
+    while True:
+        request = None
+        try:
+            request = receive_frame(sock, limits)
+            validate_request(request, limits)
+        except (EOFError, OSError, TimeoutError):
+            return True
+        except (ValueError, TypeError):
+            refused_budget = None
+            if (request is not None and type(request.get("max_response_bytes")) is int
+                    and 0 <= request["max_response_bytes"] <= limits.max_response_bytes):
+                refused_budget = request["max_response_bytes"]
+            _safe_send(sock, _refusal("local_bridge_invalid_request", session_id=session_id,
+                                     incarnation=incarnation), limits, refused_budget)
+            return True
+        budget = request["max_response_bytes"]
+        if request["session_id"] != session_id:
+            _safe_send(sock, _refusal("local_bridge_session_denied", request=request,
+                                     session_id=session_id, incarnation=incarnation), limits, budget)
+            return True
+        try:
+            context.status()
+            response = _dispatch_context(request, context, incarnation, limits)
+            # Construction and budget checks are complete. Renew this captured
+            # context's native authority immediately before releasing any bytes.
+            context.status()
+        except Exception:
+            _safe_send(sock, _refusal("local_bridge_authority_denied", request=request,
+                                     session_id=session_id, incarnation=incarnation), limits, budget)
+            return False
+        try:
+            send_frame(sock, response, limits, budget=budget)
+        except (OSError, ValueError, TimeoutError):
+            return True
+
+
+def serve_local_bridge_sessions(ledger: ReadOnlyAuthorityLedger,
+                                admissions: tuple[LocalBridgeAdmission, ...],
+                                socket_path: Path, limits: LocalServiceLimits) -> int:
+    """Serve one to three explicitly admitted contexts through one serial socket."""
+    parent_fd = -1
+    listener = broker = None
+    socket_identity = None
+    credential_identities = {}
+    contexts = []
+    old_handlers = {}
+    stop = _DeferredStop()
+    result = 1
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with stop.defer():
+                    old_handlers[signum] = signal.signal(signum, stop)
+        if (not isinstance(limits, LocalServiceLimits) or type(admissions) is not tuple
+                or not 1 <= len(admissions) <= 3
+                or any(not isinstance(item, LocalBridgeAdmission)
+                       or not isinstance(item.binding, WorkerRunBinding) for item in admissions)
+                or len({item.binding for item in admissions}) != len(admissions)):
+            raise ValueError("local_bridge_endpoint_denied")
+        socket_path = Path(socket_path)
+        credential_files = tuple(Path(item.credential_file) for item in admissions)
+        paths = (socket_path,) + credential_files
+        if (len(set(paths)) != len(paths)
+                or any(path.parent != socket_path.parent or not path.is_absolute()
+                       or str(path) != os.path.abspath(str(path)) for path in paths)):
+            raise ValueError("local_bridge_endpoint_denied")
+        with stop.defer():
+            parent_fd = open_private_directory(socket_path.parent)
+        for path in paths:
+            try:
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("local_bridge_endpoint_denied")
+        broker = LocalRunBroker(ledger, max_worker_sessions=3)
+        for admission in admissions:
+            with stop.defer():
+                context = broker.open_context(admission.binding, Path(admission.capability_file),
+                                              profiles=())
+                contexts.append(context)
+        incarnation = secrets.token_urlsafe(24)
+        tokens = tuple(secrets.token_urlsafe(32) for _ in contexts)
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("local_bridge_auth_denied")
+        routes = tuple(zip(tokens, contexts))
+        with stop.defer():
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            info = os.stat(socket_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("local_bridge_endpoint_denied")
+            socket_identity = _identity(info)
+        os.chmod(str(socket_path), 0o600, follow_symlinks=False)
+        if _identity(os.stat(socket_path.name, dir_fd=parent_fd, follow_symlinks=False)) != socket_identity:
+            raise ValueError("local_bridge_endpoint_denied")
+        listener.listen(1)
+        for credential_file, token in zip(credential_files, tokens):
+            def credential_owned(identity: tuple, name=credential_file.name) -> None:
+                credential_identities[name] = identity
+
+            _publish_credential(parent_fd, credential_file.name, {
+                "schema_version": 1, "socket_path": str(socket_path),
+                "service_incarnation": incarnation, "transport_token": token,
+            }, stop=stop, on_owned=credential_owned)
+        result = 0
+        idle_deadline = time.monotonic() + limits.idle_timeout_sec
+        while True:
+            try:
+                remaining = idle_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                listener.settimeout(min(remaining, 0.25))
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            with connection:
+                if not _serve_context_connection(connection, routes, incarnation, limits):
+                    result = 1
+                    break
+            idle_deadline = time.monotonic() + limits.idle_timeout_sec
+    except _ServiceStopped:
+        result = 0
+    except Exception:
+        result = 1
+    finally:
+        for signum in old_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        # Each resource has an independent cleanup attempt. Broker cleanup owns
+        # its contexts and never retries an ambiguous numeric scope descriptor.
+        for resource in (broker, listener):
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException:
+                    result = 1
+        if parent_fd >= 0:
+            owned_paths = [(socket_path.name, socket_identity)] + list(credential_identities.items())
+            for name, identity in owned_paths:
+                try:
+                    _cleanup_owned(parent_fd, name, identity)
+                except BaseException:
+                    result = 1
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                result = 1
         for signum, old_handler in old_handlers.items():
             signal.signal(signum, old_handler)
     return result
