@@ -551,6 +551,50 @@ This bounded local projection does not add a daemon, wire methods, connector,
 automatic recovery or a default-runtime switch. Actual ordinary ChatGPT/RDC
 acceptance remains separately scoped.
 
+### B05: serial endpoint for independently admitted read contexts
+
+The trusted local source entrypoint
+`serve_local_bridge_sessions(ledger, admissions, socket_path, limits)` accepts a
+finite tuple of one through three frozen
+`LocalBridgeAdmission(binding, capability_file, credential_file)` records. One
+`LocalRunBroker(max_worker_sessions=3)` admits each native context without process
+profiles. Credential paths are distinct, absent and inside the socket's existing
+canonical private directory; duplicate bindings and invalid admissions fail
+before endpoint publication. The existing six-argument single-session entrypoint
+and its complete implementation remain unchanged.
+
+Each credential retains the exact version-1 schema and has a fresh distinct
+transport token. All contexts share one service incarnation. Hello authentication
+captures one sealed context; a later session ID can only match that context and
+cannot select another route. A complete valid B credential grants B's context.
+The unchanged wire accepts only `session.status`, `file.read` and `file.list`;
+binding, capability paths, process operations and additional selectors never
+become request fields. Native operations use the captured context's binding.
+
+The serial owner renews native authority before dispatch and after constructing
+and budget-checking the complete response, immediately before transmission.
+Selected-context revocation refuses buffered output and ends the service under
+the existing fatal-authority policy. Context and credential ownership is recorded
+before a deferred stop is delivered. Partial later startup failure unwinds earlier
+resources; cleanup attempts every eligible owned route/path independently and
+reports unresolved failure. Matching device/inode/owner/type checks preserve
+foreign and replaced endpoint objects. Native writer state remains unchanged.
+
+**Source gate:** real sequential clients over one AF_UNIX socket prove three
+independent native bindings and exact read/list results; complete cross-session
+denials, fresh final-send revocation for all three operations, later acquisition
+signals/failures and ownership-preserving cleanup accompany the retained
+predecessor suite. Actual main database/WAL and protected-state observations stay
+equal; exact ledger SHM bookkeeping is observed separately.
+
+**Pending parent gates:** complete registered native verification, genuine
+independent review, verified publication, required first-attempt PR/main CI,
+protected exact merge, immutable-merge runtime and recovery-aware preservation.
+Source/runtime evidence is limited to trusted local sequential read transport.
+Concurrent connections, reconnect isolation, process wire methods, native writer
+release, ordinary ChatGPT/RDC acceptance and default-runtime switching remain
+separately scoped; B05 does not establish B06 behavior or an OS sandbox.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
