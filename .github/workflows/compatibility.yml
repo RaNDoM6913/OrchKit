@@ -42,6 +42,120 @@ jobs:
           git --version
           python --version
 
+      - name: Provision stdlib SQLite
+        if: matrix.python == '3.9' || matrix.python == '3.10'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          ARCHFLAGS: "-arch arm64"
+          MACOSX_DEPLOYMENT_TARGET: "26.0"
+        run: |
+          python - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import sqlite3
+          import subprocess
+          import sys
+          import sysconfig
+          import tarfile
+          import tempfile
+          from distutils.core import Extension, setup
+
+          version = platform.python_version()
+          sources = {
+              "3.9.13": "125b0c598f1e15d2aa65406e83f792df7d171cdf38c16803b149994316a3080f",
+              "3.10.11": "3c3bc3048303721c904a03eb8326b631e921f11cc3be2988456a42f115daf04c",
+          }
+          if version not in sources or platform.machine() != "arm64":
+              raise RuntimeError("Unrecognized CPython build for SQLite provisioning")
+          minor = ".".join(version.split(".")[:2])
+          suffix = sysconfig.get_config_var("EXT_SUFFIX")
+          extension = Path(importlib.util.find_spec("_sqlite3").origin).resolve()
+          expected = Path(sys.base_prefix).resolve() / "lib" / ("python" + minor) / "lib-dynload" / ("_sqlite3" + suffix)
+          if extension != expected or hasattr(sqlite3.Connection, "enable_load_extension"):
+              raise RuntimeError("Unexpected stdlib extension path or load-extension authority")
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          backup = runner_temp / ("orchkit-original-" + version + "-" + extension.name)
+          shutil.copy2(extension, backup)
+          url = "https://www.python.org/ftp/python/" + version + "/Python-" + version + ".tar.xz"
+          print(json.dumps({"python": version, "sqlite_before": sqlite3.sqlite_version,
+                            "original_extension": str(extension), "original_backup": str(backup),
+                            "original_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+                            "cpython_source": url, "source_sha256": sources[version]}), flush=True)
+          sqlite_prefix = Path(subprocess.check_output(["brew", "--prefix", "sqlite"], text=True).strip())
+          sqlite_library = sqlite_prefix / "lib" / "libsqlite3.dylib"
+          if not sqlite_library.is_file() or not (sqlite_prefix / "include" / "sqlite3.h").is_file():
+              subprocess.run(["brew", "install", "sqlite"], check=True)
+          subprocess.run(["brew", "list", "--versions", "sqlite"], check=True)
+          print("SQLITE_LIBRARY_SHA256 " + hashlib.sha256(sqlite_library.read_bytes()).hexdigest(), flush=True)
+          with tempfile.TemporaryDirectory(prefix="orchkit-sqlite-", dir=runner_temp) as directory:
+              work = Path(directory)
+              archive = work / "cpython.tar.xz"
+              subprocess.run(["curl", "--fail", "--location", "--silent", "--show-error",
+                              "--output", str(archive), url], check=True)
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != sources[version]:
+                  raise RuntimeError("CPython source SHA-256 mismatch")
+              module = work / "_sqlite"
+              module.mkdir()
+              source_directory = "Python-" + version + "/Modules/_sqlite"
+              with tarfile.open(archive) as source:
+                  for member in source.getmembers():
+                      if member.isfile() and member.name.startswith(source_directory + "/"):
+                          relative = Path(member.name).relative_to(source_directory)
+                          if ".." in relative.parts:
+                              raise RuntimeError("Unexpected CPython source path")
+                          target = module / relative
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          with source.extractfile(member) as content:
+                              target.write_bytes(content.read())
+              defines = [("SQLITE_OMIT_LOAD_EXTENSION", "1")]
+              if minor == "3.9":
+                  defines.append(("MODULE_NAME", '"sqlite3"'))
+              build_lib = work / "lib"
+              setup(name="stdlib-sqlite-relink", script_args=[
+                  "build_ext", "--build-lib", str(build_lib), "--build-temp", str(work / "temp")],
+                  ext_modules=[Extension("_sqlite3", sorted(str(path) for path in module.glob("*.c")),
+                                         include_dirs=[str(module), str(sqlite_prefix / "include")],
+                                         define_macros=defines, extra_objects=[str(sqlite_library)])])
+              built = build_lib / extension.name
+              linkage = subprocess.check_output(["otool", "-L", str(built)], text=True)
+              print(linkage, flush=True)
+              if str(sqlite_library) not in linkage:
+                  raise RuntimeError("Rebuilt stdlib module is not linked to the selected SQLite")
+              command = ["/usr/bin/install", "-S", "-m", "755", str(built), str(extension)]
+              if not os.access(extension.parent, os.W_OK):
+                  command.insert(0, "sudo")
+              subprocess.run(command, check=True)
+          PY
+
+      - name: SQLite capability
+        run: |
+          python - <<'PY'
+          import json
+          import sqlite3
+          import sys
+          import _sqlite3
+
+          connection = sqlite3.connect(":memory:")
+          version = connection.execute("SELECT sqlite_version()").fetchone()[0]
+          print("SQLITE_VERSION " + json.dumps({"python": sys.version.split()[0],
+                                               "sqlite_version": version,
+                                               "executable": sys.executable,
+                                               "provider": sqlite3.__name__,
+                                               "extension": _sqlite3.__file__}), flush=True)
+          octets = connection.execute("SELECT octet_length(?)", ("\u00e9",)).fetchone()[0]
+          if octets != 2 or connection.execute("SELECT octet_length(?)", ("\u00e9\0x",)).fetchone()[0] != 4:
+              raise RuntimeError("SQLite UTF-8 byte-length capability is unavailable")
+          print("B04_CI_SQLITE_" + "CAPABILITY " + json.dumps({"python": sys.version.split()[0],
+                  "sqlite_version": version, "octet_length_available": True,
+                  "octet_length_result": octets}), flush=True)
+          connection.close()
+          PY
+
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 

@@ -37,6 +37,14 @@ The wheel is installed into a separate clean virtual environment. `scripts/check
 
 These package checks do not publish artifacts, expand the support matrix, launch workers, or certify ordinary-Chat/RDC route acceptance. Each release publication still requires the [owner-gated process](release-process.md).
 
+## SQLite capability in compatibility CI
+
+The broker-overview byte gate uses SQLite's `octet_length` function to inspect text byte lengths from column metadata before fetching the values. SQLite introduced this function in [3.43.0](https://sqlite.org/releaselog/3_43_0.html); its [documented metadata behavior](https://sqlite.org/lang_corefunc.html#octet_length) is part of this gate. The required capability must be available through the tested interpreter's standard-library `sqlite3` module.
+
+The setup-python macOS binaries observed for Python 3.9.13 and 3.10.11 bundle SQLite 3.37.2 and 3.40.1 inside `_sqlite3`. For those two lanes, CI rebuilds only that standard CPython extension from the matching, SHA-256-pinned [3.9.13](https://www.python.org/downloads/release/python-3913/) or [3.10.11](https://www.python.org/downloads/release/python-31011/) source against Homebrew's SQLite dynamic library. Provisioning verifies the interpreter patch version, source hash, exact standard-library extension path, and resulting library dependency before replacing the module in the disposable runner. It retains the original module and hash in runner temporary storage and preserves disabled extension-loading support.
+
+Every lane then runs the `SQLite capability` step before unit tests. It records `sqlite_version()` independently, verifies UTF-8 byte counts including embedded NUL, and emits the `B04_CI_SQLITE_CAPABILITY` receipt. Unit tests, compilation, build tools, distribution builds, and the clean installed-wheel environment use that same provisioned Python installation. Unknown legacy interpreter builds, mismatched sources, unexpected module paths, or missing capability fail before the test suite; the six Python lanes and their existing package checks remain required. The exact linked SQLite version is recorded in each workflow run.
+
 ## Expanding the matrix
 
 Add automated compatibility checks only after the intended environment is named explicitly. A new support claim should record the OS/architecture, Python and Git versions, the source revision, the required test command, and whether package build/install smoke checks passed.

@@ -1,6 +1,6 @@
 """Trusted in-process ownership of independent local file/process contexts.
 
-Routing identities remain volatile and every operation checks native authority.
+Routing identities remain volatile and worker operations check native authority.
 Use a broker and its contexts only in their creating thread and process. This
 module adds no transport, native writer/process release or same-user OS fence.
 """
@@ -24,6 +24,11 @@ from .worker_operations import (
 
 
 _CONTEXT_SEAL = object()
+
+
+def _validate_overview_limit(limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= 128:
+        raise ValueError("bridge_overview_invalid_limit")
 
 
 class LocalRunContext:
@@ -103,6 +108,7 @@ class LocalRunBroker:
             ledger, max_worker_sessions=max_worker_sessions,
         )
         self.__ledger = ledger
+        self.__home = ledger.root.expanduser().resolve()
         self.__owner = (os.getpid(), threading.get_ident())
         self.__owned: list[_OwnedContext] = []
         self.__contexts: dict[LocalRunContext, _OwnedContext] = {}
@@ -111,6 +117,42 @@ class LocalRunBroker:
     def __require_owner(self) -> None:
         if self.__owner != (os.getpid(), threading.get_ident()):
             raise ValueError("bridge_broker_owner_mismatch")
+
+    def overview_projection(self, *, limit: int = 32,
+                            home: Path | None = None) -> dict:
+        """Observe bounded volatile flags, never capability/native authority.
+
+        Unlisted bindings are UNKNOWN even after this broker closes. Retained
+        cleanup history can outnumber live routing slots, so bound the retained
+        list itself rather than assuming the session admission limit bounds it.
+        No resource owner or native write-capable connection is consulted.
+        """
+        self.__require_owner()
+        _validate_overview_limit(limit)
+        if home is not None and home.expanduser().resolve() != self.__home:
+            raise ValueError("bridge_broker_home_mismatch")
+        return {
+            "scope": "THIS_BROKER_ONLY",
+            "status": "UNKNOWN" if len(self.__owned) > limit else "OBSERVED",
+            "coverage": "TRUNCATED" if len(self.__owned) > limit else "COMPLETE",
+            "unlisted_route_state": "UNKNOWN",
+            "external_connectivity": "UNKNOWN",
+            "contexts": [
+                {
+                    "binding": asdict(owned.binding),
+                    "route_state": (
+                        "OPEN_IN_THIS_BROKER"
+                        if not self.__closed and not owned.closed and owned.session_open
+                        else "CLOSED_IN_THIS_BROKER"
+                    ),
+                    "current_native_authority": "UNKNOWN",
+                    "cleanup_unresolved": (
+                        owned.cleanup_unresolved or owned.process_cleanup_unresolved
+                    ),
+                }
+                for owned in self.__owned[:limit]
+            ],
+        }
 
     def open_context(self, binding: WorkerRunBinding,
                      capability_file: Path, *, profiles=()) -> LocalRunContext:
