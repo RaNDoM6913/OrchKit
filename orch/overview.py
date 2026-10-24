@@ -2,18 +2,246 @@ from __future__ import annotations
 
 import re
 import shlex
+import sqlite3
 import stat
+from contextlib import closing
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import HOME_CONFIG_MAX_BYTES, read_bounded_json_object
+from .bridge_local_broker import LocalRunBroker, _validate_overview_limit
+from .bridge_process_store import (_MAX_ACK_BYTES, _MAX_RECORD_BYTES,
+                                   _chains, _ledger_binding)
+from .core import STATE_SCHEMA_VERSION
 from .dispatcher import RDC_MARKER_MAX_BYTES, validate_rdc_marker
 from .project import (
     PROJECT_CONFIG_MAX_BYTES,
     project_root_identity_matches,
     validate_project_schema,
 )
-from .readiness import audit_project, state_permission_findings
+from .readiness import (_open_ledger_read_only, audit_project,
+                        state_permission_findings)
+from .worker_operations import WorkerRunBinding
+
+
+_RECORDED_RUN_STATES = frozenset({
+    "RUNNING", "RESULT_SUBMITTED", "QUIESCING", "VERIFYING", "REVIEWING",
+    "VERIFIED", "NEEDS_FIX", "BLOCKED", "ABORTED", "COMPLETE",
+})
+_RECORDED_TASK_STATES = frozenset({
+    "PLANNED", "READY", "NEEDS_FIX", "BLOCKED", "IN_PROGRESS",
+    "WAITING_REVIEW", "READY_TO_PUBLISH", "WAITING_OWNER", "DONE", "CANCELLED",
+})
+_PROCESS_EVENT_KINDS = (
+    "PROCESS_DISPATCH_INTENT", "PROCESS_EXIT_OBSERVED", "PROCESS_CLOSURE_ACKNOWLEDGED",
+)
+
+
+def _bridge_recorded_projection(home: Path, limit: int) -> tuple[dict, dict]:
+    """Inspect existing native data, including current WAL, without repair.
+
+    SQLite mode=ro can maintain its SHM bookkeeping index. This is logically
+    read-only native data, not a universal filesystem-immutability guarantee.
+    The instruction budget also bounds the frozen chain validator's JSON
+    cross-binding scan, whose work is not bounded by its returned-row LIMIT.
+    """
+    native = {"status": "UNKNOWN", "coverage": "UNKNOWN", "runs": []}
+    processes = {
+        "status": "UNKNOWN", "coverage": "UNKNOWN", "runs": [],
+        "count_scope": "VALIDATED_VISIBLE_CHAINS_ONLY",
+        "observed_unresolved_dispatch_count": None,
+    }
+    native_loaded = False
+
+    def blocked(reason):
+        native.update(status="BLOCKED", coverage="UNKNOWN", reason=reason)
+        processes.update(status="BLOCKED", coverage="UNKNOWN",
+                         observed_unresolved_dispatch_count=None)
+        return native, processes
+
+    try:
+        if home.is_symlink() or (home.exists() and not home.is_dir()):
+            return blocked("state_home_unsafe")
+        runtime = home / ".runtime"
+        if not runtime.exists() and not runtime.is_symlink():
+            native["status"] = "NOT_INITIALIZED"
+            return native, processes
+        if any(item.get("status") == "BLOCKED"
+               for item in state_permission_findings(home)):
+            return blocked("state_permissions_unsafe")
+
+        with closing(_open_ledger_read_only(runtime / "orch.sqlite3")) as conn:
+            budget = 0
+
+            def bounded_sql():
+                nonlocal budget
+                budget += 1
+                return int(budget >= 1000)
+
+            conn.set_progress_handler(bounded_sql, 1000)
+            # One read transaction keeps run/task/chain observations coherent.
+            conn.execute("BEGIN")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != STATE_SCHEMA_VERSION:
+                return blocked("state_schema_mismatch")
+            required_columns = {
+                "runs": {"run_id", "task_id", "attempt", "state"},
+                "tasks": {"task_id", "project_id", "writer_key", "status"},
+                "events": {"seq", "kind", "task_id", "run_id", "payload_json"},
+            }
+            for table, required in required_columns.items():
+                actual = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if not required <= actual:
+                    return blocked("state_schema_mismatch")
+
+            # Direct-column octet_length reads the stored byte count without
+            # loading the value. Require UTF-8 so it matches the frozen chain
+            # validator's UTF-8 limits. Missing octet_length (SQLite <3.43) is
+            # handled by the existing fail-closed sqlite3.Error path; no fallback.
+            if conn.execute("PRAGMA encoding").fetchone()[0] != "UTF-8":
+                return blocked("state_encoding_unsupported")
+            unsafe_native = conn.execute(
+                "SELECT 1 FROM runs WHERE "
+                "typeof(run_id)<>'text' OR octet_length(run_id)>200 OR "
+                "typeof(task_id)<>'text' OR octet_length(task_id)>200 OR "
+                "typeof(attempt)<>'integer' OR attempt NOT BETWEEN 1 AND 1000000 OR "
+                "typeof(state)<>'text' OR octet_length(state)>128 "
+                "UNION ALL SELECT 1 FROM tasks WHERE "
+                "typeof(task_id)<>'text' OR octet_length(task_id)>200 OR "
+                "typeof(project_id)<>'text' OR octet_length(project_id)>160 OR "
+                "typeof(writer_key)<>'text' OR octet_length(writer_key)>200 OR "
+                "typeof(status)<>'text' OR octet_length(status)>128 LIMIT 1"
+            ).fetchone()
+            if unsafe_native is not None:
+                return blocked("native_record_bytes_unsafe")
+
+            run_rows = conn.execute(
+                "SELECT run_id FROM runs ORDER BY run_id LIMIT ?", (limit + 1,),
+            ).fetchall()
+            native["coverage"] = "TRUNCATED" if len(run_rows) > limit else "COMPLETE"
+            native["status"] = "UNKNOWN" if len(run_rows) > limit else "RECORDED"
+            bindings = {}
+            for row in run_rows[:limit]:
+                try:
+                    recorded, binding = _ledger_binding(conn, row["run_id"])
+                    binding = asdict(WorkerRunBinding(**binding))
+                except (TypeError, ValueError):
+                    native.update(status="BLOCKED", reason="native_binding_invalid")
+                    continue
+                bindings[row["run_id"]] = binding
+                native["runs"].append({
+                    "binding": binding,
+                    "run_state": (recorded["state"]
+                                  if recorded["state"] in _RECORDED_RUN_STATES else "UNKNOWN"),
+                    "task_state": (recorded["task_state"]
+                                   if recorded["task_state"] in _RECORDED_TASK_STATES else "UNKNOWN"),
+                })
+            native_loaded = True
+
+            # The frozen validator can JSON-scan records for any run, including
+            # malformed/foreign row bindings. Gate all process-event metadata
+            # before DISTINCT IDs, JSON parsing or payload materialization.
+            unsafe_process = conn.execute(
+                "SELECT 1 FROM events WHERE kind IN (?,?,?) AND ("
+                "typeof(run_id)<>'text' OR octet_length(run_id)>200 OR "
+                "typeof(task_id)<>'text' OR octet_length(task_id)>200 OR "
+                "typeof(payload_json)<>'text' OR octet_length(payload_json)>"
+                "CASE WHEN kind=? THEN ? ELSE ? END) LIMIT 1",
+                (*_PROCESS_EVENT_KINDS, "PROCESS_CLOSURE_ACKNOWLEDGED",
+                 _MAX_ACK_BYTES, _MAX_RECORD_BYTES),
+            ).fetchone()
+            if unsafe_process is not None:
+                processes.update(status="BLOCKED", coverage="UNKNOWN",
+                                 reason="process_record_bytes_unsafe",
+                                 observed_unresolved_dispatch_count=None)
+                return native, processes
+
+            # Include inactive/orphan process-bearing runs rather than treating
+            # only native writers or only locally routed runs as capacity.
+            process_rows = conn.execute(
+                "SELECT DISTINCT run_id FROM events WHERE kind IN (?,?,?) "
+                "ORDER BY run_id LIMIT ?", (*_PROCESS_EVENT_KINDS, limit + 1),
+            ).fetchall()
+            candidates = list(dict.fromkeys(
+                [row["run_id"] for row in process_rows] + list(bindings)
+            ))
+            processes["coverage"] = (
+                "UNKNOWN" if native["status"] == "BLOCKED" else
+                "TRUNCATED" if (native["coverage"] == "TRUNCATED"
+                                or len(process_rows) > limit or len(candidates) > limit)
+                else "COMPLETE"
+            )
+            processes["status"] = "RECORDED"
+            unresolved = 0
+            for run_id in candidates[:limit]:
+                binding = bindings.get(run_id)
+                try:
+                    _, ledger_binding = _ledger_binding(conn, run_id)
+                    binding = asdict(WorkerRunBinding(**ledger_binding))
+                    intents, exits = _chains(conn, run_id, binding)
+                except (TypeError, ValueError, RecursionError):
+                    processes["status"] = "BLOCKED"
+                    item = {"status": "BLOCKED", "reason": "process_records_invalid"}
+                    if binding is not None:
+                        item["binding"] = binding
+                    processes["runs"].append(item)
+                    continue
+                pending = len(intents) - len(exits)
+                unresolved += pending
+                processes["runs"].append({
+                    "binding": binding,
+                    "status": ("UNKNOWN" if pending else "RECORDED_EXITS"
+                               if intents else "NO_PROCESS_RECORDS"),
+                    "recorded_dispatch_count": len(intents),
+                    "recorded_exit_count": len(exits),
+                    "unresolved_dispatch_count": pending,
+                })
+            if processes["status"] != "BLOCKED":
+                processes["observed_unresolved_dispatch_count"] = unresolved
+                if unresolved or processes["coverage"] != "COMPLETE":
+                    processes["status"] = "UNKNOWN"
+            return native, processes
+    except sqlite3.Error:
+        if native_loaded:
+            processes.update(status="BLOCKED", coverage="UNKNOWN",
+                             reason="state_query_unavailable",
+                             observed_unresolved_dispatch_count=None)
+            return native, processes
+        return blocked("state_query_unavailable")
+    except (OSError, ValueError, TypeError):
+        return blocked("state_ledger_unavailable")
+
+
+def operator_overview(
+    home: Path,
+    *,
+    project_id: Optional[str] = None,
+    broker: Optional[LocalRunBroker] = None,
+    limit: int = 32,
+) -> Dict[str, Any]:
+    """Keep legacy setup/readiness semantics and add independent bridge facts.
+
+    A supplied broker is a trusted in-process object, used only by its owner.
+    Recorded states and metadata do not certify current capability authority,
+    a connected ChatGPT worker, a physical process state or safe global capacity.
+    """
+    _validate_overview_limit(limit)
+    if broker is not None and not isinstance(broker, LocalRunBroker):
+        raise ValueError("bridge_overview_invalid_broker")
+    routing = (broker.overview_projection(home=home, limit=limit)
+               if broker is not None else {
+                   "scope": "THIS_BROKER_ONLY", "status": "UNKNOWN",
+                   "coverage": "UNKNOWN", "unlisted_route_state": "UNKNOWN",
+                   "external_connectivity": "UNKNOWN", "contexts": [],
+               })
+    result = _operator_overview(home, project_id=project_id)
+    native, processes = _bridge_recorded_projection(home.expanduser(), limit)
+    result["bridge"] = {
+        "schema_version": 1, "read_only": True,
+        "external_connectivity": "UNKNOWN",
+        "native": native, "routing": routing, "processes": processes,
+    }
+    return result
 
 
 def _command(home: Path, suffix: str) -> str:
@@ -228,7 +456,7 @@ def _check_status(
     return None
 
 
-def operator_overview(
+def _operator_overview(
     home: Path,
     *,
     project_id: Optional[str] = None,
