@@ -595,6 +595,67 @@ Concurrent connections, reconnect isolation, process wire methods, native writer
 release, ordinary ChatGPT/RDC acceptance and default-runtime switching remain
 separately scoped; B05 does not establish B06 behavior or an OS sandbox.
 
+### B06: concurrent read transport and explicit reconnect isolation
+
+The trusted local entrypoint
+`serve_local_bridge_concurrent_sessions(ledger, admissions, socket_path, limits)`
+uses one owner-thread `selectors.DefaultSelector` loop for one through three
+independently admitted read contexts. B05's serial entrypoints, wire-v1 schemas,
+broker and native authority interfaces remain unchanged. At most three peers,
+including unauthenticated hello peers, hold transport state. Accept work and each
+peer's nonblocking I/O are bounded; reads consume only the current frame, with no
+request pipeline or response queue. Receive and send deadlines are absolute and
+do not renew when a peer trickles bytes. Native filesystem and authority calls
+remain synchronous; transport interleaving does not promise progress through a
+blocked storage call.
+
+Authentication captures one sealed context, reserved by one live peer before
+hello success is queued. Session IDs check that captured identity and never
+select a different route. A duplicate newcomer cannot evict the incumbent.
+Ordinary EOF, malformed input, transport timeout or send failure closes only the
+peer. A fresh client can explicitly reconnect with the same live service
+credential and a fresh hello; this does not retry, replay or resume an operation,
+admit a new native writer, release writer authority or recover a saved process.
+Peer and reservation cleanup uses object identity so stale selector events or a
+reused descriptor cannot remove a replacement connection.
+
+Native authority is checked before dispatch, after complete response construction
+and budgeting, and immediately before every successful-response send step.
+Denial permanently retires only the selected context and token for that service
+invocation, while other contexts continue. An unsent buffered success is replaced
+by an empty authority refusal within the original deadline and budget, or the
+peer closes. A partially sent success frame is closed without appending another
+frame. Restored native authority cannot resurrect that route. Retirement and
+unresolved cleanup latch a nonzero result through idle or signal shutdown. This
+does not revoke bytes already handed to the kernel or make ledger transitions
+atomic with socket sends. Explicit fresh service admission creates fresh
+token/session/incarnation identities.
+
+Ownership is recorded under deferred signal delivery for each acquisition.
+Every eligible peer, selector, broker, listener, credential, endpoint and parent
+descriptor receives an independent cleanup attempt. Exact ownership checks
+preserve foreign or replaced objects; disconnect and cleanup do not establish
+native completion or process inactivity.
+
+**Source gate:** forty self-contained B06 cases pass with no failures, errors,
+skips or expected failures. Real-socket cases cover simultaneous
+A/B/C exact results and owner-thread dispatch, stalled hello/header/body,
+absolute trickle deadlines, observed would-block backpressure, unauthenticated
+capacity, duplicate isolation, explicit reconnect, cross-session and malformed
+wire denials, queued and partial-send revocation, restoration nonresurrection,
+fresh restart identity, signals and partial cleanup. The passive runtime fixture
+owns its actual children and temporary directories, records immutable child
+imports and read-only connection closes, compares main database/WAL and protected
+state exactly, and observes the exact SHM bookkeeping paths separately.
+
+**Pending parent gates:** the complete registered native suite retaining all948
+predecessor IDs, sole genuine independent review, verified publication,
+first-attempt PR/main CI, protected exact merge, immutable-merge runtime replay
+of every published B06 case and recovery-aware final preservation. This bounded
+read transport does not establish process/mutation wire routes, automatic
+recovery, real ordinary ChatGPT/RDC workers, device-wide authority, an OS sandbox,
+a remote relay or a default-runtime switch.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
