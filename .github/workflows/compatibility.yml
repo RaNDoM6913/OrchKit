@@ -13,7 +13,7 @@ jobs:
   macos:
     name: macOS arm64 / Python ${{ matrix.python }}
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +34,16 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python }}
+
+      - name: Resolve native Git
+        run: |
+          native_git="$(/usr/bin/xcrun --find git)"
+          test -x "$native_git"
+          native_git_bin="$RUNNER_TEMP/orch-native-git-bin"
+          mkdir -m 700 "$native_git_bin"
+          ln -s "$native_git" "$native_git_bin/git"
+          echo "$native_git_bin" >> "$GITHUB_PATH"
+          "$native_git" --version
 
       - name: Environment
         run: |

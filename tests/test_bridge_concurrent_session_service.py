@@ -525,6 +525,20 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="orch-b06-", dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name).resolve()
+        self.subprocess_env = dict(os.environ)
+        if sys.platform == "darwin":
+            # Resolve the developer-tool launcher once. Every authority check
+            # still invokes the real Git executable with its original arguments.
+            native_git = Path(subprocess.check_output(
+                ["/usr/bin/xcrun", "--find", "git"], text=True,
+                stderr=subprocess.PIPE, timeout=12).strip())
+            self.assertTrue(native_git.is_absolute() and native_git.is_file()
+                            and os.access(native_git, os.X_OK))
+            git_bin = self.base / "native-git-bin"
+            git_bin.mkdir(mode=0o700)
+            (git_bin / "git").symlink_to(native_git)
+            # A Git-only directory keeps the selected Python interpreter.
+            self.subprocess_env["PATH"] = str(git_bin) + os.pathsep + os.environ.get("PATH", os.defpath)
         (self.base / "home").mkdir(mode=0o700)
         self.native_connections = []
         self.addCleanup(self._close_native_setup)
@@ -583,7 +597,7 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         self.addCleanup(self._finish_remaining)
 
     def _git(self, *args):
-        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+        env = dict(self.subprocess_env, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
                    GIT_TERMINAL_PROMPT="0")
         return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args],
             check=True, capture_output=True, env=env, timeout=12)
@@ -628,7 +642,7 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         package_root = Path(orch.__file__).resolve().parent.parent
         child = subprocess.Popen([sys.executable, "-I", "-B", "-c", _CHILD,
             str(package_root), str(config_file)], stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, cwd=str(self.base))
+            stderr=subprocess.PIPE, text=True, cwd=str(self.base), env=self.subprocess_env)
         self.b05_service_children.append(child)
         launch["child"] = child
         self.active.append(launch)
