@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -394,7 +395,13 @@ service._cleanup_owned = cleanup
 
 original_dispatch = service._dispatch_context
 def dispatch(request, context, incarnation, limits):
-    response = original_dispatch(request, context, incarnation, limits)
+    started = time.monotonic()
+    event('native_start', run_id=context.binding.run_id, operation=request.get('operation'))
+    try:
+        response = original_dispatch(request, context, incarnation, limits)
+    finally:
+        event('native_end', run_id=context.binding.run_id, operation=request.get('operation'),
+              duration=time.monotonic() - started)
     if (context.binding.run_id == config.get('selected_run')
             and request['operation'] == config.get('revoke_operation')
             and config.get('revoke_phase') == 'construction' and not report.get('revoked')):
@@ -468,7 +475,10 @@ def close_peer(self, peer):
     if owned:
         event('peer_closed', fd=peer.sock.fileno(), deadline=peer.deadline,
               run_id=None if peer.route is None else peer.route.context.binding.run_id,
-              output_pending=bool(peer.output), sent=peer.sent)
+              phase='send' if peer.output else 'receive',
+              close_classification='deadline_elapsed' if time.monotonic() >= peer.deadline else 'other_or_unknown',
+              output_pending=bool(peer.output), output_bytes=len(peer.output), sent=peer.sent,
+              retired=None if peer.route is None else peer.route.retired)
     if owned and selected(peer):
         self.selector.stale = self.selector.get_key(peer.sock)
         event('selected_unregistered', fd=peer.sock.fileno(), deadline=peer.deadline)
@@ -516,6 +526,54 @@ finally:
     print(json.dumps(report, sort_keys=True), flush=True)
 raise SystemExit(result)
 '''
+
+
+class _StatusPump:
+    """Own one original client socket and surface every background failure."""
+    def __init__(self, test, label, peer):
+        self.test, self.label = test, label
+        self.sock, self.hello = peer
+        self.stop_requested = threading.Event()
+        self.ready = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name='b06-pump-' + label, daemon=True)
+
+    def _run(self):
+        try:
+            number = 0
+            while not self.stop_requested.is_set():
+                number += 1
+                reply = self.test._call(self.sock, self.hello,
+                    request_id='pump-%s-%d' % (self.label, number))
+                if (reply.get('state') != 'SUCCEEDED'
+                        or reply.get('status', {}).get('binding') != asdict(self.test.bindings[self.label])):
+                    raise AssertionError('pump %s received invalid status response' % self.label)
+                self.ready.set()
+                self.stop_requested.wait(0.05)
+        except BaseException as error:
+            self.error = error
+            self.ready.set()
+
+    def start(self):
+        self.thread.start()
+
+    def check(self):
+        if self.error is not None:
+            raise self.error
+
+    def stop(self):
+        self.stop_requested.set()
+        self.thread.join(timeout=6)
+        if self.thread.is_alive():
+            shutdown_error = None
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError as error:
+                shutdown_error = '%s: %s' % (type(error).__name__, error)
+            self.thread.join(timeout=2)
+            raise AssertionError('pump %s required forced shutdown; alive=%s; shutdown_error=%s; pump_error=%s' %
+                (self.label, self.thread.is_alive(), shutdown_error, self.error))
+        self.check()
 
 
 class ConcurrentSessionServiceTests(unittest.TestCase):
@@ -1171,14 +1229,66 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         self._ready(launch)
         peers = {label: self._connect(launch, label) for label in ("a", "c")}
         stalled, hello = self._connect(launch, "b")
-        self._ac_progress(launch, peers, close=False)
-        started = time.monotonic()
-        send_frame(stalled, self._request(hello, "file.read", "large.bin", max_response_bytes=65536), self.limits)
-        observed = self._wait_event(launch, "would_block")
-        self.assertTrue(observed["selected"])
-        self.assertGreater(observed["sent"], 0)
-        self._ac_progress(launch, peers)
-        time.sleep(max(0, 5.8 - (time.monotonic() - started)))
+        pumps = [_StatusPump(self, label, peers[label]) for label in ("a", "c")]
+        caught = None
+        try:
+            for pump in pumps:
+                pump.start()
+            for pump in pumps:
+                self.assertTrue(pump.ready.wait(5), 'pump did not complete initial status: ' + pump.label)
+                pump.check()
+            send_frame(stalled, self._request(hello, "file.read", "large.bin", max_response_bytes=65536), self.limits)
+            observed = self._wait_event(launch, "would_block")
+            self.assertTrue(observed["selected"])
+            self.assertGreater(observed["sent"], 0)
+            queued = next(item for item in self._events(launch) if item["kind"] == "response_queued")
+            deadline = queued["deadline"]
+            # All ordering and the original B queue deadline use the child clock.
+            end = time.monotonic() + 5
+            progress = {}
+            while time.monotonic() < end:
+                for pump in pumps:
+                    pump.check()
+                events = self._events(launch)
+                for label in ("a", "c"):
+                    dispatches = {item['request_id']: item['monotonic'] for item in events
+                        if item['kind'] == 'dispatch'
+                        and item.get('request_id', '').startswith('pump-' + label + '-')
+                        and observed['monotonic'] < item['monotonic'] < deadline}
+                    progress[label] = [item for item in events
+                        if item['kind'] == 'response_complete'
+                        and item.get('request_id') in dispatches
+                        and dispatches[item['request_id']] <= item['monotonic'] < deadline]
+                if all(progress.values()):
+                    break
+                if launch['child'].poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(set(progress) == {'a', 'c'} and all(progress.values()),
+                'A/C lacked new progress before B deadline: ' + str(progress))
+        except BaseException as error:
+            caught = error
+        finally:
+            # Stop both, even if the first one failed; preserve all failures.
+            for pump in pumps:
+                pump.stop_requested.set()
+            errors = []
+            for pump in pumps:
+                try:
+                    pump.stop()
+                except BaseException as error:
+                    errors.append('%s: %s: %s' % (pump.label, type(error).__name__, error))
+            if caught is not None or errors:
+                events = [item for item in self._events(launch) if item['kind'] in
+                    ('dispatch', 'native_start', 'native_end', 'response_queued',
+                     'response_complete', 'would_block', 'peer_closed', 'retired')][-30:]
+                raise AssertionError('backpressure failure; pump errors=%s; recent events=%s' %
+                    (errors, events)) from caught
+        for sock, _ in peers.values():
+            sock.close()
+        closed = self._wait_event(launch, 'selected_unregistered', timeout=6)
+        self.assertGreaterEqual(closed['monotonic'], deadline,
+            'B closed before its original absolute send deadline')
         stalled.settimeout(1)
         pieces = bytearray()
         while True:
@@ -1194,12 +1304,29 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         self.assertEqual(new_hello["session_id"], hello["session_id"])
         fresh.close()
         report = self._finish(launch)
-        deadline = next(item["deadline"] for item in report["events"] if item["kind"] == "response_queued")
-        for label in ("a", "c"):
-            completed = [item["monotonic"] for item in report["events"] if item["kind"] == "response_complete" and item.get("request_id") == "ac-" + label]
-            self.assertLess(max(completed), deadline)
         self.assertEqual(report["context_count"], 3)
         self.assertEqual(launch["child"].returncode, 0)
+
+    def test_b06_status_pump_reports_original_peer_expiry_and_joins(self):
+        launch = self._launch()
+        self._ready(launch)
+        peer = self._connect(launch, 'a')
+        closed = self._wait_event(launch, 'peer_closed', timeout=6)
+        self.assertEqual(closed['run_id'], self.bindings['a'].run_id)
+        self.assertEqual(closed['phase'], 'receive')
+        self.assertGreaterEqual(closed['monotonic'], closed['deadline'])
+        pump = _StatusPump(self, 'a', peer)
+        pump.start()
+        try:
+            self.assertTrue(pump.ready.wait(3), 'expired peer pump did not report failure')
+        finally:
+            with self.assertRaises((OSError, EOFError)):
+                pump.stop()
+        self.assertFalse(pump.thread.is_alive())
+        peer[0].close()
+        report = self._finish(launch)
+        self.assertEqual(report['context_count'], 3)
+        self.assertEqual(launch['child'].returncode, 0)
 
     def test_b06_current_frame_only_does_not_dispatch_pipeline_during_pending_output(self):
         launch = self._launch(small_send_buffer=True, backpressure_probe=True, stale_read=True)
