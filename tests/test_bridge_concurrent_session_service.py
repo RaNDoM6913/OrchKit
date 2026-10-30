@@ -452,7 +452,7 @@ def write(self, peer):
     finally:
         if pending and self.current(peer) and not peer.output:
             event('response_complete', request_id=request_id, fd=peer.sock.fileno(),
-                  run_id=peer.route.context.binding.run_id)
+                  run_id=peer.route.context.binding.run_id, deadline=peer.deadline)
         active_peer = None
 service._Transport.write = write
 original_retire = service._Transport.retire
@@ -530,8 +530,11 @@ raise SystemExit(result)
 
 class _StatusPump:
     """Own one original client socket and surface every background failure."""
-    def __init__(self, test, label, peer):
+    def __init__(self, test, label, peer, phased=False):
         self.test, self.label = test, label
+        self.phased = phased
+        self.release = threading.Event()
+        self.completed = threading.Event()
         self.sock, self.hello = peer
         self.stop_requested = threading.Event()
         self.ready = threading.Event()
@@ -549,10 +552,19 @@ class _StatusPump:
                         or reply.get('status', {}).get('binding') != asdict(self.test.bindings[self.label])):
                     raise AssertionError('pump %s received invalid status response' % self.label)
                 self.ready.set()
-                self.stop_requested.wait(0.05)
+                if self.phased:
+                    if number == 1:
+                        while not self.stop_requested.is_set() and not self.release.wait(0.05):
+                            pass
+                    else:
+                        self.completed.set()
+                        self.stop_requested.wait()
+                else:
+                    self.stop_requested.wait(0.05)
         except BaseException as error:
             self.error = error
             self.ready.set()
+            self.completed.set()
 
     def start(self):
         self.thread.start()
@@ -1087,16 +1099,38 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
                 pass  # A serving child may still be appending the last line.
         return values
 
-    def _wait_event(self, launch, kind, timeout=4.5):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            events = [item for item in self._events(launch) if item["kind"] == kind]
-            if events:
-                return events[-1]
-            if launch["child"].poll() is not None:
-                break
-            time.sleep(0.005)
-        self.fail("serving child did not observe " + kind)
+    def _wait_event(self, launch, kind, timeout=4.5, pumps=()):
+        # B has no send deadline until its response is queued. Observe that
+        # separately, then observe the real nonblocking send within its budget.
+        def wait_for(predicate, seconds, phase):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                for pump in pumps:
+                    pump.check()
+                events = self._events(launch)
+                found = [item for item in events if predicate(item)]
+                if found:
+                    return found[-1]
+                if launch['child'].poll() is not None:
+                    self.fail('serving child exited while observing ' + phase)
+                if kind == 'would_block' and any(
+                        item['kind'] == 'selected_unregistered' for item in events):
+                    self.fail('selected peer closed while observing ' + phase)
+                time.sleep(0.005)
+            self.fail('serving child did not observe ' + phase)
+
+        if kind == 'would_block':
+            # Each observer is bounded by one unmodified 5s transport budget
+            # plus the existing 1s observer margin, not a new transport deadline.
+            margin = self.limits.io_timeout_sec + 1
+            queued = wait_for(lambda item: item['kind'] == 'response_queued'
+                              and item.get('operation') == 'file.read', margin, 'B response queue')
+            observed = wait_for(lambda item: item['kind'] == 'would_block'
+                                and item.get('selected'), margin, kind)
+            self.assertLess(queued['monotonic'], observed['monotonic'])
+            self.assertLess(observed['monotonic'], queued['deadline'])
+            return observed
+        return wait_for(lambda item: item['kind'] == kind, timeout, kind)
 
     def _eof(self, sock):
         sock.settimeout(6)  # Observer margin above the unchanged maximum service deadline.
@@ -1229,43 +1263,58 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         self._ready(launch)
         peers = {label: self._connect(launch, label) for label in ("a", "c")}
         stalled, hello = self._connect(launch, "b")
-        pumps = [_StatusPump(self, label, peers[label]) for label in ("a", "c")]
+        pumps = [_StatusPump(self, label, peers[label], phased=True) for label in ('a', 'c')]
         caught = None
         try:
+            # Finish initial requests sequentially, preserving each socket and
+            # its real receive deadline before introducing B.
             for pump in pumps:
                 pump.start()
-            for pump in pumps:
                 self.assertTrue(pump.ready.wait(5), 'pump did not complete initial status: ' + pump.label)
                 pump.check()
+            def completed_event(request_id):
+                # A client can receive the last bytes before the child has
+                # appended its completion event. Wait for that real event.
+                end = time.monotonic() + 1
+                while time.monotonic() < end:
+                    for active in pumps:
+                        active.check()
+                    for item in self._events(launch):
+                        if item['kind'] == 'response_complete' and item.get('request_id') == request_id:
+                            return item
+                    if launch['child'].poll() is not None:
+                        break
+                    time.sleep(0.005)
+                self.fail('child did not report response completion: ' + request_id)
+
+            initial = {('pump-%s-1' % pump.label): completed_event('pump-%s-1' % pump.label)
+                       for pump in pumps}
             send_frame(stalled, self._request(hello, "file.read", "large.bin", max_response_bytes=65536), self.limits)
-            observed = self._wait_event(launch, "would_block")
-            self.assertTrue(observed["selected"])
-            self.assertGreater(observed["sent"], 0)
-            queued = next(item for item in self._events(launch) if item["kind"] == "response_queued")
-            deadline = queued["deadline"]
-            # All ordering and the original B queue deadline use the child clock.
-            end = time.monotonic() + 5
-            progress = {}
-            while time.monotonic() < end:
-                for pump in pumps:
-                    pump.check()
-                events = self._events(launch)
-                for label in ("a", "c"):
-                    dispatches = {item['request_id']: item['monotonic'] for item in events
-                        if item['kind'] == 'dispatch'
-                        and item.get('request_id', '').startswith('pump-' + label + '-')
-                        and observed['monotonic'] < item['monotonic'] < deadline}
-                    progress[label] = [item for item in events
-                        if item['kind'] == 'response_complete'
-                        and item.get('request_id') in dispatches
-                        and dispatches[item['request_id']] <= item['monotonic'] < deadline]
-                if all(progress.values()):
-                    break
-                if launch['child'].poll() is not None:
-                    break
-                time.sleep(0.01)
-            self.assertTrue(set(progress) == {'a', 'c'} and all(progress.values()),
-                'A/C lacked new progress before B deadline: ' + str(progress))
+            observed = self._wait_event(launch, 'would_block', pumps=pumps)
+            self.assertGreater(observed['sent'], 0)
+            queued = next(item for item in self._events(launch)
+                          if item['kind'] == 'response_queued' and item.get('operation') == 'file.read')
+            deadline = queued['deadline']
+            # Earliest original receive budget first. Each pump issues exactly
+            # one new request and waits for its actual response before the next.
+            for pump in sorted(pumps, key=lambda p: initial['pump-%s-1' % p.label]['deadline']):
+                pump.release.set()
+                end = time.monotonic() + self.limits.io_timeout_sec + 1
+                while not pump.completed.wait(0.01):
+                    for active in pumps:
+                        active.check()
+                    if launch['child'].poll() is not None or time.monotonic() >= end:
+                        self.fail('pump did not complete after would_block: ' + pump.label)
+                pump.check()
+                request_id = 'pump-%s-2' % pump.label
+                completed = completed_event(request_id)
+                dispatched = next(item for item in self._events(launch)
+                                  if item['kind'] == 'dispatch' and item.get('request_id') == request_id)
+                self.assertLess(observed['monotonic'], dispatched['monotonic'])
+                self.assertLessEqual(dispatched['monotonic'], completed['monotonic'])
+                self.assertLess(completed['monotonic'], deadline)
+                self.assertEqual(dispatched['fd'], initial['pump-%s-1' % pump.label]['fd'])
+                self.assertEqual(completed['fd'], initial['pump-%s-1' % pump.label]['fd'])
         except BaseException as error:
             caught = error
         finally:
@@ -1306,6 +1355,58 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         report = self._finish(launch)
         self.assertEqual(report["context_count"], 3)
         self.assertEqual(launch["child"].returncode, 0)
+
+    def test_b06_backpressure_with_slow_real_authority(self):
+        # Delay the genuine status calls to expose self-load, retaining all
+        # native checks and original transport deadlines.
+        marker = "original_broker_close = broker_module.LocalRunBroker.close"
+        injected = """actual_status = broker_module.LocalRunContext.status
+def slow_status(self, *args, **kwargs):
+    time.sleep(0.22)
+    return actual_status(self, *args, **kwargs)
+broker_module.LocalRunContext.status = slow_status
+"""
+        self.assertEqual(_CHILD.count(marker), 1)
+        with mock.patch.dict(globals(), {'_CHILD': _CHILD.replace(marker, injected + marker)}):
+            self.test_b06_real_backpressure_would_block_leaves_a_c_progress_and_send_deadline()
+
+    def test_b06_backpressure_prequeue_delay_does_not_consume_send_observer(self):
+        # The child performs the real B dispatch after a deliberately slow
+        # prequeue phase. The queue and send deadlines remain unchanged.
+        dispatch_marker = "def transport_dispatch(self, peer, value):\n"
+        queue_marker = "def queue(self, peer, value, **kwargs):\n    original_queue(self, peer, value, **kwargs)"
+        dispatch_injection = """    global fixture_b_dispatch_start
+    if selected(peer) and value.get('operation') == 'file.read':
+        fixture_b_dispatch_start = time.monotonic()
+"""
+        queue_injection = """    if selected(peer) and operation(peer) == 'file.read':
+        time.sleep(max(0, fixture_b_dispatch_start + 4.7 - time.monotonic()))
+"""
+        self.assertEqual(_CHILD.count(dispatch_marker), 1)
+        self.assertEqual(_CHILD.count(queue_marker), 1)
+        child = _CHILD.replace(dispatch_marker, dispatch_marker + dispatch_injection)
+        child = child.replace(queue_marker, "def queue(self, peer, value, **kwargs):\n" +
+                              queue_injection + "    original_queue(self, peer, value, **kwargs)")
+        with mock.patch.dict(globals(), {'_CHILD': child}):
+            launch = self._launch(small_send_buffer=True, backpressure_probe=True)
+        self._ready(launch)
+        stalled, hello = self._connect(launch, 'b')
+        send_frame(stalled, self._request(hello, 'file.read', 'large.bin', max_response_bytes=65536), self.limits)
+        observed = self._wait_event(launch, 'would_block')
+        queued = next(item for item in self._events(launch) if item['kind'] == 'response_queued')
+        self.assertTrue(observed['selected'])
+        self.assertGreater(observed['sent'], 0)
+        dispatched = next(item for item in self._events(launch)
+                          if item['kind'] == 'dispatch' and item.get('operation') == 'file.read')
+        self.assertGreater(queued['monotonic'] - dispatched['monotonic'], 4.5)
+        self.assertLess(queued['monotonic'], observed['monotonic'])
+        self.assertLess(observed['monotonic'], queued['deadline'])
+        closed = self._wait_event(launch, 'selected_unregistered', timeout=6)
+        self.assertGreaterEqual(closed['monotonic'], queued['deadline'])
+        stalled.close()
+        report = self._finish(launch)
+        self.assertEqual(report['context_count'], 3)
+        self.assertEqual(launch['child'].returncode, 0)
 
     def test_b06_status_pump_reports_original_peer_expiry_and_joins(self):
         launch = self._launch()
