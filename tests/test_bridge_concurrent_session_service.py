@@ -1258,7 +1258,7 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
     def test_b06_trickle_cannot_extend_absolute_request_deadline(self):
         self._slow("body", trickle=True)
 
-    def test_b06_real_backpressure_would_block_leaves_a_c_progress_and_send_deadline(self):
+    def _backpressure_would_block_leaves_a_c_progress_and_send_deadline(self):
         launch = self._launch(small_send_buffer=True, backpressure_probe=True)
         self._ready(launch)
         peers = {label: self._connect(launch, label) for label in ("a", "c")}
@@ -1355,20 +1355,41 @@ class ConcurrentSessionServiceTests(unittest.TestCase):
         report = self._finish(launch)
         self.assertEqual(report["context_count"], 3)
         self.assertEqual(launch["child"].returncode, 0)
+        return report
+
+    def test_b06_real_backpressure_would_block_leaves_a_c_progress_and_send_deadline(self):
+        self._backpressure_would_block_leaves_a_c_progress_and_send_deadline()
 
     def test_b06_backpressure_with_slow_real_authority(self):
-        # Delay the genuine status calls to expose self-load, retaining all
-        # native checks and original transport deadlines.
+        # Exercise slow genuine authority during both post-backpressure requests.
+        # One delayed check per request bounds injected self-load; every other
+        # dispatch and send check still performs its real native work.
         marker = "original_broker_close = broker_module.LocalRunBroker.close"
-        injected = """actual_status = broker_module.LocalRunContext.status
+        dispatch_marker = "def transport_dispatch(self, peer, value):\n"
+        dispatch_injection = """    global fixture_slow_request
+    fixture_slow_request = value.get('request_id')
+"""
+        injected = """fixture_slow_request = None
+fixture_slowed = set()
+actual_status = broker_module.LocalRunContext.status
 def slow_status(self, *args, **kwargs):
-    time.sleep(0.22)
+    request_id = fixture_slow_request
+    if request_id in ('pump-a-2', 'pump-c-2') and request_id not in fixture_slowed:
+        fixture_slowed.add(request_id)
+        event('slow_authority_injected', request_id=request_id, seconds=0.22)
+        time.sleep(0.22)
     return actual_status(self, *args, **kwargs)
 broker_module.LocalRunContext.status = slow_status
 """
         self.assertEqual(_CHILD.count(marker), 1)
-        with mock.patch.dict(globals(), {'_CHILD': _CHILD.replace(marker, injected + marker)}):
-            self.test_b06_real_backpressure_would_block_leaves_a_c_progress_and_send_deadline()
+        self.assertEqual(_CHILD.count(dispatch_marker), 1)
+        child = _CHILD.replace(marker, injected + marker)
+        child = child.replace(dispatch_marker, dispatch_marker + dispatch_injection)
+        with mock.patch.dict(globals(), {'_CHILD': child}):
+            report = self._backpressure_would_block_leaves_a_c_progress_and_send_deadline()
+        slowed = [event['request_id'] for event in report['events']
+                  if event['kind'] == 'slow_authority_injected']
+        self.assertCountEqual(slowed, ['pump-a-2', 'pump-c-2'])
 
     def test_b06_backpressure_prequeue_delay_does_not_consume_send_observer(self):
         # The child performs the real B dispatch after a deliberately slow
