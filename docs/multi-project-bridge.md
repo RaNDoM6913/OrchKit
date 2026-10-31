@@ -955,6 +955,46 @@ This trusted local API does not provide descendant containment, same-user OS
 fencing, remote relay access, ordinary ChatGPT/RDC acceptance or runtime-default
 migration. Those retain their separate acceptance gates.
 
+### Opt-in local existing-file patch transport
+
+Trusted local code can call `serve_local_bridge_patch_sessions(ledger, admissions,
+socket_path, limits)` with `LocalBridgeAdmission` records and a
+`ReadOnlyAuthorityLedger`. This is a separate v3 endpoint on the existing bounded
+concurrent transport. It replaces one existing, allowed regular file per explicit
+operation; it does not create or delete target files. The existing v1 read endpoint,
+v2 process endpoint, five-second default I/O deadline and default CLI are unchanged.
+
+```python
+client = LocalPatchClient(credential_file)
+operation_id = client.new_operation_id()  # retain before sending
+outcome = client.apply("README.md", baseline_sha256=old_sha256,
+                       baseline_size=old_size, replacement=new_bytes,
+                       operation_id=operation_id)
+client.close()
+```
+
+The client obtains a stable tag of the admitted native binding and combines it
+with a random nonce. The tag is a namespace check, not authentication; the
+private transport credential and live native authority are still required. Keep
+the operation ID and original target across reconnect or a fresh service with the
+same live binding. An explicit identical request can return a historical receipt
+without another replacement; changed request material conflicts. The native
+request's output bound is fixed independently of the wire response budget. A
+failed or lost response is uncertain and is never automatically retried. Explicit
+`client.reconcile(target, operation_id=operation_id)` uses the existing durable
+records and evidence; it does not reapply replacement bytes. A historical result
+reports the recorded past event, not a guarantee about current file contents.
+Unresolved or ambiguous evidence remains `UNKNOWN` and blocks native closure.
+
+Requests use strict bounded JSON framing and canonical base64; the 64 KiB frame
+limit means the maximum replacement carried on the wire is smaller than the
+native 64 KiB content bound. Native filesystem work remains synchronous and can
+block socket interleaving. Patch records use the existing private runtime journal
+and execution store; the authority database remains SELECT-only. The filesystem
+checks and cooperative lock do not fence another same-user process. This source
+API does not establish ordinary ChatGPT/RDC execution, a remote connector,
+production deployment, native lifecycle completion or a default-runtime switch.
+
 ## P1-E — remote MCP relay and OrchKit connector
 
 Create a remote MCP endpoint usable by ChatGPT while the local Bridge establishes an outbound authenticated connection.
