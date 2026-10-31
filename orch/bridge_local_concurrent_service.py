@@ -363,6 +363,11 @@ def serve_local_bridge_concurrent_sessions(ledger: ReadOnlyAuthorityLedger,
         admissions: tuple[LocalBridgeAdmission, ...], socket_path: Path,
         limits: LocalServiceLimits) -> int:
     """Interleave bounded local transport without acquiring authority on reconnect."""
+    return _serve_concurrent(ledger, admissions, socket_path, limits)
+
+
+def _serve_concurrent(ledger, admissions, socket_path, limits, *, process_store=None,
+                      profiles_by_binding=None, transport_class=None):
     parent_fd = -1
     parent_identity = None
     broker = listener = selector = transport = None
@@ -400,12 +405,13 @@ def serve_local_bridge_concurrent_sessions(ledger: ReadOnlyAuthorityLedger,
             else:
                 raise ValueError("local_bridge_endpoint_denied")
         with stop.defer():
-            broker = LocalRunBroker(ledger, max_worker_sessions=3)
+            broker = (LocalRunBroker(ledger, max_worker_sessions=3) if process_store is None
+                      else LocalRunBroker(ledger, max_worker_sessions=3, process_store=process_store))
         contexts = []
         for admission in admissions:
             with stop.defer():
                 context = broker.open_context(admission.binding, Path(admission.capability_file),
-                                              profiles=())
+                                              profiles=() if profiles_by_binding is None else profiles_by_binding[admission.binding])
                 contexts.append(context)
         incarnation = secrets.token_urlsafe(24)
         tokens = tuple(secrets.token_urlsafe(32) for _ in contexts)
@@ -433,7 +439,7 @@ def serve_local_bridge_concurrent_sessions(ledger: ReadOnlyAuthorityLedger,
             _publish_credential(parent_fd, credential_file.name, dict(
                 schema_version=1, socket_path=str(socket_path), service_incarnation=incarnation,
                 transport_token=token), stop=stop, on_owned=credential_owned)
-        transport = _Transport(selector, listener, routes, incarnation, limits,
+        transport = (transport_class or _Transport)(selector, listener, routes, incarnation, limits,
                                parent_fd, credential_identities, stop)
         transport.run()
     except _ServiceStopped:

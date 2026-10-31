@@ -4,6 +4,21 @@ All notable public-facing changes are documented here.
 
 ## Unreleased
 
+### Added
+
+- Added an opt-in concurrent local process endpoint with immutable operator
+  profiles, session-bound operation identities and output cursors, explicit
+  reconnect behavior, and bounded retained direct-child ownership. The existing
+  read-only wire and default runtime remain unchanged.
+- Added a restricted transactional process-journal companion for existing native
+  homes while preserving SELECT-only authority access and durable unresolved
+  process capacity charges.
+
+### Fixed
+
+- Retained process owners when bounded cleanup cannot join their supervisor,
+  allowing an explicit owned-child cleanup retry without discarding ownership.
+
 ### Documentation
 
 - Matched the dynamic compatibility badge to the rectangular README badges and simplified the project title.

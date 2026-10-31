@@ -656,6 +656,47 @@ read transport does not establish process/mutation wire routes, automatic
 recovery, real ordinary ChatGPT/RDC workers, device-wide authority, an OS sandbox,
 a remote relay or a default-runtime switch.
 
+### B07: explicit concurrent process endpoint
+
+`serve_local_bridge_process_sessions(ledger, admissions, socket_path, limits)`
+adds an opt-in source API beside the existing read-only endpoints. Each frozen
+`LocalProcessAdmission` supplies a native binding, capability-file path,
+credential path and immutable tuple of `OwnedProcessProfile` values. Workers
+cannot register executables, argv, environment, working directories or PIDs.
+The existing read-only v1 protocol and its five-second I/O ceiling stay intact.
+
+The separate v2 process protocol accepts `process.start`, `process.poll` and
+`process.terminate`. Hello captures one sealed native context. Operation IDs and
+output cursors authenticate their session; cursors also bind the retained child
+handle. `LocalProcessClient.new_operation_id()` creates an explicit operation
+identity. A caller may reconnect and explicitly submit that same operation to
+the same live context; the server returns the existing observation or refuses a
+conflict. Neither the client nor a new service invocation automatically retries,
+spawns a second child, adopts a PID or reconstructs volatile output.
+
+`ProcessOperationStore.open_existing(root)` opens a separate, restricted
+transactional process journal seam. It checks the existing private home and
+database identities without initialization, migration or permission repair.
+The authority ledger remains SELECT-only. Only validated process intent/exit
+appends use the transactional seam; FULL commit and independent readback still
+precede spawning and release of process capacity. Six global and two per-run
+unresolved operations remain charged across reconnect, revocation and restart.
+
+Native authority is renewed before dispatch and before each successful send
+step. Revocation retires the selected route. Cleanup uses only retained direct
+child objects; a supervisor still running after bounded cleanup keeps its owner
+for an explicit retry. Only durable direct-child reap with settled output proves
+exit. Peer closure, routing cleanup and a missing child never release a native
+writer. Other admitted contexts continue independently of the failed route.
+
+Acceptance covers all 998 preceding test identities plus new strict-schema,
+cross-session, real-child, cursor/output, duplicate/lost-response, restart,
+capacity and cleanup cases. Complete native verification and current-snapshot
+independent review precede publication; first exact-head PR/main CI, protected
+merge and immutable runtime cases remain delivery gates. These local process
+operations do not establish ordinary ChatGPT/RDC integration, descendant
+containment, an OS sandbox or a default-runtime switch.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.
