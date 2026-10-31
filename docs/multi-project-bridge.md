@@ -905,6 +905,56 @@ Acceptance criteria:
 - daemon restart yields explicit reconnect/recovery state rather than silent continuation;
 - `orch overview` can summarize active sessions by project.
 
+### Opt-in local process transport
+
+Trusted operators can call
+`serve_local_bridge_process_sessions(ledger, admissions, socket_path, limits)`
+with frozen `LocalProcessAdmission` records containing exact
+`OwnedProcessProfile` tuples. This separate endpoint uses the bounded concurrent
+transport and private credential ownership of the read endpoint. Read-only v1
+and default CLI behavior remain unchanged; process requests use a strict v2
+schema. The wire supplies an admitted profile ID or opaque handle, an explicit
+operation ID, a session-bound cursor and a response budget. It never supplies
+native bindings, capabilities, shell commands, argv, environment or PIDs.
+
+The explicit client flow is:
+
+```python
+client = LocalProcessClient(credential_file)
+operation_id = client.new_operation_id()
+started = client.call("process.start", "approved-profile",
+                      operation_id=operation_id)
+handle = started["result"]["handle"]
+observed = client.call("process.poll", handle,
+                       operation_id=client.new_operation_id(),
+                       cursor=started["result"]["next_cursor"])
+client.close()
+```
+
+Successful API delivery and child exit are separate: inspect `process_state`,
+`exit_code`, bounded base64 output, `next_cursor`, `has_more` and `truncated`.
+Cursor values also authenticate the child handle. Operation IDs survive an
+explicit reconnect to the same live context; a conflicting operation refuses.
+Lost responses do not authorize automatic replay. A new service creates new
+sessions and refuses old session identities; durable dispatch history prevents
+another spawn, and no saved PID becomes ownership evidence.
+
+Process metadata uses `ProcessOperationStore.open_existing(root)`, a restricted
+existing-database transactional companion to the unchanged SELECT-only authority
+view. Process intent/exit rows receive FULL commit and independent readback.
+Unresolved entries retain the global six/per-run two capacity charge even when
+their local owner is unavailable. Raw output remains volatile. Direct-child
+reaping and settled output, rather than transport closure or elapsed time,
+establish exit. Cleanup retains an owner whose supervisor has not finished and
+never signals an unrelated process or releases native writer authority.
+
+Authority checks surround dispatch and successful transmission. B's disconnect,
+timeout, revocation or unresolved cleanup leaves A/C independently routable;
+foreign or replaced endpoint objects remain protected by ownership checks.
+This trusted local API does not provide descendant containment, same-user OS
+fencing, remote relay access, ordinary ChatGPT/RDC acceptance or runtime-default
+migration. Those retain their separate acceptance gates.
+
 ## P1-E — remote MCP relay and OrchKit connector
 
 Create a remote MCP endpoint usable by ChatGPT while the local Bridge establishes an outbound authenticated connection.

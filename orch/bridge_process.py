@@ -214,16 +214,23 @@ class LocalOwnedProcessOperations:
     def __init__(self, authority: LocalRunSessionAuthority, session_id: str,
                  binding: WorkerRunBinding, capability_file: Path, profiles, *,
                  max_processes_total: int = DEFAULT_MAX_PROCESSES_TOTAL,
-                 max_processes_per_run: int = DEFAULT_MAX_PROCESSES_PER_RUN):
+                 max_processes_per_run: int = DEFAULT_MAX_PROCESSES_PER_RUN,
+                 process_store: ProcessOperationStore | None = None):
         if not isinstance(authority, LocalRunSessionAuthority):
             raise ValueError("process_invalid_authority")
         self._authority, self._session, self._binding = authority, session_id, binding
         self._capability = capability_file
         self._orch = authority._orch
-        self._store = ProcessOperationStore(
-            self._orch, max_processes_total=max_processes_total,
-            max_processes_per_run=max_processes_per_run,
-        )
+        if process_store is None:
+            self._store = ProcessOperationStore(
+                self._orch, max_processes_total=max_processes_total,
+                max_processes_per_run=max_processes_per_run,
+            )
+        else:
+            if not isinstance(process_store, ProcessOperationStore):
+                raise ValueError("process_invalid_store")
+            process_store.require_authority(self._orch)
+            self._store = process_store
         self._owner_pid = os.getpid()
         self._lock = threading.RLock()
         self._children, self._outcomes = {}, {}
@@ -544,6 +551,7 @@ class LocalOwnedProcessOperations:
             self._closed = True
             self._cleanup_requests()
             children = tuple(self._children.values())
+        cleanup_unresolved = False
         for child in children:
             if child.thread is not None and child.thread.ident is not None:
                 child.thread.join(timeout=1.5)
@@ -554,9 +562,14 @@ class LocalOwnedProcessOperations:
                         child.process.wait(timeout=_REAP_GRACE)
                 except (OSError, subprocess.SubprocessError):
                     child.unknown = True
+                    cleanup_unresolved = True
                 if child.thread is None or child.thread.ident is None:
                     if child.process.stdout is not None:
                         child.process.stdout.close()
+                elif child.thread.is_alive():
+                    cleanup_unresolved = True
+        if cleanup_unresolved:
+            raise ValueError("process_cleanup_unresolved")
 
     def __enter__(self):
         return self

@@ -103,10 +103,17 @@ class LocalRunBroker:
     underlying numeric descriptor could already have been reused elsewhere.
     """
 
-    def __init__(self, ledger: AuthorityLedger, *, max_worker_sessions: int = 3):
+    def __init__(self, ledger: AuthorityLedger, *, max_worker_sessions: int = 3,
+                 process_store=None):
         self.__authority = LocalRunSessionAuthority(
             ledger, max_worker_sessions=max_worker_sessions,
         )
+        if process_store is not None:
+            from .bridge_process_store import ProcessOperationStore
+            if not isinstance(process_store, ProcessOperationStore):
+                raise ValueError("process_invalid_store")
+            process_store.require_authority(ledger)
+        self.__process_store = process_store
         self.__ledger = ledger
         self.__home = ledger.root.expanduser().resolve()
         self.__owner = (os.getpid(), threading.get_ident())
@@ -180,6 +187,7 @@ class LocalRunBroker:
             if profiles:
                 owned.processes = LocalOwnedProcessOperations(
                     self.__authority, session_id, binding, capability_file, profiles,
+                    **({"process_store": self.__process_store} if self.__process_store is not None else {}),
                 )
             self.__require_live(owned)
             context = LocalRunContext(self, session_id, binding, _seal=_CONTEXT_SEAL)

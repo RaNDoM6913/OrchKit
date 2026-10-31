@@ -293,6 +293,18 @@ class ProcessOperationStore:
         self._home = orch.root
         self._home_identity = _identity(os.stat(self._home, follow_symlinks=False), boundary=True)
 
+    @classmethod
+    def open_existing(cls, root):
+        """Open an existing private home without initialization or repair."""
+        from .bridge_process_ledger import ExistingProcessLedger
+        return cls(ExistingProcessLedger(root))
+
+    def require_authority(self, authority):
+        """Refuse a different or replaced authority home and database."""
+        from .bridge_process_ledger import ExistingProcessLedger
+        if not isinstance(self._orch, ExistingProcessLedger) or not self._orch.matches(authority):
+            raise ValueError("process_ledger_authority_mismatch")
+
     def _lock(self):
         return _require_lock(self._home, self._home_identity)
 
