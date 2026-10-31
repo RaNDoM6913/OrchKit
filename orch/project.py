@@ -211,6 +211,29 @@ def _detect_commands(root: Path) -> Dict[str, Any]:
     return detected
 
 
+def inspect_project_identity(path: Path) -> Dict[str, Any]:
+    """Observe current repository identity without examining worktree content."""
+    requested = path.expanduser().resolve()
+    if not requested.is_dir():
+        raise ValueError("project_directory_not_found")
+    root_probe = _git_inspection_metadata(requested, "rev-parse", "--show-toplevel")
+    if root_probe.returncode != 0:
+        raise ValueError("not_a_git_repository")
+    root = Path(root_probe.stdout.strip()).resolve()
+    branch = _git_inspection_metadata(root, "branch", "--show-current")
+    head = _git_inspection_metadata(root, "rev-parse", "HEAD")
+    common_probe = _git_inspection_metadata(root, "rev-parse", "--git-common-dir")
+    if common_probe.returncode == 0 and common_probe.stdout.strip():
+        common_raw = Path(common_probe.stdout.strip())
+        common_dir = common_raw.resolve() if common_raw.is_absolute() else (root / common_raw).resolve()
+    else:
+        common_dir = (root / ".git").resolve()
+    writer_key = "git:" + hashlib.sha256(str(common_dir).encode("utf-8")).hexdigest()[:32]
+    return {"root": str(root), "writer_key": writer_key,
+            "branch": branch.stdout.strip() if branch.returncode == 0 else None,
+            "head": head.stdout.strip() if head.returncode == 0 else None}
+
+
 def inspect_project(path: Path) -> Dict[str, Any]:
     requested = path.expanduser().resolve()
     if not requested.is_dir():

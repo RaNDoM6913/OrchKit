@@ -18,7 +18,7 @@ from typing import Protocol
 from .config import read_bounded_json_object
 from .core import WRITER_LOCK_RUN_STATES
 from .project import (
-    PROJECT_CONFIG_MAX_BYTES, ProjectRegistry, inspect_project,
+    PROJECT_CONFIG_MAX_BYTES, ProjectRegistry, inspect_project_identity as inspect_project,
     project_root_identity_matches, validate_project_schema,
 )
 from .worker_operations import WorkerRunBinding
