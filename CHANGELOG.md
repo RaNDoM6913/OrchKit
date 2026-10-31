@@ -6,6 +6,9 @@ All notable public-facing changes are documented here.
 
 ### Added
 
+- Added a separate opt-in local v3 endpoint for bounded replacement of an
+  existing allowed file, with retained operation IDs and explicit reconciliation
+  through the existing durable patch records.
 - Added an opt-in concurrent local process endpoint with immutable operator
   profiles, session-bound operation identities and output cursors, explicit
   reconnect behavior, and bounded retained direct-child ownership. The existing

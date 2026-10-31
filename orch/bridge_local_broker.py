@@ -71,6 +71,12 @@ class LocalRunContext:
     def process_terminate(self, request: WorkerOperationRequest) -> WorkerOperationOutcome:
         return self.__broker._process_terminate(self, request)
 
+    def patch_apply(self, request, replacement):
+        return self.__broker._patch(self, request, replacement=replacement)
+
+    def patch_reconcile(self, request):
+        return self.__broker._patch(self, request, replacement=None)
+
     def close(self) -> None:
         self.__broker._close_context(self)
 
@@ -84,6 +90,7 @@ class _OwnedContext:
     reader: LocalBoundedFileReader | None = None
     lister: LocalBoundedFileLister | None = None
     processes: LocalOwnedProcessOperations | None = None
+    patcher: object | None = None
     context: LocalRunContext | None = None
     closed: bool = False
     session_open: bool = True
@@ -104,7 +111,7 @@ class LocalRunBroker:
     """
 
     def __init__(self, ledger: AuthorityLedger, *, max_worker_sessions: int = 3,
-                 process_store=None):
+                 process_store=None, patch_enabled: bool = False):
         self.__authority = LocalRunSessionAuthority(
             ledger, max_worker_sessions=max_worker_sessions,
         )
@@ -113,6 +120,9 @@ class LocalRunBroker:
             if not isinstance(process_store, ProcessOperationStore):
                 raise ValueError("process_invalid_store")
             process_store.require_authority(ledger)
+        if type(patch_enabled) is not bool:
+            raise ValueError("bridge_broker_invalid_patch_policy")
+        self.__patch_enabled = patch_enabled
         self.__process_store = process_store
         self.__ledger = ledger
         self.__home = ledger.root.expanduser().resolve()
@@ -184,6 +194,10 @@ class LocalRunBroker:
             )
             owned.reader = LocalBoundedFileReader(owned.scope)
             owned.lister = LocalBoundedFileLister(owned.scope)
+            if self.__patch_enabled:
+                from .bridge_file_patch import LocalBoundedFilePatcher
+                owned.patcher = LocalBoundedFilePatcher(
+                    self.__authority, session_id, binding, capability_file)
             if profiles:
                 owned.processes = LocalOwnedProcessOperations(
                     self.__authority, session_id, binding, capability_file, profiles,
@@ -233,6 +247,17 @@ class LocalRunBroker:
     def _list(self, context: LocalRunContext,
               request: WorkerOperationRequest) -> WorkerOperationOutcome:
         return self.__file_operation(context, request, listing=True)
+
+    def _patch(self, context: LocalRunContext, request: WorkerOperationRequest, *, replacement):
+        owned = self.__require_context(context)
+        require_matching_worker_run(owned.binding, request)
+        self.__require_live(owned)
+        if owned.patcher is None:
+            raise ValueError("bridge_broker_patch_unavailable")
+        result = (owned.patcher.reconcile(request) if replacement is None
+                  else owned.patcher.apply(request, replacement))
+        self.__require_live(owned)
+        return result
 
     def __process_operation(self, context: LocalRunContext,
                             request: WorkerOperationRequest, *, kind: str,

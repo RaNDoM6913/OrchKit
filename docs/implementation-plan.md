@@ -697,6 +697,23 @@ merge and immutable runtime cases remain delivery gates. These local process
 operations do not establish ordinary ChatGPT/RDC integration, descendant
 containment, an OS sandbox or a default-runtime switch.
 
+### B07-WIRE-PATCH-001: opt-in existing-file patch endpoint
+
+The source API `serve_local_bridge_patch_sessions` adds a separate v3 socket
+endpoint using sealed native admissions and the existing concurrent transport.
+A retained binding-tagged operation ID survives a new service session for the
+same live binding. Identical requests can receive a historical durable receipt;
+conflicts refuse, and explicit reconciliation does not reapply bytes. Unknown
+outcomes remain visible and block native closure. Request framing bounds the
+replacement below the native content ceiling, and no create/delete operation is
+provided. Authority continues through the SELECT-only view; v1, process v2 and
+the five-second default I/O limit remain in place.
+
+Full prior-suite verification, independent review, publication, exact-head CI,
+protected merge, immutable-merge runtime replay and preservation remain separate
+acceptance gates. This source work does not establish ordinary ChatGPT/RDC
+execution, a remote relay, same-user fencing or a default-runtime switch.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.

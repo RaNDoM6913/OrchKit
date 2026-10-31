@@ -367,7 +367,7 @@ def serve_local_bridge_concurrent_sessions(ledger: ReadOnlyAuthorityLedger,
 
 
 def _serve_concurrent(ledger, admissions, socket_path, limits, *, process_store=None,
-                      profiles_by_binding=None, transport_class=None):
+                      profiles_by_binding=None, transport_class=None, patch_enabled=False):
     parent_fd = -1
     parent_identity = None
     broker = listener = selector = transport = None
@@ -405,8 +405,12 @@ def _serve_concurrent(ledger, admissions, socket_path, limits, *, process_store=
             else:
                 raise ValueError("local_bridge_endpoint_denied")
         with stop.defer():
-            broker = (LocalRunBroker(ledger, max_worker_sessions=3) if process_store is None
-                      else LocalRunBroker(ledger, max_worker_sessions=3, process_store=process_store))
+            options = {}
+            if process_store is not None:
+                options["process_store"] = process_store
+            if patch_enabled:
+                options["patch_enabled"] = True
+            broker = LocalRunBroker(ledger, max_worker_sessions=3, **options)
         contexts = []
         for admission in admissions:
             with stop.defer():
