@@ -1,4 +1,5 @@
 """B10 native lifecycle: exact claims and durable non-replaying checkpoints."""
+from contextlib import closing, contextmanager
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,15 @@ import unittest
 from orch.core import Orchestrator, canonical_json
 from orch.plan import build_single_task_plan, write_plan
 from orch.project import ProjectRegistry
+
+
+class _FixtureOrchestrator(Orchestrator):
+    @contextmanager
+    def connect(self):
+        # sqlite3's transaction context manager does not close the connection.
+        with closing(super().connect()) as conn:
+            with conn:
+                yield conn
 
 
 class LifecycleTests(unittest.TestCase):
@@ -31,7 +41,7 @@ class LifecycleTests(unittest.TestCase):
         git('-C', str(self.repo), 'commit', '-qm', 'root')
         self.home = self.base / 'home'
         self.home.mkdir(mode=0o700)
-        self.orch = Orchestrator(self.home)
+        self.orch = _FixtureOrchestrator(self.home)
         self.project = ProjectRegistry(self.home).add(self.repo, name='B10 disposable', profile='safe',
                             review_mode='off', allow_commit=True, allow_push=False)['project']
         for suffix in ('A', 'B'):
