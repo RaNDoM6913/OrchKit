@@ -6,6 +6,9 @@ All notable public-facing changes are documented here.
 
 ### Added
 
+- Added an opt-in local lifecycle source interface for exact-task claim,
+  bounded context, checkpoint and durable operation disposition. Capability
+  contents stay local, and uncertain committed claims retain the writer.
 - Added a separate opt-in local v3 endpoint for bounded replacement of an
   existing allowed file, with retained operation IDs and explicit reconciliation
   through the existing durable patch records.
@@ -19,6 +22,8 @@ All notable public-facing changes are documented here.
 
 ### Fixed
 
+- Require each lifecycle ledger writer connection to verify WAL synchronous
+  FULL before transactions; close and fail closed if that check fails.
 - Retained process owners when bounded cleanup cannot join their supervisor,
   allowing an explicit owned-child cleanup retry without discarding ownership.
 

@@ -714,6 +714,37 @@ protected merge, immutable-merge runtime replay and preservation remain separate
 acceptance gates. This source work does not establish ordinary ChatGPT/RDC
 execution, a remote relay, same-user fencing or a default-runtime switch.
 
+### B10: opt-in local claim, context and checkpoint
+
+The separate schema-4 lifecycle endpoint is enabled explicitly through
+`serve_local_lifecycle(authority, admissions, socket_path, limits)`. Trusted local
+code constructs `LifecycleAuthority(root)`, creates a `LifecycleGrantSpec` with
+the exact project, writer, task, plan revision, canonical task-payload SHA-256,
+next attempt and worker, and supplies the resulting grant ID with a private
+credential path in `LifecycleAdmission`. A `LifecycleClient` can then call
+`claim`, `context`, `checkpoint` and `disposition`; it cannot select a different
+task or invoke submission, verification or publication. Capability contents
+and native leases stay inside the local authority.
+
+Each lifecycle writer connection checks WAL, sets `synchronous=FULL` and verifies
+an integer readback of `2` before any lifecycle transaction. A failed or unsafe
+check closes the connection and fails closed.
+
+A durable reservation precedes each mutation. The claim effect and its record,
+and the checkpoint effect and its record, each commit atomically. A duplicate
+operation reports its recorded outcome or `UNKNOWN`; it does not automatically
+execute again. If a claim committed but capability publication or admission is
+uncertain, the writer remains reserved. A checkpoint neither releases that
+writer nor establishes process inactivity. Restart requires explicit local
+re-admission and fresh native checks, and a pending operation is not replayed.
+The native context limit and the complete encoded response limit are separate.
+
+Records are retained for this milestone, with at most 4,096 grants and 32
+checkpoint operations per grant. Exhaustion refuses further admissions or
+operations; unresolved evidence is not pruned. Receipt, submit and quiesce are
+B11 work; controller closure is B12 work. Full integrated verification, review,
+publication, CI, merge and immutable-runtime acceptance remain separate gates.
+
 ## 5. P1-E: remote MCP route
 
 Only after local operations and reconnect semantics are tested, add the outbound device connection and the remote relay/connector. Any hosting, domain, account, or paid infrastructure change requires separate owner approval.

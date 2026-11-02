@@ -1129,6 +1129,28 @@ Only after parity and fresh ordinary-Chat acceptance:
 - keep RDC as an optional compatibility fallback;
 - remove Desktop Commander as a required dependency.
 
+## B10 local lifecycle source interface
+
+The opt-in schema-4 local endpoint accepts trusted, immutable task grants and
+exposes exact-task claim, bounded full context, checkpoint and operation
+disposition through a dedicated client. The operator creates the grant with
+`LifecycleAuthority` and `LifecycleGrantSpec`, then starts
+`serve_local_lifecycle` with `LifecycleAdmission` and private credential paths.
+A route or transport credential is not native authority; capability contents
+and lease tokens are never sent over the socket.
+
+Each lifecycle writer connection checks WAL and sets `synchronous=FULL`, then
+requires integer readback `2` before any lifecycle transaction. A failed or
+unsafe check closes the connection and fails closed.
+
+Mutation IDs have durable reservations and outcomes. A repeated or interrupted
+operation can remain `UNKNOWN`; it is not automatically executed again. When a
+native claim has committed, uncertain capability publication keeps its writer
+reserved. Checkpoint does not release the writer or prove inactivity. Existing
+local endpoints and the default runtime are unchanged. B11 still owns receipt,
+submit and quiesce, and B12 owns controller closure; the full acceptance and
+publication gates remain outstanding.
+
 ## Future P2 — safe concurrency inside one repository
 
 Do not implement this by simply assigning different writer locks to linked Git worktrees.
